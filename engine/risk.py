@@ -73,19 +73,27 @@ class RiskEngine:
             out.append("계좌 평가금액을 읽을 수 없습니다 (안전을 위해 중단).")
             return out
 
+        # 일일 손실은 **평가손익 기준**으로 잽니다 (storage/autotrade.touch_daily).
+        # 총자산 차이로 재면 출금 한 번에 없던 손실이 잡혀 매매가 멈춥니다 —
+        # 11만원 계좌에서 5만원을 빼면 -41% 로 즉시 한도 발동이었습니다.
         start = float(day.get("start_value") or 0)
         limit = float(cfg.get("daily_loss_limit_pct", 0) or 0)
         if start > 0 and limit > 0:
-            change = (total - start) / start * 100
+            pnl = day.get("pnl")
+            change = ((float(pnl) / start * 100) if pnl is not None
+                      else (total - start) / start * 100)
             if change <= -limit:
                 out.append(f"일일 손실 한도 초과 ({change:+.2f}% / 한도 -{limit:g}%)")
 
+        # 낙폭도 손익 기준 — 출금으로 총자산이 줄어든 것을 낙폭으로 읽으면 안 됩니다
         peak = float(day.get("peak_value") or 0)
         max_dd = float(cfg.get("max_drawdown_pct", 0) or 0)
-        if peak > 0 and max_dd > 0:
-            dd = (total - peak) / peak * 100
-            if dd <= -max_dd:
-                out.append(f"최대 낙폭 초과 ({dd:+.2f}% / 한도 -{max_dd:g}%)")
+        if max_dd > 0:
+            dd = day.get("drawdown_pct")
+            if dd is None:
+                dd = (total - peak) / peak * 100 if peak > 0 else 0.0
+            if float(dd) <= -max_dd:
+                out.append(f"최대 낙폭 초과 ({float(dd):+.2f}% / 한도 -{max_dd:g}%)")
 
         return out
 
@@ -114,9 +122,10 @@ class RiskEngine:
             verdict.rejects.append("숏 진입이 설정에서 꺼져 있습니다.")
             return verdict
 
-        # 2) 장 상태 — 닫힌 장에 낸 주문은 다음 개장 때 원하지 않는 가격에 체결됩니다
-        tradable, why = feed.is_tradable_now(
-            inst, regular_only=self._regular_only(inst))
+        # 2) 장 상태 — 신규 진입은 **프리마켓·정규장에서만** 냅니다.
+        # 닫힌 장에 낸 주문은 다음 개장 때 원하지 않는 가격에 체결되고,
+        # 애프터마켓·시간외 단일가는 호가가 얇아 스프레드부터 지고 시작합니다.
+        tradable, why, _session = feed.entry_allowed_now(inst, cfg)
         if not tradable:
             verdict.rejects.append(why)
             return verdict
@@ -191,7 +200,14 @@ class RiskEngine:
 
         quantity = inst.round_quantity(quantity)
         if quantity <= 0:
-            verdict.rejects.append("한도를 적용하니 주문 수량이 0이 되었습니다.")
+            # **어느 한도가 잘랐는지** 함께 남깁니다. 예전에는 "한도를 적용하니
+            # 0이 되었습니다"로만 찍혀서, 종목 비중·총 노출·현금 중 무엇이
+            # 막았는지 알 수 없었습니다 (이미 거의 다 투자된 계좌에서는 총 노출
+            # 한도가 범인인데, 화면만 봐서는 현금 부족으로 오해합니다).
+            detail = " / ".join(verdict.reasons) if verdict.reasons else ""
+            verdict.rejects.append(
+                "한도를 적용하니 주문 수량이 0이 되었습니다."
+                + (f" — {detail}" if detail else ""))
             return verdict
 
         min_order = float(cfg.get("min_order_krw", 0) or 0)

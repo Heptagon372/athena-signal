@@ -49,8 +49,15 @@
         <select id="modeSelect"></select>
       </div>
       <div class="field">
-        <label>회전 주기 (초)</label>
+        <label>전체 회전 주기 (초)</label>
         <input id="cfg_interval_sec" type="number" min="15" step="5">
+        <span class="muted" style="font-size:11px">신호 계산 + 신규 진입</span>
+      </div>
+      <div class="field">
+        <label>보호 회전 주기 (초)</label>
+        <input id="cfg_guard_interval_sec" type="number" min="0" step="1">
+        <span class="muted" style="font-size:11px">
+          보유 종목의 손절·트레일링만 확인 (지표 계산 없음). 0 = 사용 안 함</span>
       </div>
       <label class="chk"><input type="checkbox" id="cfg_dry_run"> 모의 판단만 (주문 안 냄)</label>
       <label class="chk"><input type="checkbox" id="cfg_manage_only_universe">
@@ -172,7 +179,8 @@ window.PAGE = {
     setInterval(() => this.pollEvents(), 7000);
   },
 
-  FIELDS: ["interval_sec","entry_score","exit_score","intraday_weight","risk_per_trade_pct",
+  FIELDS: ["interval_sec","guard_interval_sec",
+           "entry_score","exit_score","intraday_weight","risk_per_trade_pct",
            "position_pct","max_positions","atr_stop_mult","stop_loss_pct","take_profit_pct",
            "trailing_stop_pct","max_hold_days","max_order_krw","min_order_krw",
            "daily_loss_limit_pct","max_drawdown_pct","max_gross_exposure_pct",
@@ -200,8 +208,12 @@ window.PAGE = {
   onSnapshot(snap) {
     const A = AT, cfg = snap.config || {}, acc = snap.account || {}, day = snap.day || {};
 
-    const dayPnl = (day.start_value && acc.total_value) ? acc.total_value - day.start_value : null;
-    const dayPct = (day.start_value && dayPnl != null) ? dayPnl / day.start_value * 100 : null;
+    // 오늘 손익은 서버가 계산한 값을 그대로 씁니다.
+    // 예전에는 여기서 (총자산 − 오늘 시작 총자산) 을 다시 계산했는데, 그러면
+    // 입금액이 그대로 수익으로 잡힙니다(실측 +1010%). 서버 식은 평가손익
+    // 기준이라 입출금과 무관합니다 — storage/autotrade.touch_daily 참고.
+    const dayPnl = day.pnl != null ? day.pnl : null;
+    const dayPct = day.pnl_pct != null ? day.pnl_pct : null;
     A.$("accStat").innerHTML = [
       ["총자산", A.won(acc.total_value), ""],
       ["총예수금", A.won(acc.cash), ""],
@@ -212,7 +224,11 @@ window.PAGE = {
         : A.won(acc.unrealized_pnl), A.sign(acc.unrealized_pnl)],
       ["묶인 증거금", A.won(acc.margin_locked), ""],
       ["오늘 손익", dayPnl == null ? "—" : A.won(dayPnl) + (dayPct != null ? ` (${A.pct(dayPct)})` : ""), A.sign(dayPnl)],
-      ["누적 실현손익", A.won(snap.summary?.realized_pnl), A.sign(snap.summary?.realized_pnl)],
+      // 누적 손익 = 일자별 '오늘 손익'의 합 (평가손익 포함).
+      // 실현손익만 세면 사서 오르는 중인 종목이 통째로 빠져, 오늘 매매를
+      // 시작한 계좌는 영원히 0원으로 보입니다.
+      ["누적 손익", A.won(snap.summary?.cumulative_pnl), A.sign(snap.summary?.cumulative_pnl)],
+      ["└ 실현", A.won(snap.summary?.realized_pnl), A.sign(snap.summary?.realized_pnl)],
     ].map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("");
     A.$("accSub").textContent = `${snap.identity?.label || ""} 기준 · 주문 ${snap.summary?.orders ?? 0}건 · `
       + `청산 ${snap.summary?.closed_trades ?? 0}건 · 승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`;

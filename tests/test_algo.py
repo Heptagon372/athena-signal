@@ -365,7 +365,9 @@ def test_protections():
     check("prot", "자산이 크면(낙폭 0.65%) 통과", not locks.global_reasons(now))
 
     # 8) 부진 종목 — 그 종목만 잠기고 다른 종목은 통과
-    lp_cfg = {**base_cfg, "protect_cooldown_min": 0, "protect_stoploss_count": 0,
+    #    (쿨다운은 손실 쿨다운까지 명시적으로 꺼서 부진 판정만 검증합니다)
+    lp_cfg = {**base_cfg, "protect_cooldown_min": 0, "protect_cooldown_loss_min": 0,
+              "protect_stoploss_count": 0,
               "protect_drawdown_pct": 0,
               "protect_lowprofit_pct": 0.0, "protect_lowprofit_lookback_min": 1440,
               "protect_lowprofit_min_trades": 3, "protect_lowprofit_stop_min": 120}
@@ -390,6 +392,332 @@ def test_protections():
     locks = protections.evaluate(1, "paper", base_cfg, equity=10_000_000, now=now,
                                  trades=[])
     check("prot", "빈 이력 안전 처리", locks.enabled and not locks.locks)
+
+    # 11) 손실 비대칭 쿨다운 (prism-insight 이식) — 손실 청산은 길게,
+    #     이익 청산은 공통값만. 60분 전 청산 기준: 공통 30분은 이미 지났고
+    #     손실 240분은 아직 안 지났습니다.
+    asym_cfg = {**base_cfg, "protect_cooldown_min": 30,
+                "protect_cooldown_loss_min": 240, "protect_stoploss_count": 0,
+                "protect_drawdown_pct": 0, "protect_lowprofit_lookback_min": 0}
+    asym_trades = [_trade("005930", 60, -50_000, "손절 도달", now),
+                   _trade("000660", 60, 70_000, "목표가 도달", now)]
+    locks = protections.evaluate(1, "paper", asym_cfg, equity=10_000_000, now=now,
+                                 trades=asym_trades)
+    loss_lock = locks.for_symbol("005930", now)
+    check("prot", "손실 청산 60분 뒤: 아직 잠김 (240분 쿨다운)",
+          loss_lock is not None and "복수" in loss_lock.reason,
+          loss_lock.reason if loss_lock else "잠금 없음")
+    check("prot", "이익 청산 60분 뒤: 통과 (공통 30분 경과)",
+          locks.for_symbol("000660", now) is None)
+
+    # 12) 손실 쿨다운을 끄면 공통값만 적용된다
+    locks = protections.evaluate(1, "paper",
+                                 {**asym_cfg, "protect_cooldown_loss_min": 0},
+                                 equity=10_000_000, now=now, trades=asym_trades)
+    check("prot", "손실 쿨다운 0 → 공통 30분만 적용 (60분 뒤 통과)",
+          locks.for_symbol("005930", now) is None)
+
+
+# ---------------------------------------------------------------------------
+# 운영 사고 회귀 검사 — 실계좌에서 실제로 났던 문제들
+# ---------------------------------------------------------------------------
+
+def test_operations():
+    print("\n[운영] 입출금 · 진입 세션 · 사이징 · 회전 주기")
+    import sqlite3
+
+    from config import DB_PATH
+    from engine import autotrade as engine, feed, instruments, strategy
+    from storage import autotrade as store
+
+    # === 1) 오늘 손익이 입출금에 흔들리지 않는가 ==========================
+    # 실측 사고: 11만원 입금 후 '오늘 손익 +1010%'. 반대로 출금하면 없던
+    # 손실이 잡혀 **일일 손실 한도가 잘못 발동**했습니다.
+    #
+    # 지금 식은 (현재 평가손익 − 오늘 시작 평가손익) + 오늘 실현손익 입니다.
+    # 두 항 모두 돈을 넣거나 빼도 변하지 않으므로 입출금이 들어올 자리가 없습니다.
+    uid = 999_903
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM at_daily WHERE user_id = ?", (uid,))
+    conn.commit()
+    conn.close()
+
+    store.touch_daily(uid, "live", 10_000, unrealized=0, cash=10_000)
+    d = store.touch_daily(uid, "live", 10_300, unrealized=300, cash=2_000)
+    check("ops", "오늘 손익 = 평가손익 (매매 시작일)",
+          abs(d["pnl"] - 300) < 1, f"오늘 손익 {d['pnl']:+,.0f}원 = 평가손익 +300원")
+
+    d = store.touch_daily(uid, "live", 120_300, unrealized=300, cash=112_000)
+    check("ops", "11만원 입금해도 오늘 손익 불변",
+          abs(d["pnl"] - 300) < 1,
+          f"총자산 {d['end_value']:,.0f}원인데 손익 {d['pnl']:+,.0f}원 (고치기 전 +110,300원)")
+
+    d = store.touch_daily(uid, "live", 70_300, unrealized=300, cash=62_000)
+    check("ops", "5만원 출금해도 손실로 잡히지 않음",
+          abs(d["pnl"] - 300) < 1 and d["drawdown_pct"] >= -0.01,
+          f"손익 {d['pnl']:+,.0f}원 · 낙폭 {d['drawdown_pct']:+.2f}% "
+          f"(고치기 전 -41% → 매매 중단)")
+
+    store.record_daily_trade(uid, "live", 300)
+    d = store.touch_daily(uid, "live", 70_300, unrealized=0, cash=62_300)
+    check("ops", "익절하면 평가손익 → 실현손익으로 이동 (합계 유지)",
+          abs(d["pnl"] - 300) < 1, f"오늘 손익 {d['pnl']:+,.0f}원")
+
+    s = store.summary(uid, "live")
+    check("ops", "누적 손익에 오늘 손익이 반영됨",
+          abs(s["cumulative_pnl"] - 300) < 1,
+          f"누적 {s['cumulative_pnl']:+,.0f}원")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM at_daily WHERE user_id = ?", (uid,))
+    conn.commit()
+    conn.close()
+
+    # === 2) 신규 진입은 프리마켓·정규장에서만 =============================
+    inst = instruments.try_resolve("AMC")
+    if inst is None:
+        check("ops", "종목 해석 불가로 세션 검사 건너뜀", True, "offline")
+    else:
+        saved = feed.market_status
+        try:
+            def fake(session, label):
+                feed.market_status = lambda i, s=session, l=label: {
+                    "is_open": s != "CLOSED", "is_regular": s == "REGULAR",
+                    "session": s, "label": l, "next_event": ""}
+
+            fake("REGULAR", "정규장")
+            check("ops", "정규장: 진입 허용",
+                  feed.entry_allowed_now(inst, {})[0])
+
+            fake("AFTER", "애프터마켓")
+            check("ops", "애프터마켓: 확장시간을 켜도 진입 금지",
+                  not feed.entry_allowed_now(inst, {"us_extended_hours": True})[0],
+                  "호가가 얇아 스프레드부터 지고 시작합니다")
+
+            fake("PRE", "프리마켓")
+            check("ops", "프리마켓: 스위치 꺼짐이면 대기",
+                  not feed.entry_allowed_now(inst, {})[0])
+            check("ops", "프리마켓: 스위치 켜면 진입 허용",
+                  feed.entry_allowed_now(inst, {"us_extended_hours": True})[0])
+
+            fake("CLOSED", "장 마감")
+            check("ops", "장 마감: 진입 금지",
+                  not feed.entry_allowed_now(inst, {"us_extended_hours": True})[0])
+        finally:
+            feed.market_status = saved
+
+    # === 3) 사이징 — 왜 그 수량인지 내역이 남는가 =========================
+    if inst is not None:
+        account = {"total_value": 110_242, "available_cash": 110_000}
+        cfg = {"risk_per_trade_pct": 1.0, "position_pct": 20.0,
+               "min_order_krw": 0, "min_one_unit": True, "atr_stop_mult": 2.0,
+               "take_profit_pct": 8.0, "algo_mode": "off"}
+        sig = strategy.Signal(key=inst.key, ok=True, direction=strategy.LONG,
+                              price=2.55, price_krw=3_723, atr=0.25)
+        plan = strategy.plan_entry(inst, sig, cfg, account)
+        s = plan.sizing
+        check("ops", "사이징 내역 기록 (한도별 수량 + 결정 한도)",
+              plan.ok and s.get("bound_by") and "qty_by_risk" in s
+              and "qty_by_weight" in s and "qty_by_cash" in s,
+              f"{plan.quantity:g}주 [{s.get('bound_by')}] 위험 {s.get('risk_pct')}%")
+
+        # 1주 값이 비중 상한을 넘으면 — 현금 탓으로 오인하지 않고 원인을 짚는다
+        pricey = strategy.Signal(key=inst.key, ok=True, direction=strategy.LONG,
+                                 price=40.59, price_krw=59_261, atr=2.16)
+        plan2 = strategy.plan_entry(inst, pricey, cfg, account)
+        check("ops", "비중 상한에 막히면 그 사실을 말한다",
+              not plan2.ok and "비중 상한" in plan2.reason,
+              plan2.reason[:60])
+
+        # 최소 1주 허용으로 예산을 넘으면 over_budget 으로 드러난다
+        plan3 = strategy.plan_entry(inst, pricey, {**cfg, "position_pct": 100.0},
+                                    account)
+        check("ops", "최소 1주 허용의 예산 초과가 드러남",
+              plan3.ok and plan3.over_budget and plan3.sizing["risk_pct"] > 1.0,
+              f"위험 {plan3.sizing.get('risk_pct')}% (예산 1.0%)")
+
+    # === 4) 회전 주기 — 설정한 간격대로 도는가 ============================
+    loop = engine.EngineLoop()
+    saved_users, saved_cfg = store.enabled_users, store.get_config
+    import time as _t
+    saved_time = _t.time
+    try:
+        store.enabled_users = lambda: [1]
+
+        # (a) 보호 회전을 끈 상태 — 전체 회전 예정만 봅니다
+        store.get_config = lambda uid: {"interval_sec": 60, "guard_interval_sec": 0}
+        loop._last_run, loop._last_guard = {1: 1000.0}, {1: 1000.0}
+        _t.time = lambda: 1000.0            # 방금 돌았음 → 60초 뒤가 예정
+        wait = loop._sleep_seconds()
+        check("ops", "다음 예정까지만 대기 (고정 15초 아님)",
+              abs(wait - 15.0) < 0.01, f"{wait:.1f}초 (상한 15초에 걸림)")
+        _t.time = lambda: 1055.0            # 5초 뒤가 예정
+        wait = loop._sleep_seconds()
+        check("ops", "예정이 가까우면 그만큼만 대기",
+              abs(wait - 5.0) < 0.01,
+              f"{wait:.1f}초 — 고치기 전에는 15초를 자서 60초가 71초가 됐습니다")
+        _t.time = lambda: 1200.0            # 이미 지남
+        check("ops", "예정이 지났으면 즉시 재개", loop._sleep_seconds() <= 0.5)
+
+        # (b) 보호 회전이 켜져 있으면 그쪽 예정이 먼저 옵니다
+        store.get_config = lambda uid: {"interval_sec": 60, "guard_interval_sec": 5}
+        loop._last_run, loop._last_guard = {1: 1000.0}, {1: 1000.0}
+        _t.time = lambda: 1002.0            # 전체는 58초 뒤, 보호는 3초 뒤
+        wait = loop._sleep_seconds()
+        check("ops", "보호 회전 예정이 더 가까우면 그쪽에 맞춰 깨어남",
+              abs(wait - 3.0) < 0.01, f"{wait:.1f}초")
+    finally:
+        _t.time = saved_time
+        store.enabled_users, store.get_config = saved_users, saved_cfg
+
+    # === 5) 보호 회전은 손절만 보고 익절·신호반전은 안 본다 ===============
+    from types import SimpleNamespace
+    inst_k = instruments.try_resolve("005930")
+    if inst_k is not None:
+        position = SimpleNamespace(side=strategy.LONG, avg_price=100.0,
+                                   current_price=108.0, quantity=10)
+        state = {"entry_price": 100.0, "stop_price": 95.0,
+                 "target_price": 108.0, "peak_price": 110.0}
+
+        # 익절 도달 — 전체 회전은 팔고, 보호 회전은 넘어갑니다
+        hit_target = strategy.Signal(key=inst_k.key, ok=True, price=108.0, score=0.0)
+        full = strategy.check_exit(inst_k, position, hit_target, {}, dict(state))
+        guard = strategy.check_exit(inst_k, position, hit_target, {}, dict(state),
+                                    protective_only=True)
+        check("ops", "보호 회전: 익절은 다음 정규 회전으로 미룸",
+              full.should_exit and not guard.should_exit,
+              f"전체='{full.reason[:24]}' / 보호=대기")
+
+        # 손절 도달 — 둘 다 즉시 팝니다
+        hit_stop = strategy.Signal(key=inst_k.key, ok=True, price=94.0, score=0.0)
+        full = strategy.check_exit(inst_k, position, hit_stop, {}, dict(state))
+        guard = strategy.check_exit(inst_k, position, hit_stop, {}, dict(state),
+                                    protective_only=True)
+        check("ops", "보호 회전: 손절은 즉시 실행",
+              full.should_exit and guard.should_exit and "손절" in guard.reason,
+              guard.reason[:40])
+
+        # 트레일링 되돌림도 보호 대상입니다
+        trail_cfg = {"trailing_stop_pct": 3.0}
+        pulled = strategy.Signal(key=inst_k.key, ok=True, price=105.0, score=0.0)
+        guard = strategy.check_exit(inst_k, position, pulled, trail_cfg, dict(state),
+                                    protective_only=True)
+        check("ops", "보호 회전: 트레일링 되돌림도 즉시 실행",
+              guard.should_exit and "되돌림" in guard.reason, guard.reason[:40])
+
+        # 신호 반전은 지표가 없으므로 보지 않습니다
+        reversed_sig = strategy.Signal(key=inst_k.key, ok=True, price=101.0,
+                                       score=-0.9)
+        full = strategy.check_exit(inst_k, position, reversed_sig, {}, dict(state))
+        guard = strategy.check_exit(inst_k, position, reversed_sig, {}, dict(state),
+                                    protective_only=True)
+        check("ops", "보호 회전: 신호 반전은 판단하지 않음",
+              full.should_exit and not guard.should_exit,
+              f"전체='{full.reason[:24]}' / 보호=대기")
+
+
+# ---------------------------------------------------------------------------
+# Market Pulse — 오닐 시장 방향 상태기계 (engine/marketpulse.py)
+# ---------------------------------------------------------------------------
+
+def _pulse_bars(rows: list[tuple[float, float | None]]) -> "pd.DataFrame":
+    """[(close, volume), ...] → 지수 프록시 일봉."""
+    idx = pd.bdate_range(end="2026-08-05", periods=len(rows))
+    return pd.DataFrame({
+        "close": [r[0] for r in rows],
+        "volume": [r[1] for r in rows],
+    }, index=idx)
+
+
+def test_marketpulse():
+    print("\n[Market Pulse] engine/marketpulse.py")
+    from engine import ensemble, marketpulse
+
+    # 1) 꾸준한 상승 — 분산일 없음 → UPTREND
+    rows = [(100 * (1.003 ** i), 100.0) for i in range(60)]
+    pulse = marketpulse.pulse_of(_pulse_bars(rows))
+    check("pulse", "상승 추세 → UPTREND", pulse is not None
+          and pulse["state"] == marketpulse.UPTREND
+          and pulse["distribution_days"] == 0,
+          f"{pulse['state']} DD={pulse['distribution_days']}" if pulse else "None")
+
+    # 2) 분산일 축적 — 하락(−0.5%)+거래량 증가를 6번 → CORRECTION
+    #    (오르는 날은 거래량이 줄고, 내리는 날만 거래량이 늘어나는 전형적 분산)
+    rows = [(100 + i * 0.2, 100.0) for i in range(30)]      # 워밍업
+    price = rows[-1][0]
+    states = []
+    for i in range(6):
+        price *= 1.001
+        rows.append((price, 80.0))                          # 상승일 (거래량 감소)
+        price *= 0.994                                      # −0.6% 하락
+        rows.append((price, 120.0 + i * 10))                # 거래량 증가 → DD
+        states.append(marketpulse.pulse_of(_pulse_bars(rows))["state"])
+    check("pulse", "분산일 6개 → CORRECTION",
+          states[-1] == marketpulse.CORRECTION,
+          f"진행: {' → '.join(states)}")
+    check("pulse", "분산일 4~5개 구간은 UNDER_PRESSURE",
+          marketpulse.UNDER_PRESSURE in states)
+
+    # 3) 팔로우스루 — 랠리 4일차 +1.5% 거래량 증가 → UPTREND 복귀 + DD 리셋
+    low = rows[-1][0]
+    rows.append((low * 1.002, 90.0))            # 랠리 1일차 (첫 상승)
+    rows.append((low * 1.004, 85.0))            # 2일차
+    rows.append((low * 1.005, 80.0))            # 3일차
+    rows.append((low * 1.021, 150.0))           # 4일차 +1.6% + 거래량 급증 = FTD
+    pulse = marketpulse.pulse_of(_pulse_bars(rows))
+    check("pulse", "FTD → UPTREND 복귀 + 분산일 리셋",
+          pulse["state"] == marketpulse.UPTREND and pulse["distribution_days"] == 0,
+          f"{pulse['state']} DD={pulse['distribution_days']}")
+
+    # 4) 폭포 하락 (거래량 정보 없음) — 분산일 0이어도 −10% 이탈로 CORRECTION
+    #    거래량 없이는 DD 를 못 세는 것과, 가격 트리거(Rev.2)를 함께 검증합니다.
+    rows = [(100.0, None)] * 30 + [(96.0, None), (92.0, None), (88.0, None)]
+    pulse = marketpulse.pulse_of(_pulse_bars(rows))
+    check("pulse", "폭포 −12% (거래량 결측) → 가격 트리거로 CORRECTION",
+          pulse["state"] == marketpulse.CORRECTION and pulse["distribution_days"] == 0,
+          f"{pulse['state']} DD={pulse['distribution_days']}")
+
+    # 5) 가격 회복 탈출 — 조정 전 고점 위 종가 = 신고가 = UPTREND
+    rows.append((101.0, None))
+    pulse = marketpulse.pulse_of(_pulse_bars(rows))
+    check("pulse", "조정 전 고점 회복 → UPTREND",
+          pulse["state"] == marketpulse.UPTREND)
+
+    # 6) anti-flap — 탈출 뒤 −9% 는 재트리거하지 않는다 (새 −10% 필요)
+    rows.append((92.5, None))                   # 탈출 종가 101 대비 −8.4%
+    pulse = marketpulse.pulse_of(_pulse_bars(rows))
+    check("pulse", "탈출 후 −8.4% 는 조정 재진입 아님",
+          pulse["state"] != marketpulse.CORRECTION, pulse["state"])
+
+    # 7) ensemble 통합 — 시장 상태를 주입해 감쇠를 검증 (네트워크 없음)
+    original = marketpulse.market_state
+    try:
+        marketpulse.market_state = lambda market: {
+            "state": "CORRECTION", "label": "조정 국면", "distribution_days": 7,
+            "in_rally_attempt": False, "rally_day": 0, "proxy": "TEST"}
+        bars = _bars(300, seed=7)
+        obs = ensemble.compute(bars, 0.6, None, {"algo_mode": "observe"},
+                               market="KOSPI")
+        soft = ensemble.compute(bars, 0.6, None, {"algo_mode": "soft"},
+                                market="KOSPI")
+        check("pulse", "observe: 상태 첨부 + 점수 불변",
+              obs.pulse.get("state") == "CORRECTION"
+              and obs.score == obs.base_score)
+        check("pulse", "soft: CORRECTION 감쇠 적용 (차단은 안 함)",
+              soft.score < soft.base_score and not soft.block
+              and not soft.blocked_by,
+              f"{soft.base_score:+.3f} → {soft.score:+.3f}")
+        gate = ensemble.compute(bars, 0.6, None, {"algo_mode": "gate"},
+                                market="KOSPI")
+        check("pulse", "gate 에서도 조정장 차단 없음 (V2 감사 반영)",
+              not gate.block and not gate.blocked_by)
+    finally:
+        marketpulse.market_state = original
+
+    # 8) market 미지정(백테스트 경로) — 시장 상태를 아예 읽지 않는다
+    state = ensemble.compute(_bars(300, seed=8), 0.5, None,
+                             {"algo_mode": "soft"}, market="")
+    check("pulse", "market 미지정 시 무동작", not state.pulse)
 
 
 # ---------------------------------------------------------------------------
@@ -456,12 +784,44 @@ def test_strategy_integration():
     check("integ", "plan_entry: gate 모드 0.2% 목표 비용 거부",
           not plan.ok and "거래비용" in plan.reason, plan.reason[:60])
 
+    # 승자 보유 (hold_winners — prism-insight oneil_fallback 이식)
+    # 50일선 +3% 위 + 진입 후 고점의 97% 이내면 목표가 익절을 보류합니다.
+    from types import SimpleNamespace
+    position = SimpleNamespace(side=strategy.LONG, avg_price=100.0,
+                               current_price=110.0, quantity=10)
+    winner_sig = strategy.Signal(key=inst.key, ok=True, price=110.0, ma50=100.0)
+    hold_state = {"entry_price": 100.0, "target_price": 108.0, "peak_price": 111.0}
+
+    plain = strategy.check_exit(inst, position, winner_sig, {}, dict(hold_state))
+    check("integ", "hold_winners 꺼짐: 목표가 도달 → 익절",
+          plain.should_exit and "목표가" in plain.reason)
+
+    held = strategy.check_exit(inst, position, winner_sig,
+                               {"hold_winners": True}, dict(hold_state))
+    check("integ", "hold_winners 켜짐: 추세 지속 → 익절 보류",
+          not held.should_exit)
+
+    # 추세가 꺾이면(50일선 근처로 후퇴) 보유 게이트가 풀려 익절이 나간다
+    tired_sig = strategy.Signal(key=inst.key, ok=True, price=110.0, ma50=109.0)
+    tired = strategy.check_exit(inst, position, tired_sig,
+                                {"hold_winners": True}, dict(hold_state))
+    check("integ", "hold_winners: 50일선 이격 소멸 → 익절 재개",
+          tired.should_exit and "목표가" in tired.reason)
+
+    # 보유 게이트가 켜져 있어도 손절은 그대로 나간다 (지키는 장치 우선)
+    stop_state = {**hold_state, "stop_price": 110.5}
+    stopped = strategy.check_exit(inst, position, winner_sig,
+                                  {"hold_winners": True}, dict(stop_state))
+    check("integ", "hold_winners 켜져도 손절은 즉시 실행",
+          stopped.should_exit and "손절" in stopped.reason)
+
 
 # ---------------------------------------------------------------------------
 
 def report() -> bool:
     print("\n" + "=" * 60)
-    names = {"prep": "전처리", "ens": "앙상블", "prot": "보호장치", "integ": "통합"}
+    names = {"prep": "전처리", "ens": "앙상블", "prot": "보호장치",
+             "pulse": "Market Pulse", "ops": "운영", "integ": "통합"}
     by_cat: dict = {}
     for cat, _, ok, _ in results:
         n, p = by_cat.get(cat, (0, 0))
@@ -488,6 +848,8 @@ if __name__ == "__main__":
     test_preprocess()
     test_ensemble()
     test_protections()
+    test_operations()
+    test_marketpulse()
     test_strategy_integration()
     ok = report()
     sys.exit(0 if ok else 1)

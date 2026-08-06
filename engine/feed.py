@@ -208,13 +208,59 @@ def market_status(inst: Instrument) -> dict:
 
 
 def is_tradable_now(inst: Instrument, regular_only: bool = True) -> tuple[bool, str]:
-    """(거래 가능 여부, 사유)."""
+    """(거래 가능 여부, 사유). 청산 경로가 씁니다 — 진입은 entry_allowed_now."""
     status = market_status(inst)
     if regular_only and not status["is_regular"]:
         return False, f"정규장이 아닙니다 ({status['label']})"
     if not status["is_open"]:
         return False, f"장이 열려 있지 않습니다 ({status['label']})"
     return True, status["label"]
+
+
+# 신규 진입을 허용하는 세션 — **프리마켓과 정규장뿐입니다.**
+#
+# 애프터마켓(미국)과 시간외 단일가(한국)를 뺀 이유: 호가가 얇아 스프레드가
+# 벌어지고, 한국 시간외는 10분 단위 단일가라 낸 가격에 체결된다는 보장이
+# 없습니다. 그 구간에 새로 들어가면 시작부터 비용을 지고 갑니다.
+# 반대로 **청산은 이 제한을 받지 않습니다** — 못 들어가는 것은 기회 손실이지만
+# 못 나오는 것은 손실입니다 (check_exit 는 그대로 is_tradable_now 를 씁니다).
+ENTRY_SESSIONS = ("REGULAR", "PRE", "PRE_AUCTION")
+_PRE_SESSIONS = ("PRE", "PRE_AUCTION")
+
+
+def entry_allowed_now(inst: Instrument, cfg: dict) -> tuple[bool, str, str]:
+    """지금 이 종목에 **신규 진입**을 시도해도 되는가. (가능여부, 사유, 세션키)
+
+    자동매매 루프가 신호를 계산하기 **전에** 이걸 먼저 봅니다. 예전에는 지표를
+    다 계산하고 주문 직전 리스크 게이트에서야 "정규장이 아닙니다"로 거부했습니다.
+    한국 종목이 유니버스에 있으면 미국장 시간(새벽) 내내 회전마다 지표를
+    계산하고 버렸고, 거부 로그만 쌓였습니다.
+    """
+    status = market_status(inst)
+    session = status.get("session", "")
+    label = status.get("label", "")
+
+    if session not in ENTRY_SESSIONS:
+        return False, f"신규 진입 시간이 아닙니다 ({label})", session
+
+    if session in _PRE_SESSIONS and not _pre_market_allowed(inst, cfg):
+        return False, f"프리마켓 신규 진입이 꺼져 있습니다 ({label})", session
+
+    if not status["is_open"]:
+        return False, f"장이 열려 있지 않습니다 ({label})", session
+    return True, label, session
+
+
+def _pre_market_allowed(inst: Instrument, cfg: dict) -> bool:
+    """프리마켓 진입을 허용하는 스위치.
+
+    한국 시간외 단일가와 미국 확장 시간은 성격이 달라 스위치를 분리해 뒀습니다
+    (engine/risk.py 의 _regular_only 와 같은 이유).
+    """
+    cfg = cfg or {}
+    if inst.market == "US":
+        return bool(cfg.get("us_extended_hours"))
+    return not bool(cfg.get("regular_session_only", True))
 
 
 # ---------------------------------------------------------------------------
@@ -259,4 +305,5 @@ def front_month_futures(underlying: str = "01") -> Instrument | None:
 
 
 __all__ = ["quote", "price_krw", "bars", "market_status", "is_tradable_now",
+           "entry_allowed_now", "ENTRY_SESSIONS",
            "days_to_expiry", "front_month_futures", "clear_cache", "QUOTE_TTL"]

@@ -30,7 +30,18 @@ from config import DB_PATH
 DEFAULT_CONFIG = {
     # 실행
     "mode": "paper",                  # paper | mock | live
-    "interval_sec": 60,               # 회전 주기(초)
+    "interval_sec": 60,               # 전체 회전 주기(초) — 신호 계산 + 신규 진입
+    # 보호 회전 주기(초). 전체 회전 사이사이에 **보유 포지션의 손절·트레일링·
+    # 시간 청산만** 확인합니다. 지표를 계산하지 않아 종목당 시세 조회 한 번이라
+    # 짧게 돌 수 있습니다. 0 이면 사용하지 않습니다(예전 동작).
+    #
+    # 왜 필요한가: 전체 회전이 60초면 손절선이 뚫려도 최대 60초를 기다립니다.
+    # 익절이 늦는 것은 기회 손실이지만 손절이 늦는 것은 손실입니다.
+    #
+    # 기본 10초인 이유: 보유 종목당 시세 조회 한 번이 듭니다. 3종목이면
+    # 10초에 3회(초당 0.3회)로, 무료 시세 제공처가 견디는 범위입니다.
+    # 더 짧게 잡으면 반응은 빨라지지만 차단당할 위험이 올라갑니다.
+    "guard_interval_sec": 10,
     "universe": ["005930", "000660", "069500"],   # 삼성전자 · SK하이닉스 · KODEX200
     "asset_classes": {"STOCK": True, "ETF": True, "FUTURES": False, "OPTION": False},
 
@@ -76,6 +87,7 @@ DEFAULT_CONFIG = {
     # 최근 매매 이력이 나쁠 때 신규 진입을 잠급니다. 청산은 막지 않습니다.
     "protect_enabled": False,
     "protect_cooldown_min": 30,             # 청산 후 같은 종목 재진입 금지(분)
+    "protect_cooldown_loss_min": 240,       # 손실 청산 후는 더 길게(복수 매매 방지)
     "protect_stoploss_count": 3,            # lookback 안 손절 횟수 한도
     "protect_stoploss_lookback_min": 240,
     "protect_stoploss_stop_min": 60,
@@ -123,6 +135,11 @@ DEFAULT_CONFIG = {
     "trailing_stop_pct": 0.0,         # 0 = 사용 안 함
     "reward_risk": 2.0,
     "max_hold_days": 15,
+    # 승자 보유 (오닐 — prism-insight 이식): 50일선 +3% 위 + 진입 후 고점의
+    # 97% 이내면 목표가 익절을 보류하고 추세가 꺾일 때까지 들고 갑니다.
+    # 손절·트레일링·시간 청산은 그대로 작동합니다. 기본 꺼짐 — 익절 방식을
+    # 바꾸는 스위치라 사람이 켜는 것이 맞습니다.
+    "hold_winners": False,
 
     # 주문 집행
     "order_timeout_sec": 180,         # 이 시간 안에 안 체결되면 주문을 취소합니다
@@ -280,6 +297,25 @@ def init():
         _migrate_scope(conn)
         # 모드 분리로 테이블을 새로 만드는 경우가 있어서, 컬럼 추가는 그 뒤입니다
         _migrate_position_state(conn)
+        _migrate_daily(conn)
+
+
+def _migrate_daily(conn):
+    """오늘 손익을 입출금과 무관하게 계산하기 위한 컬럼.
+
+    start_unrealized  오늘 첫 회전 시점의 평가손익 (밤새 들고 있던 포지션 몫)
+    day_pnl           오늘 손익 확정값 — 누적 집계가 이걸 더합니다
+    last_cash         직전 회전의 예수금 (참고·진단용)
+    external_flow     오늘 들어오고 나간 현금 합계 (손익이 아님을 명시적으로 분리)
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(at_daily)")}
+    for column, ddl in (("last_cash", "REAL"),
+                        ("external_flow", "REAL NOT NULL DEFAULT 0"),
+                        ("start_unrealized", "REAL"),
+                        ("day_pnl", "REAL NOT NULL DEFAULT 0"),
+                        ("peak_pnl", "REAL NOT NULL DEFAULT 0")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE at_daily ADD COLUMN {column} {ddl}")
 
 
 def _migrate_scope(conn):
@@ -898,11 +934,26 @@ def get_recommendations(user_id: int) -> list[dict]:
 
 
 def touch_daily(user_id: int, mode: str, total_value: float,
-                trade_date: str = None) -> dict:
-    """오늘의 시작·최고·현재 평가금액을 갱신하고 돌려줍니다.
+                unrealized: float = None, cash: float = None,
+                settled: int = 0, trade_date: str = None) -> dict:
+    """오늘의 손익·최고 평가금액을 갱신하고 돌려줍니다.
 
-    일일 손실 한도는 '오늘 시작 대비'로 재는 것이 맞습니다. 누적 손익으로 재면
-    어제까지 벌어둔 돈이 오늘의 손실을 가려 한도가 작동하지 않습니다.
+    오늘 손익 = (현재 평가손익 − 오늘 시작 평가손익) + 오늘 실현손익
+
+    **왜 총자산 차이로 재지 않는가 — 입금 때문입니다.**
+        예전에는 `총자산 − 오늘 시작 총자산` 으로 쟀습니다. 계좌에 돈을 넣으면
+        총자산이 그만큼 뛰므로 입금액이 통째로 수익으로 잡혔습니다
+        (실측: 11만원 입금 후 '오늘 손익 +1010%'). 반대로 출금하면 없던 손실이
+        생겨 **일일 손실 한도가 잘못 발동해 매매가 멈춥니다.**
+
+        입출금을 탐지해 기준선을 옮기는 방법도 써 봤지만, 탐지가 한 번이라도
+        어긋나면 같은 버그가 다시 납니다(실제로 콘솔이 7초마다 예수금 기록을
+        지워서 탐지가 통째로 무력화됐습니다).
+
+        지금 식은 **탐지가 필요 없습니다.** 평가손익과 실현손익은 돈을 넣거나
+        빼도 변하지 않습니다. 입출금이 계산에 들어올 자리가 아예 없습니다.
+
+    unrealized 를 넘기지 않으면(옛 호출부) 총자산 기준으로 되돌아갑니다.
 
     **계좌(모드)별로 따로 기록합니다.** 모의계좌 1천만원을 기준으로 실계좌
     300만원을 재면 첫 회전에 '-70% 손실'로 오판합니다.
@@ -910,6 +961,9 @@ def touch_daily(user_id: int, mode: str, total_value: float,
     init()
     trade_date = trade_date or date.today().isoformat()
     total_value = float(total_value or 0)
+    cash = float(cash) if cash is not None else None
+    unrealized = float(unrealized) if unrealized is not None else None
+
     with _conn() as conn:
         row = conn.execute(
             "SELECT * FROM at_daily WHERE user_id = ? AND mode = ? AND trade_date = ?",
@@ -917,22 +971,54 @@ def touch_daily(user_id: int, mode: str, total_value: float,
         if not row:
             conn.execute(
                 "INSERT INTO at_daily (user_id, mode, trade_date, start_value, "
-                "peak_value, end_value) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, mode, trade_date, total_value, total_value, total_value))
+                "peak_value, end_value, last_cash, start_unrealized, day_pnl) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (user_id, mode, trade_date, total_value, total_value, total_value,
+                 cash, unrealized))
             return {"trade_date": trade_date, "mode": mode, "start_value": total_value,
                     "peak_value": total_value, "end_value": total_value,
-                    "realized_pnl": 0.0, "trade_count": 0}
+                    "realized_pnl": 0.0, "trade_count": 0, "external_flow": 0.0,
+                    "start_unrealized": unrealized, "unrealized": unrealized,
+                    "pnl": 0.0, "pnl_pct": 0.0}
+
+        start = float(row["start_value"])
+        realized = float(row["realized_pnl"] or 0)
+        external = float(row["external_flow"] or 0)
+        start_unrealized = row["start_unrealized"]
+
+        # 오늘 첫 회전에 평가손익을 못 받았다면(옛 호출부) 지금 값을 기준으로
+        # 삼습니다. 그 시점부터의 변화만 오늘 손익이 됩니다.
+        if start_unrealized is None and unrealized is not None:
+            start_unrealized = unrealized
+
+        if unrealized is not None and start_unrealized is not None:
+            pnl = (unrealized - float(start_unrealized)) + realized
+        else:
+            pnl = total_value - start          # 옛 방식 (입출금에 취약)
 
         peak = max(float(row["peak_value"]), total_value)
+        # 낙폭도 **손익 기준**으로 잽니다. 총자산 최고점 대비로 재면 출금할 때
+        # 총자산만 떨어져 없던 낙폭이 잡히고 매매가 멈춥니다.
+        peak_pnl = max(float(row["peak_pnl"] or 0), pnl)
+
         conn.execute(
-            "UPDATE at_daily SET peak_value = ?, end_value = ? "
+            "UPDATE at_daily SET peak_value = ?, end_value = ?, last_cash = ?, "
+            "start_unrealized = ?, day_pnl = ?, peak_pnl = ? "
             "WHERE user_id = ? AND mode = ? AND trade_date = ?",
-            (peak, total_value, user_id, mode, trade_date))
+            (peak, total_value, cash, start_unrealized, pnl, peak_pnl,
+             user_id, mode, trade_date))
+
+        base = start if start > 0 else (total_value or 1)
         return {"trade_date": trade_date, "mode": mode,
-                "start_value": float(row["start_value"]),
-                "peak_value": peak, "end_value": total_value,
-                "realized_pnl": float(row["realized_pnl"]),
-                "trade_count": int(row["trade_count"])}
+                "start_value": start, "peak_value": peak, "end_value": total_value,
+                "realized_pnl": realized,
+                "trade_count": int(row["trade_count"]),
+                "external_flow": external,
+                "start_unrealized": start_unrealized,
+                "unrealized": unrealized,
+                "pnl": pnl, "peak_pnl": peak_pnl,
+                "pnl_pct": pnl / base * 100 if base else 0.0,
+                "drawdown_pct": (pnl - peak_pnl) / base * 100 if base else 0.0}
 
 
 def record_daily_trade(user_id: int, mode: str, realized_pnl: float = 0.0,
@@ -977,6 +1063,14 @@ def summary(user_id: int, mode: str = None) -> dict:
             "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) wins "
             f"FROM at_orders WHERE user_id = ? AND realized_pnl IS NOT NULL{scope}",
             args).fetchone()
+        # 누적 손익 — 날짜별로 확정해 둔 '오늘 손익'을 전부 더합니다.
+        # 실현손익(판 것)만 세면, 사서 오르는 중인 종목의 성과가 통째로 빠져
+        # 오늘 하루 매매를 시작한 계좌는 영원히 0원으로 보입니다.
+        day_scope = " AND mode = ?" if mode else ""
+        cumulative = conn.execute(
+            f"SELECT SUM(day_pnl) t FROM at_daily WHERE user_id = ?{day_scope}",
+            args).fetchone()
+
     closed = int(pnl["n"] or 0)
     wins = int(pnl["wins"] or 0)
     return {
@@ -986,4 +1080,6 @@ def summary(user_id: int, mode: str = None) -> dict:
         "wins": wins,
         "win_rate": (wins / closed * 100) if closed else 0.0,
         "realized_pnl": float(pnl["total"] or 0),
+        # 평가손익까지 포함한 누적 성과 (일자별 '오늘 손익'의 합)
+        "cumulative_pnl": float(cumulative["t"] or 0),
     }

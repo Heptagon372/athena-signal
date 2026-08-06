@@ -35,6 +35,12 @@ DEFAULTS = {
 
     # 1) 쿨다운 — 청산 후 이 시간 동안 같은 종목 재진입 금지 (0이면 사용 안 함)
     "protect_cooldown_min": 30,
+    # 손실 청산 뒤에는 더 길게 쉽니다 (0이면 위 공통값만 적용).
+    # prism-insight 의 실계좌 진단 이식: 하루 안 재매수 왕복 31건이 평균 −5.6%,
+    # −10% 로 판 종목을 0.78일 만에 되사는 패턴이 반복됐습니다. 손실 후 재진입
+    # (복수 매매)이 문제였고, **이익 실현 후 재진입은 정당한 추세 지속**이라
+    # 두 경우를 같은 잣대로 묶으면 안 됩니다.
+    "protect_cooldown_loss_min": 240,
 
     # 2) 손절 감시 — lookback 안에 손절이 count 회 이상이면 stop 분간 잠금
     "protect_stoploss_count": 3,
@@ -184,22 +190,46 @@ def _cooldown(trades: list, params: dict, now: datetime) -> list[Lock]:
     막는 이유는 신호가 틀려서가 아닙니다. 방금 나온 자리는 **직전 판단이
     이미 반영된 가격**이라, 같은 지표가 같은 신호를 다시 낼 수밖에 없습니다.
     그래서 손절 → 재진입 → 손절이 몇 분 간격으로 반복됩니다.
+
+    손실 청산은 더 길게 쉽니다 (prism-insight reentry_cooldown 이식).
+    원본의 실계좌 진단: 손실로 판 종목을 하루 안에 되사는 '복수 매매'가
+    체계적 손실원이었습니다 (왕복 31건 평균 −5.6%). 반대로 이익 실현 뒤
+    재진입은 추세 지속의 정당한 형태라 공통 쿨다운만 적용합니다.
     """
     minutes = int(params["protect_cooldown_min"])
-    if minutes <= 0:
+    loss_minutes = int(params.get("protect_cooldown_loss_min") or 0)
+    if minutes <= 0 and loss_minutes <= 0:
         return []
 
-    latest: dict[str, datetime] = {}
+    latest: dict[str, datetime] = {}         # 마지막 청산 (손익 무관)
+    latest_loss: dict[str, datetime] = {}    # 마지막 손실 청산
     for trade in trades:
         symbol = str(trade.get("symbol") or "")
+        if not symbol:
+            continue
         when = _closed_at(trade)
-        if symbol and (symbol not in latest or when > latest[symbol]):
+        if symbol not in latest or when > latest[symbol]:
             latest[symbol] = when
+        if float(trade.get("realized_pnl") or 0) < 0 and \
+                (symbol not in latest_loss or when > latest_loss[symbol]):
+            latest_loss[symbol] = when
 
     out = []
     for symbol, when in latest.items():
-        until = when + timedelta(minutes=minutes)
-        if until > now:
+        until = when + timedelta(minutes=minutes) if minutes > 0 else None
+        loss_at = latest_loss.get(symbol)
+        loss_until = (loss_at + timedelta(minutes=loss_minutes)
+                      if loss_at and loss_minutes > 0 else None)
+
+        if loss_until and (until is None or loss_until > until):
+            if loss_until > now:
+                out.append(Lock(
+                    protection="cooldown", scope=SYMBOL, symbol=symbol,
+                    until=loss_until,
+                    reason=f"손실 청산 후 쿨다운(복수 매매 방지) — "
+                           f"{(loss_until - now).total_seconds() / 60:.0f}분 남음 "
+                           f"(설정 {loss_minutes}분)"))
+        elif until and until > now:
             out.append(Lock(
                 protection="cooldown", scope=SYMBOL, symbol=symbol, until=until,
                 reason=f"청산 직후 쿨다운 — {(until - now).total_seconds() / 60:.0f}분 남음 "
@@ -380,6 +410,9 @@ def describe(cfg: dict = None) -> list[dict]:
          "value": "켜짐" if p["protect_enabled"] else "꺼짐"},
         {"key": "protect_cooldown_min", "label": "청산 후 재진입 금지",
          "value": f"{p['protect_cooldown_min']}분" if p["protect_cooldown_min"] else "없음"},
+        {"key": "protect_cooldown_loss_min", "label": "손실 청산 후 재진입 금지",
+         "value": (f"{p['protect_cooldown_loss_min']}분 (복수 매매 방지)"
+                   if p["protect_cooldown_loss_min"] else "공통값만 적용")},
         {"key": "protect_stoploss_count", "label": "손절 감시",
          "value": f"{p['protect_stoploss_lookback_min']}분 안에 "
                   f"{p['protect_stoploss_count']}회 → {p['protect_stoploss_stop_min']}분 중단"},

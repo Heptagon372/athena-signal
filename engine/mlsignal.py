@@ -1,23 +1,24 @@
 """
-ML 오버레이 (XGBoost·PatchTST 이식 신호)
----------------------------------------
-두 예측기를 하나의 점수로 묶어 기존 신호에 **소프트 결합**하는 곳입니다.
+ML 오버레이 (XGBoost·LightGBM·PatchTST·Kalman 이식 위원회)
+---------------------------------------------------------
+네 예측기를 하나의 점수로 묶어 기존 신호에 **소프트 결합**하는 곳입니다.
 
-    engine/gbdt.py      XGBoost 이식 — 피처 조합의 상호작용 (횡단 관점)
-    engine/patchtst.py  PatchTST 이식 — 시계열 모양의 반복 (시계열 관점)
+    engine/gbdt.py "xgb"   XGBoost 이식 — 깊이 우선 트리 (피처 상호작용)
+    engine/gbdt.py "lgbm"  LightGBM 이식 — 리프 우선 + GOSS (같은 재료, 다른 성장)
+    engine/patchtst.py     PatchTST 이식 — 시계열 모양의 반복 (패치 어텐션)
+    engine/kalman.py       filterpy 이식 — 국소 선형 추세 + 적응형 Q (상태공간)
 
-둘은 서로 다른 실패 방식을 갖습니다. 부스팅은 피처에 없는 패턴을 못 보고,
-패치 어텐션은 과거에 없던 모양 앞에서 무력합니다. 그래서 합의를 요구하지 않고
-**각자의 검증 성적으로 가중**해 섞습니다 — 검증에서 무가치했던 쪽은 그 회전에서
-자연히 0 에 가까운 가중치를 받습니다.
+넷은 서로 다른 실패 방식을 갖습니다. 부스팅은 피처에 없는 패턴을 못 보고,
+패치 어텐션은 과거에 없던 모양 앞에서 무력하며, 칼만 추세는 횡보에서 뒤집니다.
+그래서 합의를 요구하지 않고 **각자의 검증 성적으로 가중**해 섞습니다 —
+검증에서 무가치했던 쪽은 그 회전에서 자연히 0 에 가까운 가중치를 받습니다.
 
 품질 게이트 — 예측기는 자격을 증명해야 점수에 들어갑니다
-    GBDT   시간순 검증 적중률이 기준(기본 55%) 이상이고, 다수 클래스만 찍는
-           것보다 나아야(edge > 0) 합니다. 데이터를 외운 모델은 검증에서
-           걸러집니다.
-    Patch  실질 이웃 수·방향 합의로 계산한 confidence 가 기준 이상이어야
-           합니다. "닮은 과거가 없는데 억지로 평균한" 예측을 거릅니다.
-    둘 다 탈락하면 이 회전에서 ML 은 **아무 힘도 갖지 않습니다** (관찰 기록만 남음).
+    GBDT 두 변형   시간순 검증 적중률 ≥ 기준(기본 55%) + 다수 클래스 초과(edge>0).
+                   각자 따로 심사받습니다 (한쪽만 통과하는 날이 흔합니다).
+    Patch          실질 이웃 수·방향 합의 confidence ≥ 기준
+    Kalman         인과적 과거 채점 적중률 ≥ 기준 (표본 30개 이상)
+    전원 탈락이면 이 회전에서 ML 은 **아무 힘도 갖지 않습니다** (관찰 기록만 남음).
 
 모드 (ml_mode)
     off      계산하지 않음
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from engine import gbdt, patchtst
+from engine import gbdt, kalman, patchtst
 
 OFF, OBSERVE, SOFT = "off", "observe", "soft"
 MODES = (OFF, OBSERVE, SOFT)
@@ -60,10 +61,14 @@ class MLState:
     mode: str = OBSERVE
     score: float | None = None       # 결합 점수 (품질 미달이면 None)
     confidence: float = 0.0
-    gbdt: dict = field(default_factory=dict)
+    gbdt: dict = field(default_factory=dict)          # XGBoost 방식
+    lgbm: dict = field(default_factory=dict)          # LightGBM 방식
     patch: dict = field(default_factory=dict)
+    kalman: dict = field(default_factory=dict)
     gbdt_used: bool = False
+    lgbm_used: bool = False
     patch_used: bool = False
+    kalman_used: bool = False
     notes: list = field(default_factory=list)
     error: str = ""
 
@@ -75,9 +80,11 @@ class MLState:
         return {"ok": self.ok, "mode": self.mode,
                 "score": round(self.score, 4) if self.score is not None else None,
                 "confidence": round(self.confidence, 3),
-                "gbdt": self.gbdt, "patch": self.patch,
-                "gbdt_used": self.gbdt_used, "patch_used": self.patch_used,
-                "notes": self.notes[:4], "error": self.error}
+                "gbdt": self.gbdt, "lgbm": self.lgbm,
+                "patch": self.patch, "kalman": self.kalman,
+                "gbdt_used": self.gbdt_used, "lgbm_used": self.lgbm_used,
+                "patch_used": self.patch_used, "kalman_used": self.kalman_used,
+                "notes": self.notes[:6], "error": self.error}
 
 
 def mode_of(cfg: dict) -> str:
@@ -143,13 +150,32 @@ def _cache_key(key: str, bars: pd.DataFrame, params: dict):
 
 def _compute(bars: pd.DataFrame, params: dict, state: MLState) -> MLState:
     h = int(params["horizon_bars"])
+    min_acc = float(params["min_val_accuracy"])
+    min_conf = float(params["min_confidence"])
+    parts: list[tuple[float, float]] = []      # (점수, 가중치)
 
-    # 1) GBDT (XGBoost 이식)
-    try:
-        g = gbdt.direction_score(bars, horizon_bars=h)
-    except Exception as exc:
-        g = gbdt.GBDTResult(error=f"{type(exc).__name__}: {exc}")
-    state.gbdt = g.to_dict()
+    # 1) GBDT 두 변형 — 같은 피처, 다른 성장 정책. 각자 따로 심사합니다.
+    #    가중치 = 검증 적중률의 초과분 (50% 를 넘은 만큼) — backtest.adjust_weights
+    #    가 요소 가중치를 정하는 것과 같은 원리입니다.
+    for variant, label, used_attr, dict_attr in (
+            ("xgb", "GBDT", "gbdt_used", "gbdt"),
+            ("lgbm", "LGBM", "lgbm_used", "lgbm")):
+        try:
+            g = gbdt.direction_score(bars, horizon_bars=h, variant=variant)
+        except Exception as exc:
+            g = gbdt.GBDTResult(error=f"{type(exc).__name__}: {exc}")
+        setattr(state, dict_attr, g.to_dict())
+        if g.ok and g.val_accuracy >= min_acc and g.edge > 0:
+            parts.append((g.score, max(0.0, g.val_accuracy - 0.5) * 2))
+            setattr(state, used_attr, True)
+            state.notes.append(
+                f"{label} {g.score:+.2f} (검증 {g.val_accuracy:.0%}, n={g.val_n})")
+        elif g.ok:
+            state.notes.append(
+                f"{label} 검증 미달 ({g.val_accuracy:.0%} < {min_acc:.0%} "
+                f"또는 edge≤0) — 미반영")
+        elif g.error and variant == "xgb":     # 표본 부족 같은 공통 사유는 한 번만
+            state.notes.append(f"GBDT 미가동 — {g.error}")
 
     # 2) 패치 어텐션 (PatchTST 이식) — 예측 시야를 GBDT 와 맞춥니다
     try:
@@ -158,25 +184,6 @@ def _compute(bars: pd.DataFrame, params: dict, state: MLState) -> MLState:
         p = patchtst.PatchForecast(error=f"{type(exc).__name__}: {exc}")
     state.patch = p.to_dict()
 
-    # 3) 품질 게이트 + 검증 성적 가중 결합
-    parts: list[tuple[float, float]] = []      # (점수, 가중치)
-
-    min_acc = float(params["min_val_accuracy"])
-    if g.ok and g.val_accuracy >= min_acc and g.edge > 0:
-        # 가중치 = 검증 적중률의 초과분 (50% 를 넘은 만큼) — backtest.adjust_weights
-        # 가 요소 가중치를 정하는 것과 같은 원리입니다.
-        g_weight = max(0.0, g.val_accuracy - 0.5) * 2
-        parts.append((g.score, g_weight))
-        state.gbdt_used = True
-        state.notes.append(
-            f"GBDT {g.score:+.2f} (검증 {g.val_accuracy:.0%}, n={g.val_n})")
-    elif g.ok:
-        state.notes.append(
-            f"GBDT 검증 미달 ({g.val_accuracy:.0%} < {min_acc:.0%} 또는 edge≤0) — 미반영")
-    elif g.error:
-        state.notes.append(f"GBDT 미가동 — {g.error}")
-
-    min_conf = float(params["min_confidence"])
     if p.ok and p.confidence >= min_conf:
         parts.append((p.score, p.confidence))
         state.patch_used = True
@@ -187,15 +194,34 @@ def _compute(bars: pd.DataFrame, params: dict, state: MLState) -> MLState:
         state.notes.append(
             f"패치 확신 미달 ({p.confidence:.2f} < {min_conf:g}) — 미반영")
 
+    # 3) 칼만 추세 (filterpy 이식) — 인과적 적중률로 심사합니다
+    try:
+        k = kalman.direction_score(bars, horizon_bars=h)
+    except Exception as exc:
+        k = kalman.KalmanResult(error=f"{type(exc).__name__}: {exc}")
+    state.kalman = k.to_dict()
+
+    if k.ok and k.hit_rate >= min_acc and k.n_eval >= 30:
+        parts.append((k.score, max(0.0, k.hit_rate - 0.5) * 2))
+        state.kalman_used = True
+        state.notes.append(
+            f"칼만 {k.score:+.2f} (적중 {k.hit_rate:.0%}, n={k.n_eval})")
+    elif k.ok:
+        state.notes.append(
+            f"칼만 적중 미달 ({k.hit_rate:.0%} < {min_acc:.0%}) — 미반영")
+
+    # 4) 검증 성적 가중 결합
     total_weight = sum(w for _, w in parts)
     if total_weight > 1e-9:
         state.score = sum(s * w for s, w in parts) / total_weight
         state.confidence = min(1.0, total_weight)
     else:
-        state.score = None               # 둘 다 자격 미달 — 이 회전에서 ML 무력
-    state.ok = bool(g.ok or p.ok)
+        state.score = None               # 전원 자격 미달 — 이 회전에서 ML 무력
+    ok_any = (state.gbdt.get("ok") or state.lgbm.get("ok")
+              or p.ok or k.ok)
+    state.ok = bool(ok_any)
     if not state.ok:
-        state.error = g.error or p.error
+        state.error = state.gbdt.get("error") or p.error or k.error
     return state
 
 
@@ -223,8 +249,9 @@ def describe() -> list[dict]:
     return [
         {"mode": OFF, "label": "사용 안 함", "note": "ML 예측을 계산하지 않습니다."},
         {"mode": OBSERVE, "label": "관찰 (기본)",
-         "note": "GBDT(XGBoost 이식)·패치 어텐션(PatchTST 이식) 점수를 계산해 "
-                 "신호 로그에 남기지만 매매 판단은 바꾸지 않습니다."},
+         "note": "GBDT(XGBoost)·LGBM(LightGBM)·패치 어텐션(PatchTST)·칼만 추세"
+                 "(filterpy) 네 예측기의 점수를 계산해 신호 로그에 남기지만 "
+                 "매매 판단은 바꾸지 않습니다."},
         {"mode": SOFT, "label": "점수 반영",
          "note": f"검증을 통과한 ML 점수를 가중 {DEFAULTS['weight']:.0%}×확신도로 "
                  "기존 점수에 섞습니다. 검증 미달이면 그 회전에서는 반영되지 않습니다."},

@@ -58,6 +58,7 @@ class Signal:
     nnfx: dict | None = None           # NNFX 오버레이 (nnfx_mode 가 off 가 아닐 때만)
     ensemble: dict | None = None       # 앙상블 진단 (algo_mode 가 off 가 아닐 때만)
     ml: dict | None = None             # ML 오버레이 (ml_mode 가 off 가 아닐 때만)
+    ma50: float | None = None          # 50일 이동평균 — 승자 보유 판정(check_exit)용
     vol_factor: float = 1.0            # 변동성 배수 — 손절·익절 폭 스케일에 사용
     reasons: list = field(default_factory=list)
     error: str = ""
@@ -76,6 +77,7 @@ class Signal:
             "regime": self.regime, "bars_used": self.bars_used,
             "quote_age": self.quote_age, "nnfx": self.nnfx,
             "ensemble": self.ensemble, "ml": self.ml,
+            "ma50": round(self.ma50, 4) if self.ma50 else None,
             "vol_factor": round(self.vol_factor, 3),
             "reasons": self.reasons[:6], "error": self.error,
         }
@@ -157,9 +159,12 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         if bars_intraday is not None and len(bars_intraday) >= MIN_INTRADAY_BARS:
             sig.intraday_score = float(indicators.analyze(bars_intraday).score)
 
-    # 앙상블 (engine/ensemble.py) — 시평선 합치·난기류·변동성 배수.
+    # 앙상블 (engine/ensemble.py) — 시평선 합치·난기류·변동성 배수·시장 방향.
     # observe 모드는 계산·기록만 하고 점수를 바꾸지 않습니다.
-    ens = ensemble.compute(bars_daily, sig.daily_score, sig.intraday_score, cfg)
+    # market 은 실시간 경로에서만 넘깁니다 — 백테스트(allow_fetch=False)가
+    # 지금의 지수 상태를 읽으면 과거 판단에 현재 정보가 섞입니다.
+    ens = ensemble.compute(bars_daily, sig.daily_score, sig.intraday_score, cfg,
+                           market=(inst.market if allow_fetch else ""))
     ens_mode = ensemble.mode_of(cfg)
     if ens.ok:
         sig.ensemble = ens.to_dict()
@@ -211,6 +216,11 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
 
     sig.score = max(-1.0, min(1.0, blended))
     sig.atr, sig.atr_pct = _atr(bars_daily, sig.price)
+    if len(bars_daily) >= 50:
+        try:
+            sig.ma50 = float(bars_daily["close"].iloc[-50:].mean())
+        except (KeyError, TypeError, ValueError):
+            sig.ma50 = None
 
     entry = float(cfg.get("entry_score", 0.35))
     allow_short = bool(cfg.get("allow_short")) and inst.shortable
@@ -294,13 +304,22 @@ class EntryPlan:
     margin_krw: float = 0.0
     risk_krw: float = 0.0
     reason: str = ""
+    # 수량이 왜 그 숫자인지 — "왜 1주밖에 안 사지?" 에 답하기 위한 내역.
+    # 계산 자체는 예전과 같고, 어느 한도가 잘랐는지를 기록만 합니다.
+    sizing: dict = field(default_factory=dict)
+
+    @property
+    def over_budget(self) -> bool:
+        """최소 1주 허용 때문에 실제 위험이 예산을 넘긴 상태인가."""
+        return bool(self.sizing.get("over_budget"))
 
     def to_dict(self) -> dict:
         return {"ok": self.ok, "quantity": self.quantity, "price": self.price,
                 "stop_price": round(self.stop_price, 4),
                 "target_price": round(self.target_price, 4),
                 "notional_krw": round(self.notional_krw), "margin_krw": round(self.margin_krw),
-                "risk_krw": round(self.risk_krw), "reason": self.reason}
+                "risk_krw": round(self.risk_krw), "reason": self.reason,
+                "sizing": self.sizing}
 
 
 def stop_distance(inst: Instrument, sig: Signal, cfg: dict) -> float:
@@ -370,6 +389,8 @@ def plan_entry(inst: Instrument, sig: Signal, cfg: dict, account: dict) -> Entry
         plan.reason = "단위당 손실을 계산할 수 없습니다."
         return plan
     qty = risk_budget / loss_per_unit
+    qty_by_risk = qty
+    bound_by = "1회 위험 예산"
 
     # 2) 비중 상한 (파생은 증거금 기준, 현물은 매수금액 기준)
     cap_krw = total_value * float(cfg.get("position_pct", 20.0)) / 100.0
@@ -381,10 +402,27 @@ def plan_entry(inst: Instrument, sig: Signal, cfg: dict, account: dict) -> Entry
     if unit_cost <= 0:
         plan.reason = "단위 비용을 계산할 수 없습니다."
         return plan
-    qty = min(qty, cap_krw / unit_cost)
+    qty_by_weight = cap_krw / unit_cost
+    if qty_by_weight < qty:
+        qty, bound_by = qty_by_weight, "종목 비중 상한"
 
     # 3) 가용 현금 (수수료 여유 1% 남김)
-    qty = min(qty, available * 0.99 / unit_cost)
+    qty_by_cash = available * 0.99 / unit_cost
+    if qty_by_cash < qty:
+        qty, bound_by = qty_by_cash, "주문가능금액"
+
+    plan.sizing = {
+        "bound_by": bound_by,
+        "qty_raw": round(qty, 4),
+        "qty_by_risk": round(qty_by_risk, 4),
+        "qty_by_weight": round(qty_by_weight, 4),
+        "qty_by_cash": round(qty_by_cash, 4),
+        "risk_budget_krw": round(risk_budget),
+        "loss_per_unit_krw": round(loss_per_unit),
+        "unit_cost_krw": round(unit_cost),
+        "position_cap_krw": round(cap_krw),
+        "total_value_krw": round(total_value),
+    }
 
     qty = inst.round_quantity(qty)
     if qty <= 0:
@@ -392,16 +430,28 @@ def plan_entry(inst: Instrument, sig: Signal, cfg: dict, account: dict) -> Entry
         if cfg.get("min_one_unit") and not inst.is_derivative and affordable:
             # 소액 계좌 — 리스크 예산으로는 1주 미만이지만 현금·비중 한도 안이면
             # 최소 1주는 허용합니다. 이때 실제 위험이 예산을 넘는다는 사실은
-            # plan.risk_krw 에 그대로 남습니다 (숨기지 않습니다).
+            # plan.risk_krw 와 sizing 에 그대로 남습니다 (숨기지 않습니다).
             qty = 1.0
+            bound_by = "최소 1주 허용"
+            plan.sizing["bound_by"] = bound_by
+            plan.sizing["forced_one_unit"] = True
         elif loss_per_unit > risk_budget and affordable:
             plan.reason = (f"리스크 예산 {risk_budget:,.0f}원 < 1주 손절 위험 "
                            f"{loss_per_unit:,.0f}원 — 1회 위험 예산(%)을 올리거나 "
                            f"'최소 1주 허용'을 켜세요")
             return plan
+        elif unit_cost > cap_krw:
+            # 1주 값이 종목 비중 상한보다 비싼 경우. 예전에는 이때도 "가용
+            # 현금이 모자랍니다"로 찍혀서, 현금이 충분한데도 왜 안 사는지
+            # 알 수 없었습니다 (소액 계좌 + 고가주에서 항상 이쪽입니다).
+            plan.reason = (f"1주 {unit_cost:,.0f}원이 종목 비중 상한 "
+                           f"{cap_krw:,.0f}원(총자산의 "
+                           f"{float(cfg.get('position_pct', 20.0)):g}%)을 넘습니다 — "
+                           f"'종목당 최대 비중'을 올리거나 더 싼 종목이어야 합니다")
+            return plan
         else:
-            plan.reason = (f"주문 가능 수량이 0입니다 "
-                           f"(가용 {available:,.0f}원 / 1단위 {unit_cost:,.0f}원)")
+            plan.reason = (f"주문 가능 수량이 0입니다 — 1주 {unit_cost:,.0f}원, "
+                           f"주문가능금액 {available:,.0f}원")
             return plan
 
     side = "buy" if sig.direction == LONG else "sell"
@@ -410,6 +460,23 @@ def plan_entry(inst: Instrument, sig: Signal, cfg: dict, account: dict) -> Entry
     plan.margin_krw = inst.margin_required(sig.price_krw, qty, side)
     plan.risk_krw = loss_per_unit * qty
     plan.ok = True
+
+    # 실제 위험이 예산의 몇 %인가 — 최소 1주 허용이 켜져 있으면 이 값이 설정을
+    # 넘길 수 있습니다. 넘겼다는 사실을 여기서 계산해 두면, 호출부가 로그에
+    # 경고로 남길 수 있습니다 (조용히 넘어가면 리스크 모형이 무너진 줄 모릅니다).
+    risk_pct = (plan.risk_krw / total_value * 100) if total_value > 0 else 0.0
+    budget_pct = float(cfg.get("risk_per_trade_pct", 1.0))
+    plan.sizing.update({
+        "quantity": qty,
+        "risk_krw": round(plan.risk_krw),
+        "risk_pct": round(risk_pct, 2),
+        "budget_pct": budget_pct,
+        "over_budget": bool(plan.risk_krw > risk_budget * 1.05),
+    })
+    if not plan.reason:
+        plan.reason = (f"{bound_by} 기준 {qty:g}{'주' if not inst.is_derivative else '계약'} "
+                       f"(1주 {unit_cost:,.0f}원 · 손절 시 위험 {plan.risk_krw:,.0f}원 "
+                       f"= 자산의 {risk_pct:.1f}%)")
 
     min_order = float(cfg.get("min_order_krw", 0) or 0)
     basis = plan.margin_krw if inst.is_derivative else plan.notional_krw
@@ -437,7 +504,8 @@ class ExitDecision:
 
 
 def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
-               state: dict, now: datetime = None) -> ExitDecision:
+               state: dict, now: datetime = None,
+               protective_only: bool = False) -> ExitDecision:
     """보유 포지션을 정리해야 하는가.
 
     확인 순서가 중요합니다 — **손실을 막는 조건을 먼저** 봅니다.
@@ -445,6 +513,18 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
 
     state 는 이 포지션에 대해 엔진이 기억하고 있는 값입니다.
         entry_price, stop_price, target_price, peak_price, opened_at
+
+    protective_only
+        **지키는 조건만** 봅니다 — 만기·손절·손실한도·트레일링·보유시간.
+        익절과 신호 반전은 건너뜁니다.
+
+        고속 보호 회전(engine/autotrade.run_guard)이 쓰는 모드입니다. 그 회전은
+        지표를 계산하지 않아 신호 점수가 없고, 승자 보유(hold_winners) 판정에
+        필요한 50일선도 없습니다. 없는 근거로 익절을 결정하면 정규 회전과 다른
+        판단이 나오므로, 아예 보지 않고 다음 정규 회전에 넘깁니다.
+
+        방향은 안전한 쪽입니다 — 익절이 몇십 초 늦는 것은 기회 손실이지만,
+        손절이 몇십 초 늦는 것은 손실입니다.
     """
     now = now or datetime.now()
     direction = 1 if position.side == LONG else -1
@@ -482,19 +562,33 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
         if drop >= trail:
             return ExitDecision(True, f"고점 대비 {drop:.2f}% 되돌림 (트레일링 {trail:g}%)")
 
-    # 4) 익절
+    # 4) 익절 — 승자 보유(hold_winners) 게이트가 먼저 봅니다.
+    #
+    # prism-insight 의 oneil_fallback (오닐: "승자는 추세가 깨질 때까지 보유")
+    # 이식. 원본 실측 사례: 목표가 도달 당일 +11% 급등 중이던 주도주를 자동
+    # 익절로 전량 청산 (INCY, 2026-07-29). 종목이 50일선을 +3% 이상 상회하고
+    # 진입 후 고점의 97% 이내에 있으면 — 추세가 아직 살아 있으면 — 목표가
+    # 익절을 보류합니다. 손절·트레일링·시간 청산은 이 게이트와 무관하게
+    # 그대로 작동합니다 (지키는 장치는 절대 끄지 않습니다).
+    winner_hold = False
+    if (cfg.get("hold_winners") and direction > 0 and sig.ok and sig.ma50
+            and price >= sig.ma50 * 1.03):
+        peak = state.get("peak_price")
+        if peak and price >= float(peak) * 0.97:
+            winner_hold = True
+
     target = state.get("target_price")
-    if target:
+    if target and not winner_hold and not protective_only:
         hit = price >= float(target) if direction > 0 else price <= float(target)
         if hit:
             return ExitDecision(True, f"목표가 도달 ({price:g}, {pnl_pct:+.2f}%)")
 
     take = float(cfg.get("take_profit_pct", 0) or 0)
-    if take > 0 and pnl_pct >= take:
+    if take > 0 and pnl_pct >= take and not winner_hold and not protective_only:
         return ExitDecision(True, f"목표 수익 {take:g}% 달성 ({pnl_pct:+.2f}%)")
 
     # 5) 신호 반전 / 소멸
-    if sig.ok:
+    if sig.ok and not protective_only:
         exit_score = float(cfg.get("exit_score", 0.05))
         if direction > 0 and sig.score <= -abs(exit_score):
             return ExitDecision(True, f"신호 반전 (점수 {sig.score:+.2f})")

@@ -102,10 +102,14 @@ class FakeFeed:
         self._saved = None
 
     def __enter__(self):
-        self._saved = (feed.quote, feed.is_tradable_now, instruments.try_resolve)
+        self._saved = (feed.quote, feed.is_tradable_now, instruments.try_resolve,
+                       feed.entry_allowed_now)
         feed.quote = lambda inst, max_age=20.0: (
             fake_quote(self.prices[inst.key]) if inst.key in self.prices else None)
         feed.is_tradable_now = lambda inst, regular_only=True: (True, "테스트 개장")
+        # 진입 경로는 별도 게이트를 씁니다 (프리마켓·정규장만). 청산용
+        # is_tradable_now 만 가짜로 열면 진입 검사가 전부 '개장 대기'로 빠집니다.
+        feed.entry_allowed_now = lambda inst, cfg=None: (True, "테스트 개장", "REGULAR")
         if self.catalog:
             original = self._saved[2]
             instruments.try_resolve = lambda q: self.catalog.get(str(q), original(q))
@@ -113,7 +117,8 @@ class FakeFeed:
         return self
 
     def __exit__(self, *exc):
-        feed.quote, feed.is_tradable_now, instruments.try_resolve = self._saved
+        (feed.quote, feed.is_tradable_now, instruments.try_resolve,
+         feed.entry_allowed_now) = self._saved
         broker.instruments.try_resolve = self._saved[2]
 
 
@@ -1102,9 +1107,17 @@ def test_account_isolation():
     correct = risk.RiskEngine(limits, {"total_value": 3_000_000}, [], live_day)
     check("분리", "실계좌가 자기 기준으로 판정됨 (오판 없음)",
           not correct.halt_reasons(), str(correct.halt_reasons()))
-    wrong = risk.RiskEngine(limits, {"total_value": 3_000_000}, [], paper_day)
-    check("분리", "(대조) 모의 기준을 실계좌에 대면 즉시 중단됨 — 고치기 전 증상",
+    # (대조) 손익 값이 없던 시절의 계산 — 총자산과 기준선의 차이로 재면,
+    # 남의 계좌 기준선을 대는 순간 -70% 로 오판했습니다. 지금은 손익(pnl)을
+    # 직접 넘기므로 이 경로를 타지 않습니다.
+    legacy_day = {k: v for k, v in paper_day.items() if k not in ("pnl", "drawdown_pct")}
+    wrong = risk.RiskEngine(limits, {"total_value": 3_000_000}, [], legacy_day)
+    check("분리", "(대조) 옛 총자산 기준 계산은 남의 기준선에 오판함",
           bool(wrong.halt_reasons()), str(wrong.halt_reasons()))
+    # 새 계산식은 같은 상황에서도 오판하지 않습니다 (손익은 계좌 간 섞이지 않음)
+    safe = risk.RiskEngine(limits, {"total_value": 3_000_000}, [], paper_day)
+    check("분리", "손익 기준 계산은 기준선이 섞여도 오판 없음",
+          not safe.halt_reasons(), str(safe.halt_reasons()))
 
     # 주문 원장
     _new_order(user, "AAA", broker_order_id="P1", mode="paper")
@@ -1644,10 +1657,13 @@ def test_strategy_separation():
     live_cfg = {"mode": "paper", "universe": ["TEST01"],
                 "scalp": {"enabled": True, "universe": ["TEST02"]}}
     originals = (engine._scalp_entry, engine.feed.quote, engine.strategy.evaluate,
-                 engine._resolve_universe_item)
+                 engine._resolve_universe_item, engine.feed.entry_allowed_now)
     try:
         engine._scalp_entry = fake_scalp_entry
         engine.feed.quote = lambda inst, **kw: {"price": 500, "age_sec": 0}
+        # 이 검사는 '어느 경로로 가는가'만 봅니다 — 장 시간 게이트는 열어 둡니다
+        engine.feed.entry_allowed_now = lambda inst, cfg=None: (True, "테스트 개장",
+                                                                "REGULAR")
         engine.strategy.evaluate = lambda inst, cfg, **kw: strategy.Signal(
             key=inst.key, ok=True, direction=strategy.FLAT, price=500)
         # 가짜 코드는 종목 해석이 안 되므로, 여기서 실물 대신 넣어줍니다.
@@ -1665,7 +1681,7 @@ def test_strategy_separation():
         check("경로", "초단타 종목만 틱 경로로 감", calls == ["TEST02"], str(calls))
     finally:
         (engine._scalp_entry, engine.feed.quote, engine.strategy.evaluate,
-         engine._resolve_universe_item) = originals
+         engine._resolve_universe_item, engine.feed.entry_allowed_now) = originals
 
     # --- 옛 설정 갈라주기 ---
     legacy_user = TEST_USER + 8

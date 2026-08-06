@@ -1498,8 +1498,14 @@ def _positions_block(user_id: int, mode: str, cfg: dict) -> dict:
         block["positions"] = [
             {**p.to_dict(), "managed": autotrade.is_managed(cfg, p.key, states)}
             for p in brk_positions]
+        # 평가손익·예수금을 반드시 함께 넘깁니다. 예전에는 총자산만 넘겨서,
+        # 콘솔이 7초마다 예수금 기록을 NULL 로 덮어썼고 입출금 판별이 통째로
+        # 무력화됐습니다. 지금 계산식은 평가손익 기준이라 이 값이 빠지면
+        # 오늘 손익이 옛 방식(총자산 차이)으로 되돌아갑니다.
         block["day"] = at_store.touch_daily(
-            user_id, mode, block["account"].get("total_value") or 0)
+            user_id, mode, block["account"].get("total_value") or 0,
+            unrealized=sum(p.unrealized_pnl or 0 for p in brk_positions),
+            cash=block["account"].get("cash"))
     except Exception as exc:
         block["account_error"] = f"{type(exc).__name__}: {exc}"
 

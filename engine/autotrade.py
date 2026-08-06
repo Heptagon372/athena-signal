@@ -141,6 +141,127 @@ def run_once(user_id: int, force: bool = False) -> dict:
         lock.release()
 
 
+# 보호 회전이 쓰는 현재가 신선도 — 손절선을 20초 전 가격으로 재면 짧게
+# 도는 의미가 없습니다. 보호 주기와 비슷하게 잡아 같은 값을 두 번 받지 않습니다.
+GUARD_QUOTE_MAX_AGE = 5.0
+
+# 전체 회전이 읽어둔 보유 목록 — 보호 회전이 재사용합니다.
+# {user_id: (기록시각, mode, [Position, ...])}
+#
+# 잔고 조회(KIS stock/deriv/overseas 3종)는 5초 캐시가 있어도 보호 주기마다
+# 만료돼 매번 다시 붙습니다. 실측으로 그것만 3~7초가 걸렸습니다.
+# 보유 **종목과 수량**은 우리가 주문을 내지 않는 한 바뀌지 않으므로, 전체
+# 회전이 읽어둔 목록을 그대로 씁니다. 정말 실시간이어야 하는 값(현재가)은
+# 보호 회전이 직접 새로 받습니다.
+_positions_cache: dict[int, tuple[float, str, list]] = {}
+GUARD_POSITIONS_TTL = 300.0        # 이보다 오래된 목록은 믿지 않고 다시 읽습니다
+
+
+def _remember_positions(user_id: int, mode: str, positions: list):
+    _positions_cache[user_id] = (time.time(), mode, list(positions or []))
+
+
+def invalidate_positions(user_id: int):
+    """주문을 냈으면 보유 목록이 곧 바뀝니다 — 캐시를 버립니다."""
+    _positions_cache.pop(user_id, None)
+
+
+def run_guard(user_id: int) -> dict:
+    """고속 보호 회전 — 보유 포지션의 **손절·트레일링·시간 청산만** 확인합니다.
+
+    왜 따로 도는가
+        전체 회전은 종목마다 일봉·분봉·지표 19종·ML 위원회를 계산해서 몇 초가
+        걸립니다. 그래서 주기를 60초보다 짧게 잡기 어렵고, 그 사이 손절선이
+        뚫려도 최대 60초를 기다렸습니다. 실계좌에서 그 60초는 손실입니다.
+
+        이 회전은 **보유 종목의 현재가만** 받아서 이미 정해져 있는 손절가·
+        트레일링·보유시간과 비교합니다. 종목당 시세 조회 한 번이라 몇 초 주기로
+        돌 수 있습니다.
+
+    하지 않는 것
+        · 신규 진입 (전체 회전의 몫)
+        · 익절·신호 반전 (지표가 없으므로 판단 근거가 없습니다)
+        · 계좌 기준선 갱신 (입출금 판별은 전체 회전에서 한 번만)
+
+    청산 주문 경로·리스크 게이트·기록은 전체 회전과 **완전히 같은 코드**를
+    씁니다. 빠른 길에만 있는 별도 청산 규칙은 만들지 않습니다.
+    """
+    cfg = store.get_config(user_id)
+    if not cfg.get("enabled"):
+        return {"ok": False, "skipped": "자동매매가 꺼져 있습니다."}
+    if int(cfg.get("guard_interval_sec", 5) or 0) <= 0:
+        return {"ok": False, "skipped": "보호 회전이 꺼져 있습니다."}
+
+    mode = cfg.get("mode", "paper")
+    # 지켜야 할 포지션이 없으면 브로커를 부르지도 않습니다 (DB 조회는 공짜).
+    states = store.get_position_states(user_id, mode)
+    if not states:
+        return {"ok": True, "skipped": "보유 포지션 없음", "checked": 0}
+
+    lock = _user_lock(user_id)
+    if not lock.acquire(blocking=False):
+        return {"ok": False, "skipped": "다른 회전이 실행 중입니다."}
+
+    started = time.time()
+    result = {"ok": True, "guard": True, "at": datetime.now().isoformat(),
+              "mode": mode, "exits": [], "rejects": [], "errors": [],
+              "signals": [], "checked": 0, "asleep": 0}
+    try:
+        brk = broker_module.get_broker(user_id, mode, cfg)
+        if not brk.health().get("ready"):
+            return {"ok": False, "skipped": "브로커 준비 안 됨"}
+
+        cached = _positions_cache.get(user_id)
+        if (cached and cached[1] == mode
+                and time.time() - cached[0] < GUARD_POSITIONS_TTL):
+            positions = cached[2]
+        else:
+            positions = brk.positions()
+            _remember_positions(user_id, mode, positions)
+
+        # 보호 회전은 청산만 합니다. RiskEngine.check_exit 는 계좌·일자 값을
+        # 보지 않으므로(현재가와 장 상태만 봄) 잔고를 다시 읽지 않습니다.
+        # 계좌가 차단 상태여도 청산은 계속해야 합니다 — 위험을 줄이는 방향입니다.
+        engine_risk = risk.RiskEngine(cfg, {}, positions, {})
+
+        for position in positions:
+            if not is_managed(cfg, position.key, states):
+                continue
+            # 장이 닫혀 있으면 시세를 받아봐야 주문을 낼 수 없습니다.
+            # 여기서 걸러야 밤새 무의미한 시세 조회가 쌓이지 않습니다.
+            inst = instruments.try_resolve(position.key)
+            if inst is not None and not feed.market_status(inst).get("is_open"):
+                result["asleep"] += 1
+                continue
+            result["checked"] += 1
+            try:
+                _handle_exit(user_id, cfg, brk, engine_risk, position,
+                             states.get(position.key, {}), result, fast=True)
+            except Exception as exc:
+                result["errors"].append(f"{position.key} 보호 검사 실패: {exc}")
+    except Exception as exc:
+        detail = traceback.format_exc(limit=4)
+        store.log_event(user_id, "error",
+                        f"보호 회전 실패: {type(exc).__name__}: {exc}",
+                        level="error", detail={"traceback": detail})
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        lock.release()
+
+    result["elapsed_sec"] = round(time.time() - started, 2)
+    # 아무 일도 없으면 로그를 남기지 않습니다 — 5초마다 찍히면 이벤트 로그가
+    # 보호 회전 기록으로만 가득 차서 정작 봐야 할 판단이 묻힙니다.
+    if result["exits"] or result["errors"]:
+        store.log_event(
+            user_id, "guard",
+            f"보호 회전 — 확인 {result['checked']}건 / 청산 {len(result['exits'])}건"
+            + (f" / 오류 {len(result['errors'])}건" if result["errors"] else ""),
+            level="warn" if result["errors"] else "trade",
+            detail={"elapsed_sec": result["elapsed_sec"],
+                    "exits": result["exits"], "errors": result["errors"][:3]})
+    return result
+
+
 def _tick(user_id: int, force: bool, started: float) -> dict:
     cfg = split_legacy_universe(user_id, store.get_config(user_id))
     if not cfg.get("enabled") and not force:
@@ -152,7 +273,7 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
         "mode": cfg["mode"], "dry_run": bool(cfg.get("dry_run")),
         "halted": False, "halt_reasons": [],
         "signals": [], "entries": [], "exits": [], "rejects": [], "errors": [],
-        "settled": [], "reconciled": [],
+        "settled": [], "reconciled": [], "waiting": [],
     }
 
     # -- 브로커 준비 ------------------------------------------------------
@@ -171,7 +292,14 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
 
     account = brk.account()
     positions = brk.positions()
-    day = store.touch_daily(user_id, mode, account.get("total_value") or 0)
+    # 보호 회전이 잔고를 다시 읽지 않도록 이 목록을 남겨둡니다
+    _remember_positions(user_id, mode, positions)
+    # 평가손익을 넘겨야 오늘 손익이 입출금과 무관해집니다
+    # (storage/autotrade.touch_daily 참고).
+    day = store.touch_daily(user_id, mode, account.get("total_value") or 0,
+                            unrealized=sum(p.unrealized_pnl or 0 for p in positions),
+                            cash=account.get("cash"),
+                            settled=len(result.get("settled") or []))
 
     # -- 0.5단계: 실계좌와 내부 상태 대조 ---------------------------------
     # 잔고 조회가 일부라도 실패했으면 이 목록은 보유분 전체가 아닙니다.
@@ -274,6 +402,8 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
         extra += f" / 체결확정 {len(result['settled'])}건"
     if result["reconciled"]:
         extra += f" / 재동기화 {len(result['reconciled'])}건"
+    if result.get("waiting"):
+        extra += f" / 개장대기 {len(result['waiting'])}건"
     errors = f" / 오류 {len(result['errors'])}건" if result["errors"] else ""
     store.log_event(
         user_id, "tick",
@@ -878,7 +1008,13 @@ def _reconcile(user_id: int, cfg: dict, positions: list, result: dict,
 # ---------------------------------------------------------------------------
 
 def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
-                 state: dict, result: dict):
+                 state: dict, result: dict, fast: bool = False):
+    """청산 검사 한 종목.
+
+    fast=True 는 고속 보호 회전(run_guard)이 쓰는 경로입니다. 지표·ML 을
+    계산하지 않고 **신선한 현재가만** 받아 손절·트레일링·시간 청산을 봅니다.
+    익절과 신호 반전은 보지 않습니다 (strategy.check_exit 의 protective_only).
+    """
     mode = cfg.get("mode", "paper")
     inst = instruments.try_resolve(position.key)
     if inst is None:
@@ -895,14 +1031,28 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
                              note="낸 주문의 체결을 기다리는 중입니다")
         return
 
-    quote = feed.quote(inst)
+    # 보호 회전은 **캐시된 가격을 믿지 않습니다** — 손절선을 재는 데 20초 전
+    # 가격을 쓰면 5초마다 확인하는 의미가 없습니다.
+    quote = feed.quote(inst, max_age=GUARD_QUOTE_MAX_AGE) if fast else feed.quote(inst)
     # 초단타 포지션의 청산 판단은 **틱**으로 해야 합니다. 20초 전 가격으로
     # 3틱 목표를 재면 이미 지나간 자리에서 뒤늦게 나가게 됩니다.
     if quote and owner == OWNER_SCALP:
         quote = _scalp_quote(inst, quote)
-    sig = strategy.evaluate(inst, cfg, quote=quote)
-    if sig.ok:
-        result["signals"].append({**sig.to_dict(), "held": True})
+
+    if fast:
+        # 지표·ML 을 계산하지 않습니다. 점수 0 짜리 신호를 만들어 가격 배리어만
+        # 재게 하고, 판정은 protective_only 로 손절 계열만 봅니다.
+        if not quote or not quote.get("price"):
+            return
+        sig = strategy.Signal(key=inst.key, ok=True, score=0.0,
+                              price=float(quote["price"]),
+                              price_krw=float(quote.get("price_krw")
+                                              or quote["price"]),
+                              quote_age=float(quote.get("age_sec") or 0))
+    else:
+        sig = strategy.evaluate(inst, cfg, quote=quote)
+        if sig.ok:
+            result["signals"].append({**sig.to_dict(), "held": True})
 
     # 트레일링 스톱용 고점 갱신 (신호가 실패해도 가격만 있으면 갱신합니다)
     price = sig.price if sig.ok else (quote or {}).get("price")
@@ -945,7 +1095,8 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
             target_price=state.get("target_price") or econ["target_price"],
             stop_price=state.get("stop_price") or econ["stop_price"])
 
-    decision = strategy.check_exit(inst, position, sig, exit_cfg, state)
+    decision = strategy.check_exit(inst, position, sig, exit_cfg, state,
+                                   protective_only=fast)
     if not decision.should_exit:
         return
 
@@ -1026,6 +1177,20 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
         return
 
     if inst.key in held and not cfg.get("allow_pyramiding"):
+        return
+
+    # 장이 닫혀 있으면 **여기서 끝냅니다** — 시세도 지표도 계산하지 않습니다.
+    # 예전에는 신호를 다 만든 뒤 주문 직전에야 리스크 게이트가 거부했습니다.
+    # 그래서 미국장 시간(새벽)마다 한국 종목의 지표·ML 을 회전마다 계산해서
+    # 버리고, 콘솔에는 "정규장이 아닙니다" 거부 로그만 쌓였습니다.
+    # 이건 거부가 아니라 '개장 대기'이므로 로그에 남기지 않고, 회전 요약에만
+    # 몇 종목이 쉬는지 셉니다.
+    open_now, why, _session = feed.entry_allowed_now(inst, cfg)
+    if not open_now:
+        result.setdefault("waiting", []).append(
+            {"symbol": inst.key, "name": inst.name, "reason": why})
+        if scalp:
+            mark_scalp_phase(user_id, inst.key, WATCH, name=inst.name, note=why)
         return
 
     # 종목별 보호 잠금 (쿨다운·부진 종목 등) — 신호 계산 전에 봅니다.
@@ -1110,6 +1275,25 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
 
     side = "buy" if sig.direction == strategy.LONG else "sell"
     verdict = engine_risk.check_entry(inst, side, plan.quantity, sig, plan, quote)
+
+    # '최소 1주 허용' 때문에 위험 예산을 넘긴 주문은 조용히 넘기지 않습니다.
+    # 소액 계좌에서는 1주만 사도 계좌의 4분의 1이 될 수 있는데, 그걸 모르면
+    # 리스크 설정이 지켜지고 있다고 착각하게 됩니다.
+    #
+    # **리스크 게이트를 통과한 뒤에** 남깁니다. 통과 전에 남기면 한도에 걸려
+    # 어차피 못 나갈 주문까지 회전마다 경고를 찍어 로그가 그것만으로 찹니다.
+    if plan.over_budget and verdict.approved:
+        s = plan.sizing
+        store.log_event(
+            user_id, "sizing",
+            f"{inst.name} 최소 1주 허용으로 {verdict.quantity:g}{_unit(inst)} 주문 — "
+            f"손절 시 위험 {s.get('risk_krw', 0):,.0f}원({s.get('risk_pct', 0):.1f}%)이 "
+            f"1회 위험 예산 {s.get('budget_pct', 0):g}%"
+            f"({s.get('risk_budget_krw', 0):,.0f}원)를 넘습니다. "
+            f"1주 {s.get('unit_cost_krw', 0):,.0f}원 · 총자산 "
+            f"{s.get('total_value_krw', 0):,.0f}원",
+            level="warn", symbol=inst.key, name=inst.name, detail=s)
+
     if not verdict.approved:
         result["rejects"].append({"symbol": inst.key, "action": "entry",
                                   "reasons": verdict.rejects})
@@ -1636,6 +1820,9 @@ def _unit(inst: Instrument) -> str:
 
 def _record(user_id: int, cfg: dict, inst: Instrument, order, reason: str,
             side: str = "", detail: dict = None):
+    # 주문을 냈으면 보유 목록이 곧 바뀝니다. 보호 회전이 옛 목록으로 판단하면
+    # 방금 판 종목을 또 팔려 들거나, 없는 포지션의 손절선을 재게 됩니다.
+    invalidate_positions(user_id)
     store.record_order(user_id, {
         "client_order_id": order.client_order_id,
         "broker_mode": cfg.get("mode", "paper"),
@@ -1726,8 +1913,10 @@ class EngineLoop:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_run: dict[int, float] = {}
+        self._last_guard: dict[int, float] = {}
         self.last_tick_at: str = ""
         self.tick_count = 0
+        self.guard_count = 0
         self.last_error = ""
 
     @property
@@ -1745,6 +1934,10 @@ class EngineLoop:
     def stop(self):
         self._stop.set()
 
+    # 다음 회전 시각을 계산하지 못했을 때의 안전 대기 (초)
+    _FALLBACK_WAIT = 5.0
+    _MAX_WAIT = 15.0
+
     def _run(self):
         # 서버 기동 직후에는 시세 소스가 아직 준비되지 않았을 수 있습니다
         self._stop.wait(10)
@@ -1753,8 +1946,34 @@ class EngineLoop:
                 self._sweep()
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
-            # 가장 짧은 주기의 사용자에 맞춰 깨어납니다 (기본 15초)
-            self._stop.wait(15)
+            # **다음 회전이 실제로 필요한 시각까지만** 잡니다.
+            #
+            # 예전에는 무조건 15초씩 잤습니다. 회전 자체가 10초쯤 걸리므로
+            # 실제 주기는 (작업시간 + 15초) 격자가 되고, 그 격자에서 설정값을
+            # 처음 넘기는 칸에서야 돌았습니다. 60초로 맞춰둬도 71초마다 도는
+            # 이유가 이것이었습니다(실측 02:56:55 → 02:58:06 → 02:59:17).
+            # 짧은 주기를 설정할수록 오차가 커져서, 30초 설정이 41초가 됩니다.
+            self._stop.wait(self._sleep_seconds())
+
+    def _sleep_seconds(self) -> float:
+        """가장 먼저 돌아올 회전(전체 또는 보호)의 예정 시각까지 남은 시간."""
+        now = time.time()
+        due = []
+        try:
+            for user_id in store.enabled_users():
+                cfg = store.get_config(user_id)
+                interval = max(int(cfg.get("interval_sec", 60)), 5)
+                due.append(self._last_run.get(user_id, 0) + interval - now)
+                guard = int(cfg.get("guard_interval_sec", 5) or 0)
+                if guard > 0:
+                    due.append(self._last_guard.get(user_id, 0)
+                               + max(guard, 2) - now)
+        except Exception:
+            return self._FALLBACK_WAIT
+        if not due:
+            return self._MAX_WAIT      # 켜진 사용자가 없으면 느긋하게
+        # 0.5초 하한 — 이미 지난 예정은 즉시 다시 돌되 CPU 를 태우지는 않습니다
+        return max(0.5, min(self._MAX_WAIT, min(due)))
 
     def _sweep(self):
         # 장 상태 전환 알림 — 자동매매가 꺼져 있어도 알려줍니다
@@ -1770,14 +1989,36 @@ class EngineLoop:
             self.last_error = f"추적 sweep 실패: {exc}"
         for user_id in store.enabled_users():
             cfg = store.get_config(user_id)
-            interval = max(int(cfg.get("interval_sec", 60)), 15)
+            interval = max(int(cfg.get("interval_sec", 60)), 5)
             last = self._last_run.get(user_id, 0)
-            if time.time() - last < interval:
+            now = time.time()
+            if now - last >= interval:
+                # 다음 예정은 **이번 예정 시각 기준**으로 잡습니다. now 로 잡으면
+                # 회전에 걸린 시간이 매번 더해져 주기가 조금씩 밀립니다(드리프트).
+                # 오래 멈춰 있었다면(서버 재시작 등) 지금부터 다시 셉니다.
+                self._last_run[user_id] = (last + interval
+                                           if now - last < interval * 2 else now)
+                # 전체 회전이 청산까지 봤으므로 보호 회전 타이머도 리셋합니다
+                self._last_guard[user_id] = now
+                run_once(user_id)
+                self.tick_count += 1
+                self.last_tick_at = datetime.now().isoformat()
                 continue
-            self._last_run[user_id] = time.time()
-            run_once(user_id)
-            self.tick_count += 1
-            self.last_tick_at = datetime.now().isoformat()
+
+            # 전체 회전 사이사이에 **손절만** 지켜보는 짧은 회전을 끼웁니다.
+            guard = int(cfg.get("guard_interval_sec", 5) or 0)
+            if guard <= 0:
+                continue
+            guard = max(guard, 2)
+            last_guard = self._last_guard.get(user_id, 0)
+            if now - last_guard >= guard:
+                self._last_guard[user_id] = now
+                try:
+                    out = run_guard(user_id)
+                    if out.get("ok") and out.get("checked"):
+                        self.guard_count += 1
+                except Exception as exc:
+                    self.last_error = f"보호 회전 실패: {exc}"
 
     def _sweep_tracking(self):
         for user_id in store.configured_users():
@@ -1799,6 +2040,7 @@ class EngineLoop:
         return {
             "running": self.running,
             "tick_count": self.tick_count,
+            "guard_count": self.guard_count,     # 손절만 보는 고속 회전 횟수
             "last_tick_at": self.last_tick_at,
             "last_error": self.last_error,
             "enabled_users": len(store.enabled_users()),

@@ -51,6 +51,9 @@ from engine import quant
 OFF, OBSERVE, SOFT, GATE = "off", "observe", "soft", "gate"
 MODES = (OFF, OBSERVE, SOFT, GATE)
 
+# Market Pulse 상태 문자열 (engine/marketpulse.py 와의 계약 — 순환 임포트 없이)
+UNDER_PRESSURE_STATE, CORRECTION_STATE = "UNDER_PRESSURE", "CORRECTION"
+
 DEFAULTS = {
     # 1) 시평선 합치
     "mtf_disagree_penalty": 0.5,   # 일봉·분봉이 반대일 때 점수를 얼마나 깎을지
@@ -69,6 +72,13 @@ DEFAULTS = {
 
     # 4) 비용
     "cost_edge_multiple": 3.0,     # 목표 수익이 왕복 비용의 몇 배는 돼야 하는가
+
+    # 5) Market Pulse (오닐 시장 방향 — engine/marketpulse.py)
+    # 감쇠만 하고 차단하지 않습니다. prism-insight 의 V2 매매 표본 감사가
+    # "조정장 전면 매수 중단"을 기각했습니다 — 조정 구간 매수는 손절율 38%
+    # 였지만 순손익 +25.3% (폭락 후 반등 대어가 이 구간에 삽니다).
+    "pulse_pressure_damping": 0.85,    # UNDER_PRESSURE 일 때 점수에 곱할 값
+    "pulse_correction_damping": 0.6,   # CORRECTION 일 때
 }
 
 
@@ -83,6 +93,7 @@ class EnsembleState:
     mtf: dict = field(default_factory=dict)
     turbulence: dict = field(default_factory=dict)
     volatility: dict = field(default_factory=dict)
+    pulse: dict = field(default_factory=dict)      # Market Pulse (시장 방향)
     notes: list = field(default_factory=list)      # 사람이 읽는 조정 내역
     blocked_by: list = field(default_factory=list)
     error: str = ""
@@ -94,6 +105,7 @@ class EnsembleState:
                 "vol_factor": round(self.vol_factor, 3),
                 "block": self.block, "mtf": self.mtf,
                 "turbulence": self.turbulence, "volatility": self.volatility,
+                "pulse": self.pulse,
                 "notes": self.notes[:6], "blocked_by": self.blocked_by,
                 "error": self.error}
 
@@ -332,6 +344,13 @@ def volatility_factor(df: pd.DataFrame, cfg: dict = None) -> dict:
     추정량은 Yang-Zhang 을 씁니다 (engine/quant.py). 종가-종가 방식보다 같은
     표본에서 분산이 훨씬 작고, 갭이 잦은 국내 종목에 특히 유리합니다.
 
+    GARCH(1,1) 보정 (engine/garch.py — bashtage/arch 이식)
+        Yang-Zhang 비율은 실현 변동성의 **사후** 비교입니다. GARCH 가 변동성
+        군집을 유의하게 찾아내면(우도비 검정 통과), 그 **예측** 비율의 제곱근을
+        보정 배수로 곱합니다 — 제곱근으로 눌러 쓰는 이유는 예측 모형 하나가
+        배리어를 크게 흔들지 않게 하기 위해서입니다. GARCH 가 자격 미달이면
+        기존 Yang-Zhang 값이 그대로 남습니다 (관찰 정보로만 첨부).
+
     **ATR 손절에는 이 배수를 곱하지 않습니다.** ATR 자체가 이미 변동성이라
     두 번 곱하면 손절 폭이 제곱으로 벌어집니다. 아래 scale_barriers 가 고정
     퍼센트 계열에만 배수를 적용하는 이유입니다.
@@ -346,6 +365,21 @@ def volatility_factor(df: pd.DataFrame, cfg: dict = None) -> dict:
         return {"ok": False, "factor": 1.0, "reason": "변동성 추정 표본 부족"}
 
     raw = fast / slow
+
+    # GARCH 예측 보정 — 자격을 통과했을 때만
+    garch_info = None
+    try:
+        from engine import garch as garch_mod
+        g = garch_mod.fit_bars(df, cfg)
+        if g.ok:
+            garch_info = g.to_dict()
+        if g.converged and g.vol_ratio > 0:
+            adj = float(np.clip(np.sqrt(g.vol_ratio), 0.85, 1.35))
+            raw *= adj
+            garch_info["applied_adj"] = round(adj, 3)
+    except Exception:
+        pass                       # 변동성 배수는 GARCH 없이도 성립해야 합니다
+
     factor = float(max(lo, min(hi, raw)))
     if factor >= 1.3:
         label = "평소보다 큼"
@@ -353,9 +387,12 @@ def volatility_factor(df: pd.DataFrame, cfg: dict = None) -> dict:
         label = "평소보다 작음"
     else:
         label = "평상 수준"
-    return {"ok": True, "factor": round(factor, 3), "raw": round(float(raw), 3),
-            "fast_vol": round(fast, 2), "slow_vol": round(slow, 2),
-            "fast_window": fast_w, "slow_window": slow_w, "label": label}
+    out = {"ok": True, "factor": round(factor, 3), "raw": round(float(raw), 3),
+           "fast_vol": round(fast, 2), "slow_vol": round(slow, 2),
+           "fast_window": fast_w, "slow_window": slow_w, "label": label}
+    if garch_info is not None:
+        out["garch"] = garch_info
+    return out
 
 
 def scale_barriers(cfg: dict, factor: float) -> dict:
@@ -436,8 +473,12 @@ def cost_edge(inst, entry_price: float, target_price: float, cfg: dict = None) -
 # ---------------------------------------------------------------------------
 
 def compute(bars_daily: pd.DataFrame, daily_score: float,
-            intraday_score: float | None, cfg: dict) -> EnsembleState:
+            intraday_score: float | None, cfg: dict,
+            market: str = "") -> EnsembleState:
     """앙상블 한 번. 신호 생성부(strategy.evaluate)에서 호출합니다.
+
+    market 은 Market Pulse 프록시 선택용입니다 ("KOSPI"/"US" 등). 비우면
+    시장 상태 판독을 건너뜁니다 (백테스트가 종목 봉만 주입하는 경로).
 
     반환값의 score 는 **조정된 점수**지만, 모드가 observe 면 base_score 와 같습니다
     (계산은 다 하되 판단은 바꾸지 않는다는 뜻입니다).
@@ -485,6 +526,31 @@ def compute(bars_daily: pd.DataFrame, daily_score: float,
     if vol.get("ok") and abs(float(vol["factor"]) - 1.0) >= 0.1:
         state.notes.append(
             f"변동성 {vol['label']} (배수 {vol['factor']:.2f}) — 손절·익절 폭 조정")
+
+    # (4) Market Pulse — 오닐 시장 방향 (engine/marketpulse.py, prism-insight 이식).
+    # 지수 프록시를 읽지 못하면 None → 아무 효과 없음 (fail-open).
+    # **어떤 모드에서도 차단하지 않습니다** — 원본 V2 감사에서 조정장 매수가
+    # 순손익 +25.3% 였습니다. 시장이 나쁠 때는 확신만 줄입니다.
+    if market:
+        try:
+            from engine import marketpulse
+            pulse = marketpulse.market_state(market)
+        except Exception:
+            pulse = None
+        if pulse:
+            state.pulse = pulse
+            params = config_from(cfg)
+            damping = {UNDER_PRESSURE_STATE: float(params["pulse_pressure_damping"]),
+                       CORRECTION_STATE: float(params["pulse_correction_damping"])
+                       }.get(pulse.get("state"))
+            if damping is not None:
+                state.notes.append(
+                    f"시장 {pulse['label']} (분산일 {pulse['distribution_days']}개"
+                    + (f", 랠리 {pulse['rally_day']}일차" if pulse.get("in_rally_attempt")
+                       else "")
+                    + f") — 신호 확신 {1 - damping:.0%} 감산")
+                if state.mode in (SOFT, GATE):
+                    score *= max(0.0, min(1.0, damping))
 
     state.score = float(max(-1.0, min(1.0, score))) if state.mode in (SOFT, GATE) \
         else state.base_score

@@ -17,6 +17,22 @@ xgboost 네이티브 바이너리는 그 크기를 몇 배로 키우고, 우리�
     Chen, T., & Guestrin, C. (2016). "XGBoost: A Scalable Tree Boosting
     System." KDD '16.
 
+LightGBM 방식도 함께 이식했습니다 (microsoft/LightGBM)
+    리프 우선 성장   깊이 순서가 아니라 **이득이 가장 큰 잎부터** 쪼갭니다
+                     (num_leaves 상한). 같은 잎 수로 더 깊은 상호작용을 잡습니다.
+    GOSS            |gradient| 상위 a% 는 전부 쓰고, 나머지에서 b% 만 무작위
+                     추출해 (1−a)/b 배로 증폭합니다 (src/boosting/goss.hpp 의
+                     multiply = (cnt − top_k)/other_k 그대로). "모델이 아직 못
+                     맞히는 표본"에 계산을 집중하면서 기울기 합의 기댓값은
+                     보존하는 샘플링입니다. 원본과 같이 1/eta 라운드 이후 시작.
+
+    Ke, G., et al. (2017). "LightGBM: A Highly Efficient Gradient Boosting
+    Decision Tree." NeurIPS 2017.
+
+    두 변형(variant="xgb" 깊이 우선 / "lgbm" 리프 우선+GOSS)은 성장 정책이
+    달라 서로 다른 오류를 냅니다 — engine/mlsignal.py 가 둘을 독립된 예측기로
+    각각 검증해 결합하는 이유입니다.
+
 무엇을 예측하는가
     "다음 h봉의 방향이 위인가" — 지표들이 각자 한 가지 관점만 보는 것과 달리,
     부스팅은 피처 조합(예: 'RSI 낮음 + 거래량 급증 + 단기 하락')의 상호작용을
@@ -50,7 +66,19 @@ DEFAULTS = {
     "bins": 32,                 # 히스토그램 구간 수
     "early_stop_rounds": 12,
     "seed": 7,                  # 결정성 — 같은 데이터는 항상 같은 모델
+
+    # LightGBM 방식 스위치 (variant="lgbm" 이 켭니다)
+    "growth": "depthwise",      # depthwise(xgboost) | leafwise(LightGBM)
+    "num_leaves": 8,            # 리프 우선 성장의 잎 수 상한 (원본 기본 31 — 소표본 축소)
+    "goss": False,              # GOSS 샘플링
+    "goss_top_rate": 0.2,       # LightGBM 기본값 그대로
+    "goss_other_rate": 0.1,
 }
+
+# variant="lgbm" 프리셋 — 리프 우선 + GOSS. GOSS 가 배깅을 대신하므로
+# subsample 은 끕니다 (원본도 GOSS 와 bagging 을 같이 쓰지 않습니다).
+LGBM_PRESET = {"growth": "leafwise", "num_leaves": 8, "max_depth": 6,
+               "goss": True, "subsample": 1.0}
 
 MIN_SAMPLES = 80                # 이보다 적으면 학습하지 않습니다
 MIN_VAL = 15                    # 검증 표본 최소 개수
@@ -163,61 +191,127 @@ class _Node:
     gain: float = 0.0
 
 
+def _best_split(binned, grad, hess, rows, cols, params, n_bins):
+    """이 잎에서 가능한 최선의 분할 (gain, feature, bin). 없으면 gain=0.
+
+    xgboost param.h: ½[G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)] − γ
+    깊이 우선(xgb)과 리프 우선(lgbm)이 같은 이득 공식을 씁니다 — 두 방식의
+    차이는 '무엇을 언제 쪼개는가'뿐입니다.
+    """
+    lam = float(params["reg_lambda"])
+    mcw = float(params["min_child_weight"])
+    g_sum = float(grad[rows].sum())
+    h_sum = float(hess[rows].sum())
+    parent_gain = g_sum * g_sum / (h_sum + lam)
+
+    best = (0.0, -1, -1)
+    for j in cols:
+        b = binned[rows, j]
+        hist_g = np.bincount(b, weights=grad[rows], minlength=n_bins)
+        hist_h = np.bincount(b, weights=hess[rows], minlength=n_bins)
+        gl = np.cumsum(hist_g)[:-1]
+        hl = np.cumsum(hist_h)[:-1]
+        gr = g_sum - gl
+        hr = h_sum - hl
+        ok = (hl >= mcw) & (hr >= mcw)
+        if not ok.any():
+            continue
+        gain = 0.5 * (gl * gl / (hl + lam) + gr * gr / (hr + lam)
+                      - parent_gain) - float(params["gamma"])
+        gain = np.where(ok, gain, -np.inf)
+        k = int(np.argmax(gain))
+        if gain[k] > best[0]:
+            best = (float(gain[k]), int(j), k)
+    return best
+
+
 class _Tree:
-    """깊이 제한 히스토그램 회귀 트리 (한 라운드의 약한 학습기)."""
+    """히스토그램 회귀 트리 (한 라운드의 약한 학습기).
+
+    growth="depthwise"  xgboost 방식 — 얕고 균형 잡힌 트리
+    growth="leafwise"   LightGBM 방식 — 이득이 가장 큰 잎부터 쪼갬 (num_leaves 상한)
+    """
 
     def __init__(self):
         self.nodes: list[_Node] = []
 
     def build(self, binned: np.ndarray, grad: np.ndarray, hess: np.ndarray,
               rows: np.ndarray, cols: np.ndarray, params: dict, n_bins: int):
-        self._grow(binned, grad, hess, rows, cols, params, n_bins, depth=0)
+        if str(params.get("growth")) == "leafwise":
+            self._grow_leafwise(binned, grad, hess, rows, cols, params, n_bins)
+        else:
+            self._grow_depthwise(binned, grad, hess, rows, cols, params, n_bins,
+                                 depth=0)
         return self
 
-    def _grow(self, binned, grad, hess, rows, cols, params, n_bins, depth) -> int:
-        lam = float(params["reg_lambda"])
-        g_sum = float(grad[rows].sum())
-        h_sum = float(hess[rows].sum())
+    def _new_leaf(self, grad, hess, rows, lam) -> int:
         node_id = len(self.nodes)
-        node = _Node(weight=-g_sum / (h_sum + lam))
-        self.nodes.append(node)
+        g, h = float(grad[rows].sum()), float(hess[rows].sum())
+        self.nodes.append(_Node(weight=-g / (h + lam)))
+        return node_id
 
+    # -- xgboost 방식: 재귀 깊이 우선 ------------------------------------
+    def _grow_depthwise(self, binned, grad, hess, rows, cols, params, n_bins,
+                        depth) -> int:
+        lam = float(params["reg_lambda"])
+        node_id = self._new_leaf(grad, hess, rows, lam)
         if depth >= int(params["max_depth"]) or len(rows) < 2:
             return node_id
 
-        parent_gain = g_sum * g_sum / (h_sum + lam)
-        best = (0.0, -1, -1)          # (gain, feature, bin)
-        mcw = float(params["min_child_weight"])
-
-        for j in cols:
-            b = binned[rows, j]
-            hist_g = np.bincount(b, weights=grad[rows], minlength=n_bins)
-            hist_h = np.bincount(b, weights=hess[rows], minlength=n_bins)
-            gl = np.cumsum(hist_g)[:-1]
-            hl = np.cumsum(hist_h)[:-1]
-            gr = g_sum - gl
-            hr = h_sum - hl
-            ok = (hl >= mcw) & (hr >= mcw)
-            if not ok.any():
-                continue
-            # xgboost param.h: ½[G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)] − γ
-            gain = 0.5 * (gl * gl / (hl + lam) + gr * gr / (hr + lam)
-                          - parent_gain) - float(params["gamma"])
-            gain = np.where(ok, gain, -np.inf)
-            k = int(np.argmax(gain))
-            if gain[k] > best[0]:
-                best = (float(gain[k]), int(j), k)
-
-        if best[1] < 0 or best[0] <= 0:
+        gain, feat, tbin = _best_split(binned, grad, hess, rows, cols, params, n_bins)
+        if feat < 0 or gain <= 0:
             return node_id            # 이득 없는 분할은 하지 않음 (잎으로 종료)
 
-        node.feature, node.threshold_bin, node.gain = best[1], best[2], best[0]
-        mask = binned[rows, best[1]] <= best[2]
-        node.left = self._grow(binned, grad, hess, rows[mask], cols, params,
-                               n_bins, depth + 1)
-        node.right = self._grow(binned, grad, hess, rows[~mask], cols, params,
-                                n_bins, depth + 1)
+        node = self.nodes[node_id]
+        node.feature, node.threshold_bin, node.gain = feat, tbin, gain
+        mask = binned[rows, feat] <= tbin
+        node.left = self._grow_depthwise(binned, grad, hess, rows[mask], cols,
+                                         params, n_bins, depth + 1)
+        node.right = self._grow_depthwise(binned, grad, hess, rows[~mask], cols,
+                                          params, n_bins, depth + 1)
         return node_id
+
+    # -- LightGBM 방식: 이득 최대 잎 우선 --------------------------------
+    def _grow_leafwise(self, binned, grad, hess, rows, cols, params, n_bins):
+        """전체 잎 중 분할 이득이 가장 큰 것부터 쪼갭니다.
+
+        깊이 우선은 모든 가지를 같은 깊이로 키우느라 이득이 없는 곳에도 예산을
+        씁니다. 리프 우선은 같은 잎 개수로 '신호가 있는 가지'를 더 깊게 팝니다.
+        소표본에서는 그만큼 과적합도 빨라서, num_leaves 를 원본 기본(31)보다
+        훨씬 작게(8) 잡고 max_depth 안전핀도 둡니다.
+        """
+        lam = float(params["reg_lambda"])
+        max_leaves = max(2, int(params["num_leaves"]))
+        max_depth = int(params.get("max_depth", 6)) or 6
+
+        root = self._new_leaf(grad, hess, rows, lam)
+        # 후보 목록: (이득, 노드 id, 행 집합, 깊이, 분할 정보)
+        candidates = []
+
+        def push(node_id, node_rows, depth):
+            if depth >= max_depth or len(node_rows) < 2:
+                return
+            gain, feat, tbin = _best_split(binned, grad, hess, node_rows, cols,
+                                           params, n_bins)
+            if feat >= 0 and gain > 0:
+                candidates.append((gain, node_id, node_rows, depth, feat, tbin))
+
+        push(root, rows, 0)
+        n_leaves = 1
+        while candidates and n_leaves < max_leaves:
+            # 잎 수가 num_leaves(기본 8) 이하라 정렬보다 max 스캔이 쌉니다
+            idx = max(range(len(candidates)), key=lambda i: candidates[i][0])
+            gain, node_id, node_rows, depth, feat, tbin = candidates.pop(idx)
+
+            node = self.nodes[node_id]
+            node.feature, node.threshold_bin, node.gain = feat, tbin, gain
+            mask = binned[node_rows, feat] <= tbin
+            left_rows, right_rows = node_rows[mask], node_rows[~mask]
+            node.left = self._new_leaf(grad, hess, left_rows, lam)
+            node.right = self._new_leaf(grad, hess, right_rows, lam)
+            n_leaves += 1
+            push(node.left, left_rows, depth + 1)
+            push(node.right, right_rows, depth + 1)
 
     def predict(self, binned: np.ndarray) -> np.ndarray:
         out = np.empty(len(binned))
@@ -274,14 +368,12 @@ class Booster:
         best_loss, best_iter, since_best = np.inf, 0, 0
         kept: list[_Tree] = []
 
-        for _ in range(int(p["rounds"])):
+        for iteration in range(int(p["rounds"])):
             prob = _sigmoid(logit_t)
             grad = prob - y_train                 # 로지스틱 1차
             hess = prob * (1 - prob)              # 로지스틱 2차 (Newton)
 
-            rows = np.flatnonzero(rng.random(n_rows) < float(p["subsample"]))
-            if len(rows) < 10:
-                rows = np.arange(n_rows)
+            rows, grad, hess = self._sample_rows(iteration, grad, hess, rng)
             n_cols = max(1, int(round(n_feat * float(p["colsample"]))))
             cols = rng.choice(n_feat, size=n_cols, replace=False)
 
@@ -303,6 +395,43 @@ class Booster:
         self.best_iteration = len(self.trees)
         self.val_logloss = best_loss if bv is not None else None
         return self
+
+    def _sample_rows(self, iteration: int, grad: np.ndarray, hess: np.ndarray,
+                     rng) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """이번 라운드에 쓸 행과 (필요시 증폭된) 기울기.
+
+        GOSS (LightGBM src/boosting/goss.hpp)
+            |gradient| 상위 top_rate 는 전부 유지하고, 나머지에서 other_rate 만
+            무작위로 뽑아 multiply = (n − top_k)/other_k 배로 증폭합니다.
+            증폭 덕에 히스토그램의 기울기 합이 기댓값 기준으로 보존됩니다 —
+            그냥 버리면 분할 이득이 큰-기울기 쪽으로 쏠립니다.
+            원본과 같이 1/eta 라운드까지는 전체 데이터로 워밍업합니다.
+        """
+        p = self.params
+        n = len(grad)
+
+        if p.get("goss"):
+            if iteration < int(1.0 / max(float(p["eta"]), 1e-6)):
+                return np.arange(n), grad, hess          # 워밍업 (원본 동일)
+            top_k = max(1, int(n * float(p["goss_top_rate"])))
+            other_k = max(1, int(n * float(p["goss_other_rate"])))
+            order = np.argsort(-np.abs(grad))
+            top = order[:top_k]
+            rest = order[top_k:]
+            if len(rest) <= other_k:
+                return np.arange(n), grad, hess
+            sampled = rng.choice(rest, size=other_k, replace=False)
+            multiply = (n - top_k) / other_k             # goss.hpp 그대로
+            grad = grad.copy()
+            hess = hess.copy()
+            grad[sampled] *= multiply
+            hess[sampled] *= multiply
+            return np.concatenate([top, sampled]), grad, hess
+
+        rows = np.flatnonzero(rng.random(n) < float(p["subsample"]))
+        if len(rows) < 10:
+            rows = np.arange(n)
+        return rows, grad, hess
 
     def predict_proba(self, x: np.ndarray) -> np.ndarray:
         b = _binned(x, self.edges)
@@ -353,14 +482,20 @@ class GBDTResult:
 
 
 def direction_score(bars: pd.DataFrame, horizon_bars: int = 5,
-                    overrides: dict = None) -> GBDTResult:
+                    overrides: dict = None, variant: str = "xgb") -> GBDTResult:
     """일봉 → 다음 horizon_bars 봉이 오를 확률.
+
+    variant
+        "xgb"   깊이 우선 성장 + 행 서브샘플링 (기본)
+        "lgbm"  리프 우선 성장 + GOSS (LightGBM 방식)
 
     학습·검증·예측이 전부 시간순입니다.
         [   학습 80%   |  검증 20%  ] → 마지막 행으로 예측
     라벨은 t+1..t+h 의 수익률이라, 마지막 h개 행은 라벨이 없어 학습에서
     빠지고 예측에만 쓰입니다. 미래를 보는 경로가 구조적으로 없습니다.
     """
+    if variant == "lgbm":
+        overrides = {**LGBM_PRESET, **(overrides or {})}
     result = GBDTResult(horizon_bars=int(horizon_bars))
     built = feature_matrix(bars)
     if built is None:
@@ -413,4 +548,4 @@ def direction_score(bars: pd.DataFrame, horizon_bars: int = 5,
 
 
 __all__ = ["Booster", "GBDTResult", "direction_score", "feature_matrix",
-           "DEFAULTS", "MIN_SAMPLES"]
+           "DEFAULTS", "LGBM_PRESET", "MIN_SAMPLES"]

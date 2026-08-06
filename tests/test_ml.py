@@ -123,6 +123,172 @@ def test_gbdt():
 
 
 # ---------------------------------------------------------------------------
+# LightGBM 방식 (engine/gbdt.py variant="lgbm")
+# ---------------------------------------------------------------------------
+
+def test_lgbm():
+    print("\n[LGBM] engine/gbdt.py — 리프 우선 + GOSS")
+    from engine import gbdt
+
+    # 1) 리프 우선 부스터도 상호작용 패턴을 학습한다
+    rng = np.random.default_rng(21)
+    x = rng.normal(0, 1, (400, 5))
+    y = ((x[:, 0] > 0.2) ^ (x[:, 2] < -0.1)).astype(float)
+    booster = gbdt.Booster(**gbdt.LGBM_PRESET).fit(x[:300], y[:300], x[300:], y[300:])
+    acc = float(((booster.predict_proba(x[300:]) > 0.5) == (y[300:] > 0.5)).mean())
+    check("lgbm", "리프 우선+GOSS: 상호작용 학습 (>85%)", acc > 0.85, f"acc={acc:.2%}")
+
+    # 2) num_leaves 상한 준수 — 잎 수가 상한을 넘는 트리가 없어야 한다
+    limit = int(gbdt.LGBM_PRESET["num_leaves"])
+    max_leaves = 0
+    for tree in booster.trees:
+        leaves = sum(1 for node in tree.nodes if node.feature < 0)
+        max_leaves = max(max_leaves, leaves)
+    check("lgbm", f"num_leaves 상한({limit}) 준수", 0 < max_leaves <= limit,
+          f"최대 잎 수={max_leaves}")
+
+    # 3) GOSS 증폭 배율 — goss.hpp 의 multiply = (n − top_k)/other_k
+    n = 200
+    grad = np.linspace(-1, 1, n)
+    hess = np.abs(grad) * 0.2 + 0.05
+    b = gbdt.Booster(goss=True, eta=1.0)     # eta=1 → 워밍업 0라운드
+    rows, g2, h2 = b._sample_rows(iteration=5, grad=grad.copy(), hess=hess.copy(),
+                                  rng=np.random.default_rng(0))
+    top_k = max(1, int(n * b.params["goss_top_rate"]))
+    other_k = max(1, int(n * b.params["goss_other_rate"]))
+    expect = (n - top_k) / other_k
+    amplified = [i for i in rows if abs(g2[i] / grad[i] - expect) < 1e-9
+                 and grad[i] != 0]
+    check("lgbm", "GOSS: 표본 수 = top+other, 증폭 배율 정확",
+          len(rows) == top_k + other_k and len(amplified) == other_k,
+          f"rows={len(rows)} 증폭={len(amplified)} 배율={expect:.1f}")
+
+    # 4) 변형 간 독립성 — 같은 데이터에서 xgb 와 lgbm 이 서로 다른 모델
+    mr_bars = _to_bars(_ar1(300, phi=-0.5, seed=3), seed=3)
+    res_x = gbdt.direction_score(mr_bars, horizon_bars=1, variant="xgb")
+    res_l = gbdt.direction_score(mr_bars, horizon_bars=1, variant="lgbm")
+    check("lgbm", "lgbm 변형: 평균회귀 학습 성공", res_l.ok and res_l.edge > 0,
+          f"acc={res_l.val_accuracy:.2%} edge={res_l.edge:+.2f}")
+    check("lgbm", "결정성 (같은 입력 → 같은 점수)",
+          abs(res_l.score - gbdt.direction_score(mr_bars, horizon_bars=1,
+                                                 variant="lgbm").score) < 1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 칼만 추세 (engine/kalman.py — filterpy 이식)
+# ---------------------------------------------------------------------------
+
+def test_kalman():
+    print("\n[칼만] engine/kalman.py")
+    from engine import kalman
+
+    # 1) 뚜렷한 추세 — 기울기 부호가 맞고 적중률이 높다
+    rng = np.random.default_rng(31)
+    trend = 0.004 + rng.normal(0, 0.008, 300)          # 상승 드리프트
+    bars_up = _to_bars(trend, seed=31)
+    res = kalman.direction_score(bars_up, horizon_bars=5)
+    check("kalman", "상승 추세: 기울기 + / 적중률 > 60%",
+          res.ok and res.slope > 0 and res.hit_rate > 0.6,
+          f"slope={res.slope:+.5f} hit={res.hit_rate:.0%} (n={res.n_eval})")
+
+    # 2) 랜덤워크 — 강한 주장을 하지 않는다 (SNR 낮음 또는 적중률 ≈ 50%)
+    rw = _to_bars(_ar1(300, phi=0.0, sigma=0.015, seed=32), seed=32)
+    res_rw = kalman.direction_score(rw, horizon_bars=5)
+    check("kalman", "랜덤워크: 낮은 확신", res_rw.ok
+          and (abs(res_rw.snr) < 3.0 or abs(res_rw.hit_rate - 0.5) < 0.12),
+          f"snr={res_rw.snr:+.2f} hit={res_rw.hit_rate:.0%}")
+
+    # 3) 적응형 Q — 급반전 구간이 있으면 Q 조절이 실제로 개입한다
+    flip = np.concatenate([np.full(150, 0.004), np.full(150, -0.006)]) \
+        + rng.normal(0, 0.004, 300)
+    bars_flip = _to_bars(flip, seed=33)
+    res_flip = kalman.direction_score(bars_flip, horizon_bars=5)
+    check("kalman", "급반전: 적응형 Q 개입 + 새 방향 추종",
+          res_flip.ok and res_flip.adapted > 0 and res_flip.slope < 0,
+          f"adapted={res_flip.adapted} slope={res_flip.slope:+.5f}")
+
+    # 4) 수준 추정 — 필터 수준이 관측 로그가격에서 크게 벗어나지 않는다
+    close_last = float(bars_up["close"].iloc[-1])
+    check("kalman", "수준 추정 합리성 (관측 대비 ±5%)",
+          abs(np.exp(res.level) / close_last - 1) < 0.05,
+          f"level={np.exp(res.level):,.0f} vs close={close_last:,.0f}")
+
+    # 5) 결정성 + 표본 부족 거부
+    res2 = kalman.direction_score(bars_up, horizon_bars=5)
+    check("kalman", "결정성", abs(res.score - res2.score) < 1e-12)
+    tiny = kalman.direction_score(bars_up.iloc[:40], horizon_bars=5)
+    check("kalman", "표본 부족 시 거부", not tiny.ok and tiny.error != "")
+
+
+# ---------------------------------------------------------------------------
+# GARCH (engine/garch.py — arch 이식)
+# ---------------------------------------------------------------------------
+
+def _garch_series(n: int, omega: float, alpha: float, beta: float,
+                  seed: int = 0) -> np.ndarray:
+    """알려진 파라미터의 GARCH(1,1) 수익률 생성 — 복원 검사용."""
+    rng = np.random.default_rng(seed)
+    r = np.zeros(n)
+    sigma2 = omega / (1 - alpha - beta)
+    for t in range(1, n):
+        sigma2 = omega + alpha * r[t - 1] ** 2 + beta * sigma2
+        r[t] = np.sqrt(sigma2) * rng.standard_normal()
+    return r
+
+
+def test_garch():
+    print("\n[GARCH] engine/garch.py")
+    from engine import ensemble, garch
+
+    # 1) 파라미터 복원 — 진짜 GARCH 데이터에서 α·β 를 근사 복원한다
+    true_a, true_b = 0.10, 0.85
+    r = _garch_series(1000, omega=1.5e-5, alpha=true_a, beta=true_b, seed=41)
+    res = garch.fit(r)
+    check("garch", "GARCH 데이터: 수렴 + 지속성 복원", res.ok and res.converged
+          and abs(res.persistence - (true_a + true_b)) < 0.1,
+          f"α={res.alpha:.3f} β={res.beta:.3f} 지속성={res.persistence:.3f} LR={res.lr_stat:.0f}")
+
+    # 2) 상수 변동성 — 우도비 검정이 '군집 없음'으로 거른다
+    flat = np.random.default_rng(42).normal(0, 0.012, 500)
+    res_flat = garch.fit(flat)
+    check("garch", "상수 변동성: 수렴 거부 (LR 미달)", res_flat.ok
+          and not res_flat.converged, f"LR={res_flat.lr_stat:.1f}")
+
+    # 3) 예측 방향 — 방금 충격이 왔으면 예측 변동성 > 무조건부
+    shocked = np.concatenate([_garch_series(400, 1.5e-5, true_a, true_b, seed=43),
+                              np.array([0.06, -0.05, 0.055])])   # 마지막에 대형 충격
+    res_shock = garch.fit(shocked)
+    check("garch", "충격 직후: 예측 변동성 > 장기 평균", res_shock.ok
+          and res_shock.vol_ratio > 1.1,
+          f"ratio={res_shock.vol_ratio:.2f} (σ₁={res_shock.sigma_next_pct:.2f}% "
+          f"vs 평균 {res_shock.sigma_uncond_pct:.2f}%)")
+
+    # 4) 반감기 공식 — persistence 로부터 정확히
+    if res.ok and 0 < res.persistence < 1:
+        expect = np.log(0.5) / np.log(res.persistence)
+        check("garch", "반감기 공식 일치", abs(res.half_life - expect) < 1e-6)
+    else:
+        check("garch", "반감기 공식 일치", False, "수렴 실패로 검증 불가")
+
+    # 5) 결정성 (seed 없는 격자 탐색)
+    res2 = garch.fit(r)
+    check("garch", "결정성", res.ok and res.alpha == res2.alpha
+          and res.loglik == res2.loglik)
+
+    # 6) ensemble 통합 — GARCH 수렴 시 변동성 배수에 보정이 붙고,
+    #    미수렴이면 기존 Yang-Zhang 값 그대로
+    bars_g = _to_bars(shocked, seed=44)
+    garch.clear_cache()
+    vol = ensemble.volatility_factor(bars_g)
+    has_garch = isinstance(vol.get("garch"), dict)
+    check("garch", "ensemble: garch 정보 첨부", vol["ok"] and has_garch,
+          f"factor={vol.get('factor')} adj={vol.get('garch', {}).get('applied_adj')}")
+    # 표본 부족 시에도 배수는 살아 있어야 한다 (GARCH 없이)
+    vol_small = ensemble.volatility_factor(bars_g.iloc[:80])
+    check("garch", "ensemble: GARCH 불가여도 배수 동작", "factor" in vol_small)
+
+
+# ---------------------------------------------------------------------------
 # 패치 어텐션 (engine/patchtst.py — PatchTST 이식)
 # ---------------------------------------------------------------------------
 
@@ -207,11 +373,12 @@ def test_mlsignal():
     state = mlsignal.compute("TEST", mr_bars, {"ml_mode": "off"})
     check("mlsig", "off: 계산 안 함", not state.ok and state.score is None)
 
-    # 2) observe — 계산·첨부, 사용 여부 표시
+    # 2) observe — 계산·첨부, 사용 여부 표시 (4개 예측기 전부)
     state = mlsignal.compute("TEST", mr_bars,
                              {"ml_mode": "observe", "ml_horizon_bars": 1})
-    check("mlsig", "observe: 두 예측기 결과 첨부", state.ok
-          and state.gbdt.get("ok") is not None and state.patch.get("ok") is not None)
+    check("mlsig", "observe: 네 예측기 결과 첨부", state.ok
+          and state.gbdt.get("ok") is not None and state.lgbm.get("ok") is not None
+          and state.patch.get("ok") is not None and state.kalman.get("ok") is not None)
 
     # 3) 품질 게이트 — 검증 미달 예측기는 결합에서 빠진다
     #    (기준을 극단으로 올려 강제 탈락시키고 확인)
@@ -222,7 +389,8 @@ def test_mlsignal():
                                "ml_min_confidence": 0.99})
     check("mlsig", "품질 게이트: 전원 미달 시 score=None",
           strict.ok and strict.score is None
-          and not strict.gbdt_used and not strict.patch_used)
+          and not strict.gbdt_used and not strict.lgbm_used
+          and not strict.patch_used and not strict.kalman_used)
 
     # 4) apply_to_score — usable 하지 않으면 점수 불변
     base = 0.4
@@ -305,8 +473,8 @@ def test_integration():
 
 def report() -> bool:
     print("\n" + "=" * 60)
-    names = {"gbdt": "GBDT", "patch": "패치 어텐션", "mlsig": "ML 오버레이",
-             "integ": "통합"}
+    names = {"gbdt": "GBDT", "lgbm": "LGBM", "kalman": "칼만", "garch": "GARCH",
+             "patch": "패치 어텐션", "mlsig": "ML 오버레이", "integ": "통합"}
     by_cat: dict = {}
     for cat, _, ok, _ in results:
         n, p = by_cat.get(cat, (0, 0))
@@ -331,6 +499,9 @@ def report() -> bool:
 
 if __name__ == "__main__":
     test_gbdt()
+    test_lgbm()
+    test_kalman()
+    test_garch()
     test_patch()
     test_mlsignal()
     test_integration()
