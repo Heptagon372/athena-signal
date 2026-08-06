@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "아테나 시그널 (Athena Signal)",
+  "short_name": "Athena Signal",
+  "version": "0.3.0",
+  "description": "코스피·코스닥·미국 종목의 기술적 지표, 뉴스, 커뮤니티 여론을 종합한 상승/하락 확률. 종목 페이지 방문 시 커뮤니티 글을 내 PC의 분석 서버로 수집합니다.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://tossinvest.com/*",
+        "https://www.tossinvest.com/*",
+        "https://finance.naver.com/item/*",
+        "https://m.stock.naver.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://tossinvest.com/stocks/*",
+        "https://www.tossinvest.com/stocks/*",
+        "https://finance.naver.com/item/board*",
+        "https://m.stock.naver.com/domestic/stock/*",
+        "https://www.paxnet.co.kr/*",
+        "https://m.paxnet.co.kr/*",
+        "https://securities.kakaopay.com/*",
+        "https://*.kakaopay.com/securities/*"
+      ],
+      "js": ["scraper.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "https://tossinvest.com/*",
+    "https://finance.naver.com/*",
+    "https://m.stock.naver.com/*",
+    "https://www.paxnet.co.kr/*",
+    "https://m.paxnet.co.kr/*",
+    "https://securities.kakaopay.com/*"
+  ]
+}

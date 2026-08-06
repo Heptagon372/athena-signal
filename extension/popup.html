@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Athena Signal</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 40 40" fill="none">
+        <circle cx="20" cy="20" r="18.5" stroke="#c9a227" stroke-width="1.4"/>
+        <circle cx="20" cy="20" r="10" stroke="#c9a227" stroke-width="1.2"/>
+        <circle cx="20" cy="20" r="3.4" fill="#c9a227"/>
+      </svg>
+      <span class="brand-text">ATHENA SIGNAL</span>
+    </div>
+    <span class="badge" id="mode-badge">연결 확인 중</span>
+  </header>
+
+  <form id="search-form">
+    <input type="text" id="ticker-input" placeholder="종목명 / 코드 (예: 삼성전자, 005930)" autocomplete="off">
+    <button type="submit">보기</button>
+  </form>
+
+  <div id="detected-hint" class="detected-hint" style="display:none;"></div>
+
+  <main id="content">
+    <div class="loading">불러오는 중…</div>
+  </main>
+
+  <footer>
+    <div class="disclaimer">확률은 실험적 지표이며 투자 조언이 아닙니다.</div>
+    <a href="#" id="open-web-link">웹 대시보드 전체 보기 ↗</a>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

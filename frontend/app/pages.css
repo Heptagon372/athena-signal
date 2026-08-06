@@ -1,0 +1,589 @@
+/* ===================================================================
+   ATHENA SIGNAL — 페이지별 스타일
+   =================================================================== */
+
+/* ---------- 로그인 ---------- */
+.auth-wrap { display: flex; justify-content: center; padding: 60px 0 80px; }
+.auth-card {
+  width: 100%; max-width: 430px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: var(--radius); padding: 32px 30px;
+}
+.auth-title { font-size: 26px; font-weight: 600; margin: 14px 0 10px; }
+.auth-lede { color: var(--muted); font-size: 13px; line-height: 1.7; margin: 0 0 24px; }
+.auth-lede strong { color: var(--text); }
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field > span { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); }
+.field em { font-style: normal; opacity: 0.7; }
+.auth-error {
+  color: var(--down); font-size: 12.5px; background: rgba(63, 127, 208, 0.08);
+  border: 1px solid var(--hairline); border-radius: var(--radius); padding: 9px 12px;
+}
+.auth-submit { width: 100%; padding: 12px; margin-top: 4px; }
+.auth-switch {
+  margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--hairline);
+  font-size: 12.5px; color: var(--muted); text-align: center;
+}
+.auth-switch button {
+  background: none; border: none; color: var(--gold); cursor: pointer;
+  font-size: 12.5px; font-weight: 600; padding: 0; text-decoration: underline;
+}
+.auth-note {
+  margin-top: 16px; font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+  color: var(--muted); line-height: 1.7;
+}
+.auth-gate { max-width: 560px; }
+.auth-gate h2 { font-size: 20px; margin: 12px 0 8px; }
+.auth-gate p { color: var(--muted); font-size: 13px; line-height: 1.7; margin: 0 0 18px; }
+
+/* ---------- 헤더 위젯 ---------- */
+.countdown {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--panel-raised); border: 1px solid var(--hairline);
+  border-radius: 20px; padding: 6px 14px 6px 11px;
+  font-family: "IBM Plex Mono", monospace; font-size: 11.5px; white-space: nowrap;
+}
+.cd-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.countdown.open .cd-dot { background: var(--up); box-shadow: 0 0 8px var(--up); animation: pulse 1.4s infinite; }
+.countdown.soon .cd-dot { background: var(--gold); box-shadow: 0 0 8px var(--gold); }
+.cd-label { color: var(--muted); }
+.countdown.open .cd-label { color: var(--up); }
+.cd-time { color: var(--text); font-variant-numeric: tabular-nums; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.user-chip {
+  display: flex; align-items: center; gap: 9px; font-size: 12px;
+  background: var(--panel-raised); border: 1px solid var(--hairline);
+  border-radius: 20px; padding: 5px 8px 5px 14px;
+}
+.theme-toggle {
+  background: var(--panel-raised); border: 1px solid var(--hairline); color: var(--muted);
+  width: 34px; height: 34px; border-radius: var(--radius); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s;
+}
+.theme-toggle:hover { color: var(--gold); border-color: var(--gold); }
+
+/* ---------- 검색 ---------- */
+.search-section { padding: 24px 0 0; border-bottom: none; }
+.search-form { display: flex; gap: 9px; align-items: flex-start; }
+.search-wrap { position: relative; flex: 1; max-width: 460px; }
+.suggest {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 60;
+  background: var(--panel-raised); border: 1px solid var(--hairline);
+  border-radius: var(--radius); overflow: hidden; max-height: 320px; overflow-y: auto;
+}
+.suggest-item {
+  width: 100%; display: flex; justify-content: space-between; gap: 10px; align-items: center;
+  padding: 9px 13px; background: none; border: none; color: var(--text);
+  font-size: 13px; cursor: pointer; text-align: left;
+}
+.suggest-item:hover { background: rgba(201, 162, 39, 0.12); }
+.suggest-meta { font-size: 11px; color: var(--muted); }
+
+/* ---------- 히어로 ---------- */
+.hero { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 44px; align-items: center; }
+.hero-title { font-size: 40px; line-height: 1.14; margin: 16px 0 14px; font-weight: 600; letter-spacing: -0.02em; }
+.hero-title em { font-style: italic; color: var(--gold); }
+.market-badge {
+  display: inline-block; font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  letter-spacing: 0.08em; padding: 4px 10px; border-radius: 20px; margin-left: 10px;
+  vertical-align: middle; border: 1px solid var(--hairline); color: var(--muted);
+}
+.market-badge.KOSPI { border-color: var(--gold); color: var(--gold); }
+.market-badge.KOSDAQ { border-color: var(--olive); color: var(--olive); }
+.market-badge.US { border-color: #7a9cc6; color: #7a9cc6; }
+
+.leverage-warning {
+  margin: 12px 0; padding: 11px 14px; background: rgba(201, 162, 39, 0.08);
+  border-left: 2px solid var(--gold); border-radius: 0 var(--radius) var(--radius) 0;
+  font-family: "IBM Plex Mono", monospace; font-size: 11.5px; line-height: 1.7;
+  color: var(--muted); max-width: 52ch;
+}
+.leverage-warning b { color: var(--gold); }
+
+.live-price { margin: 16px 0; }
+.lp-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.lp-value { font-family: "IBM Plex Mono", monospace; font-size: 34px; font-weight: 600; line-height: 1.1; }
+.lp-change { font-family: "IBM Plex Mono", monospace; font-size: 16px; }
+.lp-meta {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 7px;
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted);
+}
+.market-state { display: inline-flex; align-items: center; gap: 6px; }
+.market-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.market-state.open { color: var(--up); }
+.market-state.open i { background: var(--up); box-shadow: 0 0 8px var(--up); animation: pulse 1.4s infinite; }
+.verified { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); margin-top: 8px; }
+.verified b { color: var(--olive); }
+
+/* ---------- 장 시작 전 예측 ---------- */
+.open-panel {
+  border: 1px solid var(--hairline); border-radius: var(--radius); text-align: center;
+  background: linear-gradient(180deg, rgba(201, 162, 39, 0.055), transparent 60%), var(--panel);
+  padding: 22px 24px 20px;
+}
+:root[data-theme="light"] .open-panel {
+  background: linear-gradient(180deg, rgba(154, 122, 18, 0.07), transparent 60%), var(--panel);
+}
+.open-eyebrow {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--gold); margin-bottom: 14px;
+}
+.open-target { font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: var(--muted); margin-top: 10px; line-height: 1.7; }
+.open-target b { color: var(--text); }
+.open-formula {
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--hairline);
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: var(--muted);
+  text-align: left; line-height: 1.85; overflow-x: auto;
+}
+.open-formula b { color: var(--gold); }
+.f-term { display: flex; justify-content: space-between; gap: 14px; white-space: nowrap; }
+.f-term i { opacity: 0.6; font-style: normal; }
+.f-total { border-top: 1px solid var(--hairline); margin-top: 7px; padding-top: 7px; color: var(--text); }
+
+/* ---------- 시평선 스트립 ---------- */
+.hz-strip { display: flex; gap: 10px; flex-wrap: wrap; }
+.hz-cell {
+  flex: 1; min-width: 112px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: var(--radius); padding: 11px 12px;
+}
+.hz-label { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--muted); }
+.hz-prob { font-family: "IBM Plex Mono", monospace; font-size: 17px; margin-top: 5px; }
+.hz-bar { height: 3px; background: var(--panel-raised); border-radius: 2px; margin-top: 7px; overflow: hidden; }
+.hz-bar i { display: block; height: 100%; border-radius: 2px; }
+.hz-meta { font-family: "IBM Plex Mono", monospace; font-size: 9.5px; color: var(--muted); margin-top: 6px; }
+
+/* ---------- 올빼미 ---------- */
+.owl-section { display: grid; grid-template-columns: 240px 1fr; gap: 38px; align-items: center; }
+.owl-stage { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.owl { overflow: visible; transition: transform 0.9s cubic-bezier(0.34, 1.3, 0.64, 1); }
+.owl.rising { animation: owl-up 3s ease-in-out infinite; }
+.owl.falling { animation: owl-down 3.4s ease-in-out infinite; }
+.owl.sleeping { animation: owl-breathe 5s ease-in-out infinite; }
+@keyframes owl-up { 0%, 100% { transform: rotate(-5deg) translateY(0); } 50% { transform: rotate(-5deg) translateY(-8px); } }
+@keyframes owl-down { 0%, 100% { transform: rotate(6deg) translateY(0); } 50% { transform: rotate(6deg) translateY(6px); } }
+@keyframes owl-breathe { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(2px) scale(0.995); } }
+
+.owl-body, .owl-head { fill: var(--owl-body); stroke-width: 2.2; transition: stroke 0.6s, filter 0.6s; }
+.owl-disc { fill: none; stroke: var(--hairline); stroke-width: 1.2; opacity: 0.75; }
+.owl-plume path { fill: none; stroke: var(--hairline); stroke-width: 1.1; opacity: 0.55; stroke-linecap: round; }
+.owl-feet path { fill: none; stroke: var(--gold); stroke-width: 1.8; stroke-linecap: round; opacity: 0.75; }
+.owl.rising .owl-body, .owl.rising .owl-head { stroke: var(--up); }
+.owl.falling .owl-body, .owl.falling .owl-head { stroke: var(--down); }
+.owl.sleeping .owl-body, .owl.sleeping .owl-head { stroke: var(--hairline); }
+.owl.strong.rising .owl-head { filter: drop-shadow(0 0 12px rgba(210, 75, 58, 0.35)); }
+.owl.strong.falling .owl-head { filter: drop-shadow(0 0 12px rgba(63, 127, 208, 0.35)); }
+
+.owl-tuft { fill: var(--owl-body); stroke: var(--hairline); stroke-width: 1.2;
+  transform-box: fill-box; transition: transform 0.7s cubic-bezier(0.34, 1.4, 0.64, 1), fill 0.6s; }
+.owl.rising .owl-tuft { fill: var(--up); opacity: 0.75; }
+.owl.falling .owl-tuft { fill: var(--down); opacity: 0.6; }
+.tuft-l { transform-origin: bottom right; }
+.tuft-r { transform-origin: bottom left; }
+.owl.strong.rising .tuft-l { transform: rotate(-13deg); }
+.owl.strong.rising .tuft-r { transform: rotate(13deg); }
+.owl.falling .tuft-l { transform: rotate(16deg); }
+.owl.falling .tuft-r { transform: rotate(-16deg); }
+.owl.sleeping .tuft-l { transform: rotate(26deg); }
+.owl.sleeping .tuft-r { transform: rotate(-26deg); }
+
+.owl-beak { fill: var(--gold); transform-box: fill-box; transform-origin: top center; transition: transform 0.5s; }
+.owl.strong.falling .owl-beak { transform: scaleY(1.25); }
+
+.owl-wing { fill: var(--panel-raised); stroke: var(--hairline); stroke-width: 1.5;
+  transform-box: fill-box; transition: transform 0.9s cubic-bezier(0.34, 1.5, 0.64, 1); }
+.wing-l { transform-origin: right center; }
+.wing-r { transform-origin: left center; }
+.owl.rising .wing-l { transform: rotate(-38deg) translateY(-12px); }
+.owl.rising .wing-r { transform: rotate(38deg) translateY(-12px); }
+.owl.strong.rising .wing-l { transform: rotate(-58deg) translateY(-18px); }
+.owl.strong.rising .wing-r { transform: rotate(58deg) translateY(-18px); }
+.owl.falling .wing-l { transform: rotate(20deg) translateY(15px); }
+.owl.falling .wing-r { transform: rotate(-20deg) translateY(15px); }
+.owl.sleeping .wing-l { transform: rotate(8deg) translateY(6px); }
+.owl.sleeping .wing-r { transform: rotate(-8deg) translateY(6px); }
+
+.eye-white { fill: var(--bg); }
+.eye-ring { fill: none; stroke: var(--gold); stroke-width: 2; }
+.eye-pupil { fill: var(--gold); transition: r 0.5s, cy 0.5s; }
+.eye-shine { fill: var(--text); opacity: 0.85; }
+.eye-lid { fill: var(--owl-body); stroke: var(--gold); stroke-width: 1.6;
+  transform-box: fill-box; transform-origin: bottom center; transform: scaleY(0); transition: transform 0.16s; }
+.owl.blinking .eye-lid { transform: scaleY(1); }
+.owl.sleeping .eye-lid { transform: scaleY(1); transition: transform 0.5s; }
+.owl.sleeping .eye-shine { opacity: 0; }
+
+.owl-brow { stroke: var(--gold); stroke-width: 2.6; stroke-linecap: round; fill: none;
+  transform-box: fill-box; transform-origin: center; transition: transform 0.55s, opacity 0.4s; opacity: 0.9; }
+.owl.rising .brow-l { transform: translateY(-4px) rotate(-9deg); }
+.owl.rising .brow-r { transform: translateY(-4px) rotate(9deg); }
+.owl.falling .brow-l { transform: translateY(3px) rotate(15deg); }
+.owl.falling .brow-r { transform: translateY(3px) rotate(-15deg); }
+.owl.sleeping .owl-brow { opacity: 0.35; transform: translateY(2px); }
+
+.owl-zzz { fill: var(--muted); font-family: "IBM Plex Mono", monospace; opacity: 0; }
+.owl.sleeping .owl-zzz { opacity: 0.8; animation: zzz 3s ease-in-out infinite; }
+@keyframes zzz { 0%, 100% { opacity: 0.25; transform: translateY(0); } 50% { opacity: 0.85; transform: translateY(-4px); } }
+
+.owl-caption { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--muted); text-align: center; }
+.owl-caption b { color: var(--text); }
+.owl-mood {
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: var(--muted);
+  padding: 4px 11px; border-radius: 20px; background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+}
+
+/* ---------- 시세 ---------- */
+.investor-row {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--hairline);
+  border: 1px solid var(--hairline); border-top: none; overflow: hidden;
+}
+.investor-row > div { background: var(--panel-raised); padding: 12px 16px; text-align: center; }
+.source-note { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: var(--muted); margin-top: 9px; line-height: 1.7; }
+
+/* ---------- 차트 ---------- */
+.tf-picker { display: flex; }
+.tf-picker button {
+  background: var(--panel); border: 1px solid var(--hairline); border-right: none;
+  color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  padding: 7px 14px; cursor: pointer; transition: color 0.15s, background 0.15s;
+}
+.tf-picker button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+.tf-picker button:last-child { border-right: 1px solid var(--hairline); border-radius: 0 var(--radius) var(--radius) 0; }
+.tf-picker button:hover { color: var(--text); }
+.tf-picker button.active { background: rgba(201, 162, 39, 0.14); color: var(--gold); border-color: var(--gold); }
+
+.chart-box { position: relative; border: 1px solid var(--hairline); border-radius: var(--radius);
+  background: var(--panel); padding: 12px 10px 8px; }
+.chart-box svg { display: block; width: 100%; height: auto; }
+.chart-legend {
+  display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px;
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted);
+}
+.chart-legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 5px; }
+.chart-legend .sw-box { height: 9px; border-radius: 1px; }
+/* 지표 설정 — 차트 범례 오른쪽 끝에 붙는 작은 드롭다운 */
+.ind-picker { position: relative; margin-left: auto; }
+.ind-picker > button {
+  background: var(--panel); border: 1px solid var(--hairline); color: var(--muted);
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; padding: 3px 10px;
+  border-radius: var(--radius); cursor: pointer; transition: color 0.15s, border-color 0.15s;
+}
+.ind-picker > button:hover { color: var(--text); }
+.ind-picker > button.active { color: var(--gold); border-color: var(--gold); }
+.ind-scrim { position: fixed; inset: 0; z-index: 24; }
+.ind-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 25; min-width: 194px;
+  background: var(--panel-raised); border: 1px solid var(--hairline);
+  border-radius: var(--radius); padding: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.ind-menu-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; letter-spacing: 0.08em; color: var(--muted);
+  padding: 6px 6px 5px; border-bottom: 1px solid var(--hairline); margin-bottom: 4px;
+}
+.ind-menu-head + .ind-menu-head { margin-top: 8px; }
+.ind-menu-head button {
+  background: none; border: none; color: var(--gold); cursor: pointer;
+  font-family: inherit; font-size: 10px; padding: 0;
+}
+.ind-menu label {
+  display: flex; align-items: center; gap: 7px; padding: 4px 6px; cursor: pointer;
+  font-size: 12px; color: var(--text); border-radius: var(--radius);
+}
+.ind-menu label:hover { background: rgba(201, 162, 39, 0.08); }
+.ind-menu label.off { color: var(--muted); cursor: not-allowed; }
+.ind-menu label i { display: inline-block; width: 12px; height: 2px; }
+.ind-menu input { accent-color: var(--gold); cursor: pointer; }
+
+.chart-tip {
+  position: absolute; pointer-events: none; z-index: 20;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline); border-radius: var(--radius); padding: 9px 11px;
+  font-family: "IBM Plex Mono", monospace; font-size: 11px; line-height: 1.65;
+  white-space: nowrap; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.tip-date { color: var(--gold); margin-bottom: 4px; }
+.tip-row { display: flex; justify-content: space-between; gap: 16px; }
+.tip-row span:first-child { color: var(--muted); }
+
+/* ---------- 국면 · 지표 ---------- */
+.regime-card {
+  border: 1px solid var(--hairline); border-left-width: 3px; border-radius: var(--radius);
+  background: var(--panel); padding: 16px 18px; margin-bottom: 18px;
+}
+.regime-card.trend { border-left-color: var(--up); }
+.regime-card.meanrev { border-left-color: var(--olive); }
+.regime-card.random { border-left-color: var(--muted); }
+.regime-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.regime-badge { font-family: "IBM Plex Mono", monospace; font-size: 12px; font-weight: 600;
+  padding: 4px 12px; border-radius: 20px; }
+.regime-badge.trend { background: rgba(210, 75, 58, 0.15); color: var(--up); }
+.regime-badge.meanrev { background: rgba(116, 129, 91, 0.2); color: var(--olive); }
+.regime-badge.random { background: var(--panel-raised); color: var(--muted); }
+.regime-strategy { font-size: 12.8px; line-height: 1.65; margin-bottom: 8px; }
+.regime-evidence { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); line-height: 1.7; }
+.regime-evidence b { color: var(--gold); }
+
+.ind-rows { display: flex; flex-direction: column; border: 1px solid var(--hairline);
+  border-radius: var(--radius); overflow: hidden; }
+.ind-row { grid-template-columns: 200px 100px 1fr 110px; }
+.ind-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; }
+.ind-dot.bullish { background: var(--up); }
+.ind-dot.bearish { background: var(--down); }
+.ind-dot.neutral { background: var(--muted); }
+.ind-reason { font-size: 12.5px; line-height: 1.55; }
+.fam-tag { font-family: "IBM Plex Mono", monospace; font-size: 9px; padding: 1px 5px;
+  border-radius: 2px; margin-left: 6px; white-space: nowrap; }
+.fam-tag.trend { background: rgba(210, 75, 58, 0.14); color: var(--up); }
+.fam-tag.meanrev { background: rgba(116, 129, 91, 0.2); color: var(--olive); }
+.fam-tag.confirm { background: rgba(201, 162, 39, 0.14); color: var(--gold); }
+.fam-tag.info { background: var(--panel-raised); color: var(--muted); }
+
+/* ---------- 근거 · 피드 ---------- */
+.rc-grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 26px; align-items: start; }
+.rationale-list { display: flex; flex-direction: column; gap: 9px; }
+.rationale-item {
+  display: flex; gap: 11px; padding: 12px 14px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: var(--radius); align-items: flex-start;
+}
+.rationale-tag { font-family: "IBM Plex Mono", monospace; font-size: 10px; padding: 3px 7px;
+  border-radius: 3px; white-space: nowrap; margin-top: 2px; }
+.rationale-tag.technical { background: rgba(201, 162, 39, 0.15); color: var(--gold); }
+.rationale-tag.news { background: rgba(116, 129, 91, 0.22); color: var(--olive); }
+.rationale-tag.community { background: rgba(156, 143, 115, 0.18); color: var(--muted); }
+.rationale-text { font-size: 12.8px; line-height: 1.55; }
+
+.feed-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+.feed-list { display: flex; flex-direction: column; gap: 7px; max-height: 300px; overflow-y: auto; }
+.feed-item {
+  display: flex; gap: 9px; padding: 9px 11px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: var(--radius);
+  text-decoration: none; color: inherit;
+}
+.feed-stance { width: 5px; border-radius: 3px; flex-shrink: 0; }
+.feed-stance.bullish { background: var(--up); }
+.feed-stance.bearish { background: var(--down); }
+.feed-stance.neutral { background: var(--hairline); }
+.feed-title { font-size: 12.3px; line-height: 1.42; }
+.feed-sources { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 9px; }
+.src-chip {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; color: var(--muted);
+  background: var(--panel-raised); border: 1px solid var(--hairline);
+  border-radius: 20px; padding: 2px 8px; white-space: nowrap;
+}
+.src-chip b { color: var(--gold); }
+
+/* ---------- 없는 종목 ---------- */
+.notfound-card { border-left: 3px solid var(--down); max-width: 720px; }
+.notfound-card h2 { font-size: 22px; margin: 12px 0 10px; }
+.notfound-card p { color: var(--text); font-size: 14px; margin: 0 0 6px; }
+.nf-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.nf-chip {
+  border: 1px solid var(--hairline); background: var(--panel-raised); color: var(--text);
+  border-radius: 20px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+}
+.nf-chip:hover { border-color: var(--gold); }
+.nf-chip span { color: var(--muted); font-size: 11px; margin-left: 6px; }
+.nf-hint { color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 11px; margin-top: 16px; line-height: 1.8; }
+
+/* ---------- 성적표 · 모의투자 ---------- */
+.resolve-note { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: var(--muted); margin-top: 10px; line-height: 1.7; }
+.scored-row { grid-template-columns: 130px 80px 1fr 130px 70px; }
+.hold-row { grid-template-columns: 1fr 100px 116px 116px 130px 80px; }
+.trade-row { grid-template-columns: 130px 62px 1fr 96px 110px 116px; }
+.ta-r { text-align: right; }
+.order-row { display: flex; gap: 9px; flex-wrap: wrap; }
+.order-row .input { flex: 1; min-width: 140px; }
+.order-hint { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: var(--muted); margin-top: 12px; line-height: 1.7; }
+.order-result { font-family: "IBM Plex Mono", monospace; font-size: 11.5px; margin-top: 10px; line-height: 1.7; }
+
+@media (max-width: 900px) {
+  .hero, .owl-section, .rc-grid { grid-template-columns: 1fr; }
+  .hero-title { font-size: 32px; }
+  .ind-row, .scored-row, .hold-row, .trade-row { grid-template-columns: 1fr 1fr; gap: 6px; }
+  .ta-r, .row .m { text-align: left; }
+}
+
+/* ---------------- 성적표 2단 레이아웃 + 실시간 채점 패널 ---------------- */
+
+.score-layout{
+  display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:22px; align-items:start;
+}
+@media (max-width: 1080px){
+  .score-layout{ grid-template-columns:1fr; }
+  .live-panel{ position:static !important; }
+}
+
+.live-panel{
+  position:sticky; top:18px;
+  background:var(--panel); border:1px solid var(--hairline);
+  padding:18px 18px 14px; display:flex; flex-direction:column; gap:13px;
+  max-height:calc(100vh - 36px); overflow-y:auto;
+}
+.lv-head{ display:flex; align-items:center; gap:8px; }
+.lv-head .eyebrow{ margin:0; flex:1; }
+.lv-dot{
+  width:7px; height:7px; border-radius:50%; background:var(--muted); flex:none;
+}
+.lv-dot.on{ background:var(--up); box-shadow:0 0 0 3px rgba(210,75,58,.18);
+  animation:lvpulse 2s ease-in-out infinite; }
+@keyframes lvpulse{ 0%,100%{opacity:1} 50%{opacity:.45} }
+.lv-market{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--muted); }
+
+.lv-symbol{ border-bottom:1px solid var(--hairline); padding-bottom:13px; }
+.lv-name{ font-size:16.5px; font-weight:600; display:flex; align-items:center;
+  gap:7px; flex-wrap:wrap; }
+.lv-code{ font-family:'IBM Plex Mono',monospace; font-size:10.5px;
+  color:var(--muted); margin-top:2px; }
+.lv-price{ font-family:'IBM Plex Mono',monospace; font-size:27px; font-weight:600;
+  margin-top:9px; transition:color .25s; }
+.lv-price.flash{ color:var(--gold); }
+.lv-cur{ font-size:13px; color:var(--muted); margin-left:3px; }
+.lv-change{ font-family:'IBM Plex Mono',monospace; font-size:12.5px; margin-top:2px; }
+
+.lv-summary{ display:grid; grid-template-columns:repeat(3,1fr); gap:8px; text-align:center; }
+.lv-summary > div{ background:var(--panel-raised); padding:9px 4px; }
+.lv-summary b{ display:block; font-family:'IBM Plex Mono',monospace; font-size:19px; }
+.lv-summary span{ font-size:10.5px; color:var(--muted); }
+
+.lv-bar{ height:5px; background:rgba(63,127,208,.25); overflow:hidden; }
+.lv-bar-fill{ height:100%; background:var(--up); transition:width .4s ease; }
+.lv-bar-label{ font-family:'IBM Plex Mono',monospace; font-size:10.5px;
+  color:var(--muted); margin-top:-6px; }
+
+.lv-caveat{ font-size:10.5px; line-height:1.7; color:var(--muted);
+  border-left:2px solid var(--hairline); padding-left:9px; }
+
+.lv-list{ display:flex; flex-direction:column; gap:7px; }
+.lv-item{ background:var(--panel-raised); padding:9px 11px;
+  border-left:2px solid var(--hairline); }
+.lv-item.ok{ border-left-color:var(--up); }
+.lv-item.no{ border-left-color:var(--down); }
+.lv-item-top{ display:flex; align-items:center; gap:7px; }
+.lv-hz{ font-size:11.5px; font-weight:600; flex:1; }
+.lv-dir{ font-family:'IBM Plex Mono',monospace; font-size:11px; }
+.lv-item-bot{ display:flex; justify-content:space-between; gap:8px;
+  margin-top:5px; font-family:'IBM Plex Mono',monospace; font-size:10.5px;
+  color:var(--muted); }
+.lv-left{ flex:none; }
+.pill.flat{ background:var(--panel); color:var(--muted); }
+.lv-cur.pre{ margin-left:0; margin-right:2px; }
+
+/* ---------------- 모의투자 트레이딩 데스크 ---------------- */
+
+.desk-search{ margin:22px 0 14px; }
+
+.desk{ display:grid; grid-template-columns:minmax(0,1fr) 330px; gap:20px; align-items:start; }
+@media (max-width: 1080px){ .desk{ grid-template-columns:1fr; } }
+
+.desk-main{ min-width:0; }
+
+.desk-quote{
+  display:flex; justify-content:space-between; align-items:flex-start; gap:16px;
+  background:var(--panel); border:1px solid var(--hairline); padding:16px 18px;
+  margin-bottom:12px;
+}
+.dq-name{ font-size:18px; font-weight:600; display:flex; align-items:center; gap:8px;
+  flex-wrap:wrap; }
+.dq-code{ font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--muted);
+  margin-top:3px; }
+.dq-right{ text-align:right; }
+.dq-price{ font-family:'IBM Plex Mono',monospace; font-size:29px; font-weight:600;
+  line-height:1.1; transition:opacity .2s; }
+.dq-price.flash{ opacity:.45; }
+.dq-change{ font-family:'IBM Plex Mono',monospace; font-size:12.5px; margin-top:3px; }
+.dq-meta{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--muted);
+  margin-top:3px; }
+
+/* --- 주문표 --- */
+.ticket{
+  position:sticky; top:18px;
+  background:var(--panel); border:1px solid var(--hairline); padding:16px;
+  display:flex; flex-direction:column; gap:12px;
+}
+@media (max-width: 1080px){ .ticket{ position:static; } }
+
+.tk-sides{ display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--hairline); }
+.tk-side{
+  background:var(--panel-raised); border:none; padding:11px 0; cursor:pointer;
+  font-family:inherit; font-size:14px; font-weight:600; color:var(--muted);
+  transition:background .15s, color .15s;
+}
+.tk-side.buy.on{ background:var(--up); color:#fff; }
+.tk-side.sell.on{ background:var(--down); color:#fff; }
+.tk-side:not(.on):hover{ color:var(--text); }
+
+.tk-types{ display:flex; gap:6px; }
+.tk-type{
+  flex:1; background:var(--panel-raised); border:1px solid var(--hairline);
+  padding:7px 0; cursor:pointer; font-family:'IBM Plex Mono',monospace;
+  font-size:11.5px; color:var(--muted);
+}
+.tk-type.on{ border-color:var(--gold); color:var(--gold); }
+
+.tk-field label{
+  display:block; font-family:'IBM Plex Mono',monospace; font-size:10.5px;
+  color:var(--muted); margin-bottom:5px;
+}
+.tk-field .input{ width:100%; text-align:right; font-family:'IBM Plex Mono',monospace; }
+
+.tk-stepper{ display:flex; gap:4px; }
+.tk-stepper button{
+  width:34px; flex:none; background:var(--panel-raised); border:1px solid var(--hairline);
+  color:var(--text); cursor:pointer; font-size:15px; line-height:1;
+}
+.tk-stepper button:hover{ border-color:var(--gold); color:var(--gold); }
+.tk-stepper .input{ flex:1; min-width:0; }
+
+.tk-note{ font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted);
+  margin-top:5px; line-height:1.6; }
+.tk-market-note{
+  font-size:11.5px; color:var(--muted); background:var(--panel-raised);
+  padding:9px 11px; line-height:1.6;
+}
+
+.tk-pcts{ display:flex; gap:4px; margin-top:6px; }
+.tk-pcts button{
+  flex:1; background:var(--panel-raised); border:1px solid var(--hairline);
+  color:var(--muted); cursor:pointer; padding:5px 0;
+  font-family:'IBM Plex Mono',monospace; font-size:10.5px;
+}
+.tk-pcts button:hover{ border-color:var(--gold); color:var(--gold); }
+
+.tk-calc{ background:var(--panel-raised); padding:11px 12px; display:flex;
+  flex-direction:column; gap:5px; }
+.tk-calc > div{ display:flex; justify-content:space-between; align-items:baseline;
+  font-family:'IBM Plex Mono',monospace; font-size:11.5px; }
+.tk-calc span{ color:var(--muted); }
+.tk-total{ border-top:1px solid var(--hairline); padding-top:7px; margin-top:2px; }
+.tk-total b{ font-size:16px; }
+.tk-fxnote{ display:block !important; font-size:9.5px; color:var(--muted);
+  border-top:1px dashed var(--hairline); padding-top:6px; }
+
+.tk-warn{ font-size:11px; color:var(--down); background:rgba(63,127,208,.1);
+  padding:8px 10px; line-height:1.6; }
+
+.tk-submit{
+  border:none; padding:13px 0; cursor:pointer; font-family:inherit;
+  font-size:14.5px; font-weight:600; color:#fff; transition:opacity .15s;
+}
+.tk-submit.buy{ background:var(--up); }
+.tk-submit.sell{ background:var(--down); }
+.tk-submit:disabled{ opacity:.35; cursor:not-allowed; }
+.tk-submit:not(:disabled):hover{ opacity:.88; }
+
+.tk-disclaimer{ font-size:10px; color:var(--muted); text-align:center; line-height:1.6; }
+
+/* --- 미체결 주문 --- */
+.order-row{ grid-template-columns:112px 62px 1fr 82px 104px 62px; }
+@media (max-width: 720px){ .order-row{ grid-template-columns:1fr 1fr; gap:6px; } }
+.count-chip{
+  display:inline-block; margin-left:7px; background:var(--gold); color:#1a1a1c;
+  font-family:'IBM Plex Mono',monospace; font-size:10px; padding:1px 7px;
+  border-radius:8px; vertical-align:middle;
+}
+.hold-actions{ display:flex; gap:5px; justify-content:flex-end; }
+.btn-mini.danger{ border-color:var(--down); color:var(--down); }
+.btn-mini:disabled{ opacity:.35; cursor:not-allowed; }

@@ -1,0 +1,9 @@
+yfinance
+pandas
+numpy
+requests
+beautifulsoup4
+feedparser
+fastapi
+uvicorn
+websockets

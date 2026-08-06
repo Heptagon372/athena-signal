@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 추천·추적 — 아테나 시그널</title>
+<link rel="stylesheet" href="/static/at_common.css">
+</head>
+<body>
+<main>
+  <section>
+    <h2>AI 자동 추적
+      <span id="trackBadge" class="pill off"><span class="dot"></span><span>꺼짐</span></span>
+      <span class="sub" id="trackNote"></span></h2>
+    <div class="row">
+      <button id="btnTrack" class="primary">추적 시작</button>
+      <button id="btnRecommend">지금 추천 받기</button>
+      <div style="flex:1"></div>
+      <div class="field" style="margin:0;width:110px"><label>추적 종목 수</label>
+        <input id="cfg_auto_universe_size" type="number" step="1"></div>
+      <div class="field" style="margin:0;width:110px"><label>갱신 주기(분)</label>
+        <input id="cfg_auto_universe_refresh_min" type="number" step="5"></div>
+      <div class="field" style="margin:0;width:130px"><label>편입 최소 점수</label>
+        <input id="cfg_auto_universe_min_score" type="number" step="0.05"></div>
+      <button id="btnSaveAuto" class="sm">저장</button>
+    </div>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <span class="muted" style="font-size:12px">추적 시장</span>
+      <label class="chk" style="margin:0"><input type="checkbox" id="cfg_mkt_kr"> 한국 (KRX)</label>
+      <label class="chk" style="margin:0"><input type="checkbox" id="cfg_mkt_us"> 미국 (NYSE·NASDAQ)</label>
+      <span style="flex:1"></span>
+      <label class="chk" style="margin:0"><input type="checkbox" id="cfg_auto_universe_keep_manual">
+        손으로 넣은 종목은 유지</label>
+    </div>
+    <div class="note">
+      추적은 <b>종목 선정까지만</b> 합니다. 실제 주문은 상단 [시작] 으로 자동매매를 켜야 나갑니다.
+      다중 팩터(모멘텀 · 상대강도(IBD식) · 트렌드템플릿(미너비니) · U/D 거래량비(오닐) ·
+      추세품질 · 위험조정 · 스마트머니 · 경제물리학 · 화제성)를 국면 가중으로 합산하며,
+      표준화는 <b>같은 시장 후보끼리만</b> 합니다 — 한국·미국을 함께 추적해도 점수가 왜곡되지 않습니다.
+    </div>
+  </section>
+
+  <section>
+    <h2>매매 대상 (유니버스) <span class="sub" id="uniSub"></span></h2>
+    <div class="row">
+      <input id="uniInput" placeholder="종목명·코드·티커 (삼성전자 / 069500 / AAPL / FUT_FRONT)" style="flex:1;min-width:220px">
+      <button id="btnAddUni">추가</button>
+    </div>
+    <div class="note" style="margin-top:6px">
+      선물은 <code>FUT_FRONT</code>(코스피200 최근월물) · <code>MINI_FUT</code> · <code>KQ150_FUT</code>
+      로 넣으면 만기마다 자동으로 갈아탑니다.
+    </div>
+    <div class="tagrow" id="uniTags"></div>
+    <div id="uniPreview" class="note" style="margin-top:10px"></div>
+  </section>
+
+  <section>
+    <h2>AI 추천 순위 <span class="sub" id="recSub"></span>
+      <button id="btnApplyPicks" class="primary sm hide" style="margin-left:auto">추천대로 편입</button></h2>
+    <div class="scroll-x" style="max-height:460px"><table id="recTable">
+      <thead><tr><th>#</th><th>종목</th><th class="num">점수</th>
+        <th>추천 근거 (기여도 순)</th><th class="num">살 수 있는 수량</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+    <div id="recEmpty" class="center">[지금 추천 받기]를 누르거나 [추적 시작]을 켜면 여기에 나타납니다.</div>
+    <div class="note" id="recFactors" style="margin-top:8px"></div>
+  </section>
+</main>
+
+<script>
+window.PAGE = {
+  nav: "ai",
+  title: "AI 추천 · 자동 추적",
+  desc: "시장을 훑어 종목을 고르고 매매 대상을 자동 갱신합니다. 주문은 여기서 나가지 않습니다.",
+  _dirty: false,
+  _lastWouldPick: [],
+
+  init() {
+    const A = AT;
+    A.$("btnTrack").onclick = () => this.toggleTracking();
+    A.$("btnRecommend").onclick = () => this.runRecommend();
+    A.$("btnApplyPicks").onclick = () => this.applyPicks();
+    A.$("btnSaveAuto").onclick = () => this.saveAuto();
+    A.$("btnAddUni").onclick = () => this.addUniverse();
+    A.$("uniInput").onkeydown = (e) => { if (e.key === "Enter") this.addUniverse(); };
+    ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score",
+     "auto_universe_keep_manual", "mkt_kr", "mkt_us"].forEach((k) => {
+      const el = A.$("cfg_" + k); if (el) el.onchange = () => { this._dirty = true; };
+    });
+    this.loadSaved();
+    setInterval(() => {
+      if (AT.SNAP?.config?.auto_universe) this.loadSaved();
+    }, 30000);
+  },
+
+  onSnapshot(snap) {
+    const A = AT, cfg = snap.config || {};
+    const track = snap.ai_tracking || {};
+    const tb = A.$("trackBadge");
+    if (track.enabled) {
+      tb.className = "pill on";
+      tb.lastElementChild.textContent = track.refreshing ? "새 종목 찾는 중…"
+        : (track.next_in_sec != null
+           ? `추적 중 · 다음 갱신 ${Math.max(1, Math.round(track.next_in_sec / 60))}분 후`
+           : "추적 중");
+      A.$("btnTrack").textContent = "추적 중지";
+      A.$("btnTrack").className = "danger";
+      A.$("trackNote").textContent = track.last_refresh_at
+        ? `마지막 갱신 ${track.last_refresh_at.slice(11, 16)} · ${track.period_min ?? 30}분 주기`
+        : "곧 첫 추천을 계산합니다 (30초~1분)";
+    } else {
+      tb.className = "pill off";
+      tb.lastElementChild.textContent = "꺼짐";
+      A.$("btnTrack").textContent = "추적 시작";
+      A.$("btnTrack").className = "primary";
+      A.$("trackNote").textContent = "";
+    }
+
+    if (!this._dirty) {
+      ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
+        .forEach((k) => { const el = A.$("cfg_" + k); if (el) el.value = cfg[k] ?? ""; });
+      A.$("cfg_auto_universe_keep_manual").checked = !!cfg.auto_universe_keep_manual;
+      const markets = cfg.auto_universe_markets || ["KR"];
+      A.$("cfg_mkt_kr").checked = markets.includes("KR");
+      A.$("cfg_mkt_us").checked = markets.includes("US");
+    }
+    this.renderUniverse(cfg.universe || [], snap.universe_detail || []);
+  },
+
+  renderUniverse(list, detail) {
+    const A = AT;
+    const info = {};
+    detail.forEach((d) => { info[d.key] = d; });
+    A.$("uniTags").innerHTML = list.map((t) => {
+      const d = info[t] || {};
+      const tip = d.auto
+        ? `AI 추천 ${d.rank}위 · 점수 ${(d.score ?? 0).toFixed(2)}\n${(d.reasons || []).join("\n")}`
+        : "직접 추가한 종목";
+      return `<span class="tag" title="${A.esc(tip)}">${d.auto ? '<b class="gold">AI</b> ' : ""}`
+        + `${A.esc(d.name && d.name !== t ? d.name : t)}`
+        + `${d.auto ? ` <span class="muted">${(d.score ?? 0).toFixed(2)}</span>` : ""}`
+        + `<button data-uni="${t}" title="제거">×</button></span>`;
+    }).join("") || '<span class="note">비어 있습니다. 종목을 추가하거나 추적을 켜세요.</span>';
+    const autoCount = detail.filter((d) => d.auto).length;
+    A.$("uniSub").textContent = list.length
+      ? `${list.length}종목 (AI ${autoCount} · 직접 ${list.length - autoCount})` : "";
+    document.querySelectorAll("[data-uni]").forEach((b) => b.onclick = async () => {
+      const next = (AT.SNAP.config.universe || []).filter((x) => x !== b.dataset.uni);
+      try { await AT.call("/autotrade/config", {method: "POST", body: {config: {universe: next}}});
+            AT.refresh(); } catch (e) { AT.toast(e.message, true); }
+    });
+  },
+
+  renderRecs(list, factors, threshold) {
+    const A = AT;
+    A.$("recEmpty").classList.toggle("hide", list.length > 0);
+    A.$("recTable").querySelector("tbody").innerHTML = list.map((r) => `<tr>
+      <td class="muted">${r.rank}</td>
+      <td>${A.esc(r.name)}${r.picked ? ' <span class="gold" title="AI가 매매 대상에 편입">★편입</span>' : ""}
+        <div class="muted mono" style="font-size:11px">${r.key} · ${r.market}</div></td>
+      <td class="num ${r.score >= (threshold ?? 0.55) ? "up" : "muted"}">${(r.score ?? 0).toFixed(3)}</td>
+      <td class="muted" style="font-size:11.5px">${(r.reasons || []).map(A.esc).join("<br>") || "—"}
+        ${(r.warnings || []).length ? `<div class="up">${r.warnings.map(A.esc).join(" · ")}</div>` : ""}</td>
+      <td class="num">${r.max_quantity == null ? '<span class="muted">—</span>'
+        : (r.tradable ? (r.max_quantity || 0).toLocaleString() + "주"
+                      : '<span class="muted">자금 부족</span>')}</td>
+      <td>${r.tradable && !r.picked ? `<button class="sm" data-adopt="${r.key}">대상 추가</button>` : ""}</td>
+    </tr>`).join("");
+    document.querySelectorAll("[data-adopt]").forEach((b) => b.onclick = () => this.adopt(b.dataset.adopt));
+    if (factors) A.$("recFactors").innerHTML = "팩터: " + factors.map((f) =>
+      `<b title="${A.esc(f.desc)}">${A.esc(f.label)}</b>`).join(" · ");
+  },
+
+  async toggleTracking() {
+    const enable = !AT.SNAP?.config?.auto_universe;
+    try {
+      await AT.call("/autotrade/track", {method: "POST", body: {enabled: enable}});
+      await AT.refresh();
+      AT.toast(enable ? "AI 자동 추적을 시작했습니다 — 곧 첫 추천이 나타납니다."
+                      : "AI 자동 추적을 중지했습니다.");
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  async runRecommend() {
+    const A = AT;
+    A.$("btnRecommend").disabled = true;
+    A.$("recSub").textContent = "시장을 훑고 팩터를 계산하는 중… (30초~1분)";
+    A.$("recEmpty").classList.add("hide");
+    try {
+      const d = await A.call("/autotrade/recommend", {method: "POST"});
+      this.renderRecs(d.recommendations || [], d.factors, d.threshold);
+      A.$("recSub").textContent = d.regime ? `시장 국면: ${d.regime}` : "";
+      this._lastWouldPick = d.would_pick || [];
+      A.$("btnApplyPicks").classList.toggle("hide", !this._lastWouldPick.length);
+      A.toast(this._lastWouldPick.length
+        ? `추천 ${d.recommendations.length}종목 · 편입 후보 ${this._lastWouldPick.join(", ")}`
+        : "기준 점수를 넘는 종목이 없습니다.");
+    } catch (e) { A.$("recSub").textContent = ""; A.toast(e.message, true); }
+    finally { A.$("btnRecommend").disabled = false; }
+  },
+
+  async loadSaved() {
+    try {
+      const d = await AT.call("/autotrade/recommend");
+      const rows = (d.recommendations || []).map((r) => ({
+        key: r.symbol || r.key, name: r.name, market: r.market,
+        rank: r.rank, score: r.score, reasons: r.reasons || [], warnings: [],
+        tradable: true, max_quantity: null, picked: r.picked,
+      }));
+      if (rows.length)
+        this.renderRecs(rows, d.factors, AT.SNAP?.config?.auto_universe_min_score);
+    } catch {}
+  },
+
+  async applyPicks() {
+    if (!this._lastWouldPick.length) return;
+    const merged = [...new Set([...(AT.SNAP.config.universe || []), ...this._lastWouldPick])];
+    try {
+      await AT.call("/autotrade/config", {method: "POST", body: {config: {universe: merged}}});
+      await AT.refresh();
+      AT.toast(`매매 대상에 편입했습니다 — ${this._lastWouldPick.join(", ")}`);
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  async saveAuto() {
+    const A = AT, patch = {};
+    ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
+      .forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
+    patch.auto_universe_keep_manual = A.$("cfg_auto_universe_keep_manual").checked;
+    const markets = [];
+    if (A.$("cfg_mkt_kr").checked) markets.push("KR");
+    if (A.$("cfg_mkt_us").checked) markets.push("US");
+    if (!markets.length) { A.$("cfg_mkt_kr").checked = true; markets.push("KR"); }
+    patch.auto_universe_markets = markets;
+    try {
+      await A.call("/autotrade/config", {method: "POST", body: {config: patch}});
+      this._dirty = false; await A.refresh();
+      A.toast("추적 설정을 저장했습니다.");
+    } catch (e) { A.toast(e.message, true); }
+  },
+
+  async addUniverse() {
+    const A = AT, q = A.$("uniInput").value.trim();
+    if (!q) return;
+    try {
+      const d = await A.call("/autotrade/instrument/" + encodeURIComponent(q));
+      const i = d.instrument;
+      const entry = /^(FUT_FRONT|MINI_FUT|KQ150_FUT)$/i.test(q) ? q.toUpperCase() : i.key;
+      const list = [...(A.SNAP.config.universe || [])];
+      if (!list.includes(entry)) list.push(entry);
+      await A.call("/autotrade/config", {method: "POST", body: {config: {universe: list}}});
+      A.$("uniInput").value = "";
+      A.$("uniPreview").innerHTML = `<b>${A.esc(i.name)}</b> · ${i.asset_label} ·
+        1단위 필요자금 ${A.won(d.unit_cost_krw)}
+        ${i.expiry ? ` · 만기 ${i.expiry} (${d.days_to_expiry}일)` : ""}
+        ${d.quote ? ` · 현재가 ${A.num(d.quote.price)}` : ' · <span class="up">시세 조회 실패</span>'}`;
+      await A.refresh();
+    } catch (e) { A.toast(e.message, true); }
+  },
+
+  async adopt(key) {
+    const list = [...(AT.SNAP.config.universe || [])];
+    if (list.includes(key)) return AT.toast("이미 매매 대상입니다.");
+    list.push(key);
+    try {
+      await AT.call("/autotrade/config", {method: "POST", body: {config: {universe: list}}});
+      await AT.refresh();
+      AT.toast(`${key} 를 매매 대상에 추가했습니다.`);
+    } catch (e) { AT.toast(e.message, true); }
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>

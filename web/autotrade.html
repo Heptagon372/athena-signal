@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>자동매매 — 아테나 시그널</title>
+<link rel="stylesheet" href="/static/at_common.css">
+</head>
+<body>
+<main>
+  <section>
+    <h2>계좌 <span class="sub" id="accSub"></span></h2>
+    <div class="stat" id="accStat"></div>
+  </section>
+
+  <div class="grid side">
+    <section>
+      <h2>보유 포지션 <span class="sub">자동 손절·익절이 걸려 있습니다</span></h2>
+      <div class="scroll-x"><table id="posTable">
+        <thead><tr>
+          <th>종목</th><th>구분</th><th class="num">수량</th><th class="num">진입가</th>
+          <th class="num">현재가</th><th class="num">평가손익</th><th class="num">손절</th>
+          <th class="num">목표</th><th></th>
+        </tr></thead><tbody></tbody>
+      </table></div>
+      <div id="posEmpty" class="center">보유 중인 포지션이 없습니다.</div>
+
+      <div id="openOrders" class="hide" style="margin-top:16px">
+        <h2 style="margin-bottom:8px">체결 대기 중인 주문</h2>
+        <div class="scroll-x"><table id="openTable">
+          <thead><tr><th>접수</th><th>종목</th><th>동작</th><th class="num">주문</th>
+            <th class="num">체결</th><th class="num">주문가</th><th>상태</th><th></th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>실행 로그 <span class="sub">모든 판단·장 상태가 기록됩니다</span></h2>
+      <div class="log" id="logBox"></div>
+    </section>
+  </div>
+
+  <div class="grid two">
+    <section>
+      <h2>거래할 자산군 · 실행 모드</h2>
+      <div id="assetBoxes"></div>
+      <div class="field" style="margin-top:12px">
+        <label>실행 모드 (계좌)</label>
+        <select id="modeSelect"></select>
+      </div>
+      <div class="field">
+        <label>회전 주기 (초)</label>
+        <input id="cfg_interval_sec" type="number" min="15" step="5">
+      </div>
+      <label class="chk"><input type="checkbox" id="cfg_dry_run"> 모의 판단만 (주문 안 냄)</label>
+      <label class="chk"><input type="checkbox" id="cfg_manage_only_universe">
+        매매 대상 종목만 관리 <span class="muted" style="font-size:11px">— 내 다른 보유분 보호</span></label>
+      <label class="chk"><input type="checkbox" id="cfg_regular_session_only"> 정규장에만 매매</label>
+      <label class="chk"><input type="checkbox" id="cfg_us_extended_hours">
+        미국 프리·애프터마켓 허용 <span class="muted" style="font-size:11px">— 미국 종목만, 한국 시간외와 별개</span></label>
+      <div class="field" style="margin-top:10px">
+        <label>미국 주문 결제 재원</label>
+        <select id="usFundingSelect">
+          <option value="fx">외화(달러)만 — 달러가 없으면 주문하지 않음</option>
+          <option value="krw">원화도 시도(통합증거금) — 달러가 0이어도 보내봄</option>
+        </select>
+        <div class="note" style="margin-top:4px">
+          KIS 해외주문 API 에는 통화를 고르는 항목이 <b>없습니다</b>. 앱의 [통합매수] 같은
+          별도 주문이 API 에는 없어서, 여기서 정하는 것은 <b>달러가 없을 때 미리 막을지</b> 여부입니다.
+          통합증거금을 신청했는데도 막힌다면 [원화도 시도]로 바꿔 KIS 판단에 맡기세요.
+        </div>
+      </div>
+      <label class="chk"><input type="checkbox" id="cfg_min_one_unit">
+        최소 1주 허용 <span class="muted" style="font-size:11px">— 소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
+      <label class="chk"><input type="checkbox" id="cfg_allow_short"> 숏 진입 허용 (파생만)</label>
+      <label class="chk"><input type="checkbox" id="cfg_use_news"> 뉴스 감성 반영 (느림)</label>
+    </section>
+
+    <section>
+      <h2>안전장치 현황 <span class="sub">주문이 나가기 전에 강제됩니다</span></h2>
+      <div class="stat" id="limitStat"></div>
+      <div class="note" style="margin-top:10px">
+        하나라도 걸리면 신규 진입이 막히고 청산(손절)만 계속 동작합니다.
+        킬 스위치는 즉시 신규 진입을 전면 차단합니다.
+      </div>
+    </section>
+  </div>
+
+  <section>
+    <h2>전략 · 리스크 설정 <span class="sub">저장하면 다음 회전부터 적용됩니다</span></h2>
+
+    <div class="field" style="margin-bottom:12px">
+      <label>NNFX 규칙 오버레이
+        <span class="sub">기준선·모멘텀·추세·거래량·과열거리 — 다섯 슬롯으로 신호를 한 번 더 봅니다</span></label>
+      <div class="row">
+        <select id="cfg_nnfx_mode" style="width:auto;min-width:210px">
+          <option value="off">사용 안 함</option>
+          <option value="soft">소프트 결합 (권장)</option>
+          <option value="veto">거부권만</option>
+          <option value="hard">원본 NNFX — 권장하지 않음</option>
+        </select>
+        <div class="field" style="margin:0;width:150px">
+          <input id="cfg_nnfx_soft_weight" type="number" step="0.05" min="0" max="1"
+                 title="소프트 결합 가중 (0~1)"></div>
+        <span class="note" id="nnfxNote"></span>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="field"><label>진입 점수 임계값 (0~1)</label><input id="cfg_entry_score" type="number" step="0.05"></div>
+      <div class="field"><label>청산 점수 임계값</label><input id="cfg_exit_score" type="number" step="0.05"></div>
+      <div class="field"><label>분봉 비중 (0~1)</label><input id="cfg_intraday_weight" type="number" step="0.05"></div>
+      <div class="field"><label>1회 위험 예산 (총자산 %)</label><input id="cfg_risk_per_trade_pct" type="number" step="0.1"></div>
+      <div class="field"><label>종목당 최대 비중 (%)</label><input id="cfg_position_pct" type="number" step="1"></div>
+      <div class="field"><label>최대 보유 종목 수</label><input id="cfg_max_positions" type="number" step="1"></div>
+      <div class="field"><label>ATR 손절 배수 (0=고정%)</label><input id="cfg_atr_stop_mult" type="number" step="0.1"></div>
+      <div class="field"><label>고정 손절 (%)</label><input id="cfg_stop_loss_pct" type="number" step="0.5"></div>
+      <div class="field"><label>익절 (%)</label><input id="cfg_take_profit_pct" type="number" step="0.5"></div>
+      <div class="field"><label>트레일링 스톱 (%, 0=끔)</label><input id="cfg_trailing_stop_pct" type="number" step="0.5"></div>
+      <div class="field"><label>최대 보유일</label><input id="cfg_max_hold_days" type="number" step="1"></div>
+      <div class="field"><label>1회 주문 상한 (원)</label><input id="cfg_max_order_krw" type="number" step="100000"></div>
+      <div class="field"><label>1회 주문 하한 (원)</label><input id="cfg_min_order_krw" type="number" step="10000"></div>
+      <div class="field"><label>일일 손실 한도 (%)</label><input id="cfg_daily_loss_limit_pct" type="number" step="0.5"></div>
+      <div class="field"><label>최대 낙폭 한도 (%)</label><input id="cfg_max_drawdown_pct" type="number" step="1"></div>
+      <div class="field"><label>총 노출 한도 (%)</label><input id="cfg_max_gross_exposure_pct" type="number" step="10"></div>
+      <div class="field"><label>시세 허용 지연 (초)</label><input id="cfg_max_quote_age_sec" type="number" step="10"></div>
+      <div class="field"><label>미체결 자동취소 (초)</label><input id="cfg_order_timeout_sec" type="number" step="30"></div>
+      <div class="field"><label>모의계좌 슬리피지 (bp)</label><input id="cfg_paper_slippage_bps" type="number" step="1"></div>
+      <div class="field"><label>파생 만기 최소 잔여일</label><input id="cfg_deriv_min_days_to_expiry" type="number" step="1"></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnSave" class="primary">설정 저장</button>
+      <button id="btnReload">되돌리기</button>
+      <span class="note" id="saveHint"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>연결 상태 <span class="sub">실계좌를 붙이기 전에 여기서 먼저 확인하세요</span></h2>
+    <div id="kisBox" class="note"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnDiagnose">증권사 연결 진단</button>
+      <span class="note">주문은 내지 않고 조회만 실제로 호출해 봅니다.</span>
+    </div>
+    <div id="diagBox" style="margin-top:10px"></div>
+  </section>
+</main>
+
+<script>
+window.PAGE = {
+  nav: "main",
+  title: "자동매매",
+  desc: "계좌 · 포지션 · 설정 · 안전장치. 종목 선정은 [AI 추천·추적] 탭에서 합니다.",
+  lite: false,      // 유일하게 포지션·계좌를 그리는 페이지라 전체 스냅샷을 받습니다
+  _dirty: false,
+  _lastEventId: 0,
+
+  init() {
+    const A = AT;
+    A.$("btnSave").onclick = () => this.saveConfig();
+    A.$("btnReload").onclick = () => { this._dirty = false; this.hint(); A.refresh(); };
+    A.$("btnDiagnose").onclick = () => this.diagnose();
+    [...this.FIELDS, ...this.BOOLS].forEach((k) => {
+      const el = A.$("cfg_" + k);
+      if (el) el.onchange = () => { this._dirty = true; this.hint(); };
+    });
+    A.$("modeSelect").onchange = () => { this._dirty = true; this.hint(); };
+    A.$("usFundingSelect").onchange = () => { this._dirty = true; this.hint(); };
+    A.$("cfg_nnfx_mode").onchange = () => { this._dirty = true; this.hint(); this.nnfxNote(); };
+    A.$("cfg_nnfx_soft_weight").onchange = () => { this._dirty = true; this.hint(); };
+    this.pollEvents();
+    setInterval(() => this.pollEvents(), 7000);
+  },
+
+  FIELDS: ["interval_sec","entry_score","exit_score","intraday_weight","risk_per_trade_pct",
+           "position_pct","max_positions","atr_stop_mult","stop_loss_pct","take_profit_pct",
+           "trailing_stop_pct","max_hold_days","max_order_krw","min_order_krw",
+           "daily_loss_limit_pct","max_drawdown_pct","max_gross_exposure_pct",
+           "max_quote_age_sec","order_timeout_sec","paper_slippage_bps",
+           "deriv_min_days_to_expiry"],
+  BOOLS: ["dry_run","manage_only_universe","regular_session_only","us_extended_hours",
+          "min_one_unit","allow_short","use_news"],
+  // 모드별 근거 — 켜기 전에 무엇을 감수하는지 화면에서 바로 보이게 합니다
+  NNFX_NOTE: {
+    off:  "기존 지표 점수만 씁니다.",
+    soft: "NNFX 점수를 가중치만큼 섞습니다. 신호를 죽이지 않고 밀거나 당깁니다.",
+    veto: "기준선 아래이거나 기준선에서 너무 멀 때만 신규 진입을 막습니다.",
+    hard: "전 슬롯 AND — 합성시장 실측에서 통과율 10%로 굶고 성과가 음수였습니다. 재현용입니다.",
+  },
+  ASSETS: [["STOCK","주식","개별 종목 (코스피·코스닥·미국)"],
+           ["ETF","ETF","매도 거래세 면제 반영"],
+           ["FUTURES","선물","승수·증거금 자동 계산 · KIS 필요"],
+           ["OPTION","옵션","프리미엄 호가 · KIS 필요"]],
+  ACTION: {buy:"매수", sell:"매도", close:"청산", open_long:"롱진입", open_short:"숏진입"},
+  STATUS: {filled:"체결", partial:"부분체결", pending:"대기", rejected:"거부",
+           cancelled:"취소됨", cancel_requested:"취소요청"},
+
+  hint() { AT.$("saveHint").textContent = this._dirty ? "저장하지 않은 변경이 있습니다." : ""; },
+
+  onSnapshot(snap) {
+    const A = AT, cfg = snap.config || {}, acc = snap.account || {}, day = snap.day || {};
+
+    const dayPnl = (day.start_value && acc.total_value) ? acc.total_value - day.start_value : null;
+    const dayPct = (day.start_value && dayPnl != null) ? dayPnl / day.start_value * 100 : null;
+    A.$("accStat").innerHTML = [
+      ["총자산", A.won(acc.total_value), ""],
+      ["총예수금", A.won(acc.cash), ""],
+      ["주문가능 현금", A.won(acc.available_cash), ""],
+      ["매입금액", A.won(acc.purchase_amount), ""],
+      ["평가금액", A.won(acc.equity_value), ""],
+      ["평가손익", acc.unrealized_pnl == null ? "—"
+        : A.won(acc.unrealized_pnl), A.sign(acc.unrealized_pnl)],
+      ["묶인 증거금", A.won(acc.margin_locked), ""],
+      ["오늘 손익", dayPnl == null ? "—" : A.won(dayPnl) + (dayPct != null ? ` (${A.pct(dayPct)})` : ""), A.sign(dayPnl)],
+      ["누적 실현손익", A.won(snap.summary?.realized_pnl), A.sign(snap.summary?.realized_pnl)],
+    ].map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("");
+    A.$("accSub").textContent = `${snap.identity?.label || ""} 기준 · 주문 ${snap.summary?.orders ?? 0}건 · `
+      + `청산 ${snap.summary?.closed_trades ?? 0}건 · 승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`;
+
+    // 포지션
+    const positions = snap.positions || [];
+    const states = snap.position_states || {};
+    A.$("posEmpty").classList.toggle("hide", positions.length > 0);
+    A.$("posTable").classList.toggle("hide", positions.length === 0);
+    A.$("posTable").querySelector("tbody").innerHTML = positions.map((p) => {
+      const s = states[p.key] || {};
+      const off = p.managed === false;
+      // 초단타가 잡은 포지션은 청산 규칙이 다릅니다(틱·초). 같은 표에 섞여
+      // 있으면서 표시가 없으면, 왜 이 종목만 3분 만에 팔렸는지 알 수 없습니다.
+      const scalp = s.strategy === "scalp";
+      return `<tr class="${off ? "pos-unmanaged" : ""}">
+        <td>${A.esc(p.name)}${off ? '<span class="tag-unmanaged">관리 안 함</span>' : ""}
+            ${scalp ? '<span class="tag-unmanaged">페니 초단타</span>' : ""}
+            <div class="muted mono" style="font-size:11px">${p.key}</div></td>
+        <td>${p.asset_label} ${p.side === "short" ? '<span class="down">숏</span>' : ""}</td>
+        <td class="num">${A.num(p.quantity, 4)}</td>
+        <td class="num">${A.num(p.avg_price)}</td>
+        <td class="num">${A.num(p.current_price)}</td>
+        <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}</td>
+        <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "—"}</td>
+        <td class="num muted">${s.target_price ? A.num(s.target_price) : "—"}</td>
+        <td><button class="sm danger" data-close="${p.key}">청산</button></td>
+      </tr>`;
+    }).join("");
+    document.querySelectorAll("[data-close]").forEach((b) =>
+      b.onclick = () => this.closePosition(b.dataset.close));
+
+    // 체결 대기
+    const open = snap.open_orders || [];
+    A.$("openOrders").classList.toggle("hide", open.length === 0);
+    A.$("openTable").querySelector("tbody").innerHTML = open.map((o) => `<tr>
+      <td class="muted mono">${o.created_at.slice(11, 19)}</td>
+      <td>${A.esc(o.name || o.symbol)}</td>
+      <td>${this.ACTION[o.action] || o.action}</td>
+      <td class="num">${A.num(o.quantity, 4)}</td>
+      <td class="num ${o.filled_quantity > 0 ? "up" : "muted"}">${A.num(o.filled_quantity, 4)}</td>
+      <td class="num">${A.num(o.price)}</td>
+      <td>${this.STATUS[o.status] || o.status}</td>
+      <td><button class="sm" data-cancel="${o.id}">취소</button></td>
+    </tr>`).join("");
+    document.querySelectorAll("[data-cancel]").forEach((b) =>
+      b.onclick = () => this.cancelOrder(b.dataset.cancel));
+
+    // 설정 폼 (수정 중이면 덮어쓰지 않음)
+    if (!this._dirty) {
+      this.FIELDS.forEach((k) => { const el = A.$("cfg_" + k); if (el) el.value = cfg[k] ?? ""; });
+      this.BOOLS.forEach((k) => { const el = A.$("cfg_" + k); if (el) el.checked = !!cfg[k]; });
+      A.$("cfg_nnfx_mode").value = cfg.nnfx_mode || "off";
+      A.$("cfg_nnfx_soft_weight").value = cfg.nnfx_soft_weight ?? 0.3;
+      this.nnfxNote();
+      A.$("usFundingSelect").value = cfg.us_order_funding || "fx";
+      A.$("modeSelect").innerHTML = (snap.modes || []).map((m) =>
+        `<option value="${m.mode}" ${m.available ? "" : "disabled"} ${m.mode === cfg.mode ? "selected" : ""}>`
+        + `${m.label}${m.available ? "" : " (사용 불가)"}</option>`).join("");
+      A.$("assetBoxes").innerHTML = this.ASSETS.map(([key, label, desc]) =>
+        `<label class="chk"><input type="checkbox" data-asset="${key}" ${cfg.asset_classes?.[key] ? "checked" : ""}>
+          ${label} <span class="muted" style="font-size:11px">— ${desc}</span></label>`).join("");
+      document.querySelectorAll("[data-asset]").forEach((el) =>
+        el.onchange = () => { this._dirty = true; this.hint(); });
+    }
+
+    // 한도
+    A.$("limitStat").innerHTML = (snap.limits || []).map((l) =>
+      `<div class="box"><div class="k">${A.esc(l.label)}</div>
+       <div class="v" style="font-size:14px">${A.esc(l.value)}</div></div>`).join("");
+
+    // 연결 상태
+    const k = snap.kis || {};
+    A.$("kisBox").innerHTML =
+      `KIS 키 <b>${k.keys_configured ? "설정됨" : "없음"}</b> ·
+       계좌 <b>${k.account_masked || "미설정"}</b> ·
+       서버 <span class="mono">${k.mock ? "모의투자" : "실전"}</span> ·
+       실주문 <b class="${k.live_enabled ? "up" : "muted"}">${k.live_enabled ? "허용" : "잠김"}</b><br>
+       엔진 루프 ${snap.loop?.running ? "가동 중" : "정지"} · 회전 ${snap.loop?.tick_count ?? 0}회`;
+  },
+
+  async saveConfig() {
+    const A = AT;
+    const patch = {mode: A.$("modeSelect").value,
+                   us_order_funding: A.$("usFundingSelect").value,
+                   asset_classes: {}};
+    const before = A.SNAP?.config?.mode;
+    if (patch.mode !== before) {
+      const warn = patch.mode === "live"
+        ? "실제 자금 계좌로 전환합니다.\n지금부터 모든 숫자와 주문이 실계좌 기준입니다. 계속할까요?"
+        : "계좌를 전환합니다. 계좌마다 포지션·손익이 따로 관리됩니다. 계속할까요?";
+      if (!confirm(warn)) return;
+    }
+    this.FIELDS.forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
+    this.BOOLS.forEach((k) => { const el = A.$("cfg_" + k); if (el) patch[k] = el.checked; });
+    patch.nnfx_mode = A.$("cfg_nnfx_mode").value;
+    patch.nnfx_soft_weight = Number(A.$("cfg_nnfx_soft_weight").value) || 0;
+    // 신호 생성 방식을 바꾸는 스위치라, 실측에서 기각된 모드는 한 번 물어봅니다
+    if (patch.nnfx_mode === "hard" && A.SNAP?.config?.nnfx_mode !== "hard"
+        && !confirm("원본 NNFX(전 슬롯 AND)는 주식에서 통과율이 10%까지 떨어져\n"
+                    + "매매가 거의 멈추고 성과가 음수였습니다.\n\n그래도 켜시겠습니까?")) return;
+    document.querySelectorAll("[data-asset]").forEach((el) => patch.asset_classes[el.dataset.asset] = el.checked);
+    try {
+      const res = await A.call("/autotrade/config", {method: "POST", body: {config: patch}});
+      this._dirty = false; this.hint(); await A.refresh();
+      if (res.stopped) A.toast("계좌가 바뀌어 자동매매를 중지했습니다. 확인 후 다시 시작하세요.", true);
+      else A.toast("설정을 저장했습니다.");
+    } catch (e) { A.toast(e.message, true); }
+  },
+
+  nnfxNote() {
+    const mode = AT.$("cfg_nnfx_mode").value;
+    const el = AT.$("nnfxNote");
+    el.textContent = this.NNFX_NOTE[mode] || "";
+    el.className = "note" + (mode === "hard" ? " up" : "");
+    AT.$("cfg_nnfx_soft_weight").disabled = mode !== "soft";
+  },
+
+  async closePosition(key) {
+    if (!confirm(`${key} 포지션을 지금 청산합니다.`)) return;
+    try { await AT.call("/autotrade/close/" + encodeURIComponent(key), {method: "POST"});
+          AT.toast("청산 주문을 냈습니다."); AT.refresh(); }
+    catch (e) { AT.toast(e.message, true); }
+  },
+
+  async cancelOrder(id) {
+    try { await AT.call(`/autotrade/orders/${id}/cancel`, {method: "POST"});
+          AT.toast("주문을 취소했습니다."); AT.refresh(); }
+    catch (e) { AT.toast(e.message, true); }
+  },
+
+  async pollEvents() {
+    try {
+      const d = await AT.call(`/autotrade/events?limit=60${this._lastEventId ? "&after_id=" + this._lastEventId : ""}`);
+      const events = (d.events || []).reverse();
+      if (!events.length) return;
+      this._lastEventId = Math.max(this._lastEventId, ...events.map((e) => e.id));
+      const box = AT.$("logBox");
+      events.forEach((e) => {
+        const div = document.createElement("div");
+        div.className = "line";
+        div.innerHTML = `<span class="t">${e.created_at.slice(11, 19)}</span>
+          <span class="k k-${e.kind}">${e.kind}</span><span>${AT.esc(e.message)}</span>`;
+        box.prepend(div);
+      });
+      while (box.children.length > 300) box.lastChild.remove();
+    } catch {}
+  },
+
+  async diagnose() {
+    const A = AT;
+    A.$("btnDiagnose").disabled = true;
+    A.$("diagBox").innerHTML = '<div class="note">증권사 서버에 실제로 조회해 보는 중…</div>';
+    try {
+      const r = await A.call("/autotrade/broker/check");
+      A.$("diagBox").innerHTML =
+        `<table><tbody>${r.checks.map((c) => `<tr>
+          <td style="width:22px">${c.ok ? '<span class="up">●</span>' : '<span class="muted">○</span>'}</td>
+          <td>${A.esc(c.name)}</td><td class="muted">${A.esc(c.detail)}</td></tr>`).join("")}</tbody></table>
+        <div class="note" style="margin-top:8px">종합
+          <b class="${r.ok ? "up" : "muted"}">${r.ok ? "자동매매를 붙일 수 있습니다" : "위 항목을 먼저 해결하세요"}</b></div>`;
+    } catch (e) { A.$("diagBox").innerHTML = `<div class="note up">${A.esc(e.message)}</div>`; }
+    finally { A.$("btnDiagnose").disabled = false; }
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>

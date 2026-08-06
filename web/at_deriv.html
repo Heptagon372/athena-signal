@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>선물·옵션 — 아테나 시그널</title>
+<link rel="stylesheet" href="/static/at_common.css">
+</head>
+<body>
+<main>
+  <section style="text-align:center;padding:48px 24px">
+    <div id="derivOwl" style="margin-bottom:18px"></div>
+    <h2 style="justify-content:center;font-size:16px">전용 화면은 준비 중입니다</h2>
+    <p class="note" style="max-width:520px;margin:8px auto 0">
+      선물·옵션 전용 대시보드(미결제약정 · 그릭스 · 롤오버 관리)는 나중에 만들 예정입니다.<br>
+      다만 <b>자동매매 자체는 지금도 선물·옵션을 지원합니다</b> — 아래 방법으로 쓰세요.
+    </p>
+  </section>
+
+  <div class="grid two">
+    <section>
+      <h2>지금 쓰는 방법</h2>
+      <ol class="note" style="padding-left:18px;font-size:12.5px;line-height:2">
+        <li><a href="/autotrade">메인</a>의 거래할 자산군에서 <b>선물 / 옵션</b>을 켭니다</li>
+        <li><a href="/autotrade/ai">AI 추천·추적</a>의 매매 대상에 종목을 넣습니다
+          <div class="mono" style="margin:4px 0">FUT_FRONT · MINI_FUT · KQ150_FUT · 201H6320</div></li>
+        <li>별칭(<code>FUT_FRONT</code> 등)을 쓰면 만기마다 최근월물로 자동 교체됩니다</li>
+        <li>메인에서 [시작] — 승수·증거금·만기 청산은 엔진이 자동 계산합니다</li>
+      </ol>
+      <div class="warnbox" style="margin-top:8px">
+        코스피200 선물 1계약 명목금액 ≈ 지수 × 25만원 (지수 350이면 <b>8,750만원</b>).
+        총 노출 한도를 반드시 켜두세요. 시세·주문에는 한국투자증권 KIS 키가 필요합니다.
+      </div>
+    </section>
+
+    <section>
+      <h2>계약 명세 <span class="sub">자동 적용되는 값들</span></h2>
+      <div class="scroll-x"><table>
+        <thead><tr><th>상품</th><th class="num">승수</th><th class="num">호가단위</th><th class="num">증거금률</th></tr></thead>
+        <tbody>
+          <tr><td>코스피200 선물</td><td class="num">250,000원/pt</td><td class="num">0.05</td><td class="num">15%</td></tr>
+          <tr><td>미니 코스피200</td><td class="num">50,000원/pt</td><td class="num">0.02</td><td class="num">15%</td></tr>
+          <tr><td>코스닥150 선물</td><td class="num">10,000원/pt</td><td class="num">0.10</td><td class="num">18%</td></tr>
+          <tr><td>코스피200 옵션</td><td class="num">250,000원/pt</td><td class="num">0.01/0.05</td><td class="num">매수=프리미엄</td></tr>
+        </tbody></table></div>
+      <div class="note" style="margin-top:8px">
+        만기 = 결제월 두 번째 목요일. 만기 <b>2일 전</b>부터 신규 진입이 막히고
+        보유분은 강제 청산됩니다. 명세가 바뀌면 <code>api_keys.json</code> 의
+        <code>DERIV_SPECS</code> 로 덮어쓸 수 있습니다.
+      </div>
+      <div class="note" id="frontMonth" style="margin-top:10px"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+window.PAGE = {
+  nav: "deriv",
+  title: "선물 · 옵션",
+  desc: "전용 대시보드는 준비 중 — 자동매매 엔진은 이미 파생을 지원합니다.",
+  init() {
+    AT.$("derivOwl").innerHTML = AT.owlSVG(96, true);
+    this.loadFront();
+  },
+  onSnapshot() {},
+  async loadFront() {
+    try {
+      const d = await AT.call("/autotrade/instrument/FUT_FRONT");
+      const i = d.instrument;
+      AT.$("frontMonth").innerHTML =
+        `현재 최근월물: <b>${AT.esc(i.name)}</b> (${i.key}) · 만기 ${i.expiry} (${d.days_to_expiry}일 남음)`
+        + (d.quote ? ` · 현재가 ${AT.num(d.quote.price)}pt` : ' · <span class="up">시세 조회에는 KIS 키 필요</span>');
+    } catch { AT.$("frontMonth").textContent = "최근월물 조회 실패 (KIS 키 확인)"; }
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>
