@@ -281,49 +281,67 @@ def get_investor_flow(code: str) -> dict | None:
 
 
 def get_daily_chart(code: str, days: int = 120) -> pd.DataFrame:
-    """기간별 시세 (tr_id: FHKST03010100). 최대 약 100건씩 조회됩니다."""
+    """기간별 시세 (tr_id: FHKST03010100).
+
+    이 TR 은 **호출당 최대 약 100건**만 돌려줍니다. 예전에는 한 번만 불러서,
+    260봉을 요청해도 조용히 100봉이 나왔습니다 — ML 학습(표본 145봉 필요)이
+    "표본 부족"으로 꺼지는 원인이었습니다. 그래서 받은 것 중 가장 오래된 날짜
+    앞으로 창을 옮겨 가며 필요한 만큼 이어 붙입니다 (역방향 페이지네이션).
+    """
     headers = _headers("FHKST03010100")
     if not headers:
         return pd.DataFrame()
 
+    parsed: list[dict] = []
     end = datetime.now()
-    start = end - timedelta(days=int(days * 1.6) + 20)
+    # 페이지당 ~100 거래일 ≈ 달력 150일. 여유를 두고 필요한 페이지 수를 잡되,
+    # API 이상으로 무한히 과거로 가지 않게 상한을 둡니다.
+    max_pages = min(6, days // 90 + 2)
 
-    throttle()
-    data = http_client.get_json(
-        _base_url() + "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-        headers=headers,
-        params={
-            "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_INPUT_ISCD": code,
-            "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
-            "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
-            "FID_PERIOD_DIV_CODE": "D",   # 일봉
-            "FID_ORG_ADJ_PRC": "0",       # 수정주가 반영
-        },
-        timeout=15,
-    )
-    rows = (data or {}).get("output2") or []
-    parsed = []
-    for r in rows:
-        date = str(r.get("stck_bsop_date") or "")
-        close = _num(r.get("stck_clpr"))
-        if len(date) != 8 or close is None:
-            continue
-        parsed.append({
-            "date": datetime.strptime(date, "%Y%m%d"),
-            "open": _num(r.get("stck_oprc")) or close,
-            "high": _num(r.get("stck_hgpr")) or close,
-            "low": _num(r.get("stck_lwpr")) or close,
-            "close": close,
-            "volume": _num(r.get("acml_vol")) or 0,
-        })
+    for _ in range(max_pages):
+        start = end - timedelta(days=150)
+        throttle()
+        data = http_client.get_json(
+            _base_url() + "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            headers=headers,
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": "D",   # 일봉
+                "FID_ORG_ADJ_PRC": "0",       # 수정주가 반영
+            },
+            timeout=15,
+        )
+        rows = (data or {}).get("output2") or []
+        page = []
+        for r in rows:
+            date = str(r.get("stck_bsop_date") or "")
+            close = _num(r.get("stck_clpr"))
+            if len(date) != 8 or close is None:
+                continue
+            page.append({
+                "date": datetime.strptime(date, "%Y%m%d"),
+                "open": _num(r.get("stck_oprc")) or close,
+                "high": _num(r.get("stck_hgpr")) or close,
+                "low": _num(r.get("stck_lwpr")) or close,
+                "close": close,
+                "volume": _num(r.get("acml_vol")) or 0,
+            })
+        if not page:
+            break                     # 더 과거가 없거나(상장 초) 조회 실패
+        parsed.extend(page)
+        if len(parsed) >= days:
+            break
+        end = min(p["date"] for p in page) - timedelta(days=1)
 
     if not parsed:
         return pd.DataFrame()
 
     df = pd.DataFrame(parsed).set_index("date").sort_index()
-    return df[~df.index.duplicated(keep="last")]
+    df = df[~df.index.duplicated(keep="last")]
+    return df.tail(days) if len(df) > days else df
 
 
 def self_check():

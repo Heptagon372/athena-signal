@@ -63,6 +63,15 @@ DEFAULT_CONFIG = {
     "algo_vol_factor_max": 2.5,         # 변동성 배수 상한
     "algo_cost_edge_multiple": 3.0,     # 목표 수익 ≥ 왕복비용 × 이 배수 (gate)
 
+    # ML 오버레이 (engine/mlsignal.py — XGBoost·PatchTST 이식).
+    # observe(기본)는 GBDT·패치 어텐션 점수를 계산해 신호에 첨부만 하고,
+    # soft 는 시간순 검증을 통과한 점수만 가중 결합합니다.
+    "ml_mode": "observe",               # off | observe | soft
+    "ml_weight": 0.25,                  # soft 결합 가중 (×확신도)
+    "ml_horizon_bars": 5,               # 예측 시야 (봉)
+    "ml_min_val_accuracy": 0.55,        # GBDT 검증 적중률 하한
+    "ml_min_confidence": 0.25,          # 패치 어텐션 확신도 하한
+
     # 보호장치 (engine/protections.py — freqtrade protections 이식).
     # 최근 매매 이력이 나쁠 때 신규 진입을 잠급니다. 청산은 막지 않습니다.
     "protect_enabled": False,

@@ -26,7 +26,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from engine import ensemble, feed, indicators, nnfx
+from engine import ensemble, feed, indicators, mlsignal, nnfx
 from engine.instruments import FUTURES, OPTION, Instrument
 
 # 지표 계산에 필요한 최소 봉 개수 — 이보다 적으면 신호를 만들지 않습니다
@@ -57,6 +57,7 @@ class Signal:
     quote_age: float = 0.0
     nnfx: dict | None = None           # NNFX 오버레이 (nnfx_mode 가 off 가 아닐 때만)
     ensemble: dict | None = None       # 앙상블 진단 (algo_mode 가 off 가 아닐 때만)
+    ml: dict | None = None             # ML 오버레이 (ml_mode 가 off 가 아닐 때만)
     vol_factor: float = 1.0            # 변동성 배수 — 손절·익절 폭 스케일에 사용
     reasons: list = field(default_factory=list)
     error: str = ""
@@ -74,7 +75,7 @@ class Signal:
                            if self.news_score is not None else None),
             "regime": self.regime, "bars_used": self.bars_used,
             "quote_age": self.quote_age, "nnfx": self.nnfx,
-            "ensemble": self.ensemble,
+            "ensemble": self.ensemble, "ml": self.ml,
             "vol_factor": round(self.vol_factor, 3),
             "reasons": self.reasons[:6], "error": self.error,
         }
@@ -136,7 +137,10 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
     sig.quote_age = float(quote.get("age_sec") or 0)
 
     if bars_daily is None and allow_fetch:
-        bars_daily = feed.bars(inst, "day", count=180)
+        # 260개를 요청하는 이유: ML(gbdt)은 워밍업 60봉 + 학습 표본 80봉 + 검증이
+        # 필요하고, 앙상블 난기류도 250봉 창을 씁니다. 제공처가 요청보다 적게
+        # 주는 일이 있어서(소스 폴백에 따라 다름) 여유 있게 잡습니다.
+        bars_daily = feed.bars(inst, "day", count=260)
     if bars_daily is None or len(bars_daily) < MIN_DAILY_BARS:
         sig.error = f"일봉이 부족합니다 ({0 if bars_daily is None else len(bars_daily)}개)"
         return sig
@@ -190,6 +194,18 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         sig.nnfx = nnfx_state.to_dict()
         if nnfx_mode == nnfx.SOFT:
             blended, note = nnfx.apply_to_score(blended, nnfx_state, cfg)
+            if note:
+                nnfx_notes.append(note)
+
+    # ML 오버레이 (engine/mlsignal.py — XGBoost·PatchTST 이식).
+    # observe 는 계산·첨부만, soft 는 검증을 통과한 점수만 가중 결합합니다.
+    ml_mode = mlsignal.mode_of(cfg)
+    if ml_mode != mlsignal.OFF:
+        ml_state = mlsignal.compute(inst.key, bars_daily, cfg)
+        if ml_state.ok or ml_state.error:
+            sig.ml = ml_state.to_dict()
+        if ml_mode == mlsignal.SOFT:
+            blended, note = mlsignal.apply_to_score(blended, ml_state, cfg)
             if note:
                 nnfx_notes.append(note)
 

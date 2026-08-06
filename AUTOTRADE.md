@@ -562,6 +562,38 @@ freqtrade / FinRL / hummingbot 세 오픈소스에서 검증된 장치를 아테
 
 ---
 
+## 8-d. ML 오버레이 (XGBoost · PatchTST 이식) — `ml_mode`
+
+서로 다른 방식으로 예측하는 두 모델을 신호 위에 겹칩니다. 라이브러리를 통째로
+들여오지 않고 핵심 알고리즘을 numpy 로 이식했습니다 — exe 배포 크기와,
+"우리가 검증할 수 있는 코드만 돌린다"는 원칙 때문입니다.
+
+| 모델 | 출처 | 보는 것 |
+|---|---|---|
+| GBDT (`engine/gbdt.py`) | dmlc/xgboost | 피처 조합의 상호작용 — 잎 가중치 `−G/(H+λ)`, 분할 이득 `½[G_L²/(H_L+λ)+G_R²/(H_R+λ)−G²/(H+λ)]−γ`, 2차(Newton) 부스팅, 히스토그램 분할, 조기 종료까지 원본 공식 그대로 (Chen & Guestrin 2016) |
+| 패치 어텐션 (`engine/patchtst.py`) | PatchTST/PatchTST (ICLR 2023) | 시계열 모양의 반복 — RevIN 인스턴스 정규화 + 패칭(unfold) + 스케일드 닷프로덕트 어텐션. 학습되는 투영만 커널 회귀(Nadaraya-Watson)로 대체 — torch 없이 같은 표현을 씁니다 |
+
+**미래 정보 차단이 구조에 박혀 있습니다.**
+- GBDT: 학습→검증→예측이 전부 시간순. 검증 구간은 학습보다 미래, 예측 행은 라벨이 없는 마지막 행
+- 패치: 비교 대상(키)은 "그 뒤 h봉 수익률"까지 이미 실현된 과거 창만
+
+**품질 게이트 — 예측기는 자격을 증명해야 점수에 들어갑니다.**
+- GBDT: 시간순 검증 적중률 ≥ 55% + 다수 클래스보다 나아야(edge>0) 함
+- 패치: 실질 이웃 수 × 방향 합의로 계산한 확신도 ≥ 0.25
+- 둘 다 탈락하면 그 회전에서 ML 은 아무 힘도 갖지 않습니다 (기록만 남음)
+
+| 모드 | 동작 |
+|---|---|
+| `off` | 계산하지 않음 |
+| `observe` | **기본값.** 계산해 신호에 첨부만 — 매매 판단 불변 |
+| `soft` | 검증 통과 점수를 가중 25%×확신도로 기존 점수에 결합 |
+
+학습 비용: 종목당 첫 계산 ~80ms, 봉이 갱신될 때만 재학습(5분 캐시와 연동).
+랜덤워크 데이터에서 "배웠다"고 주장하지 않는 것까지 테스트로 고정돼 있습니다
+(`tests/test_ml.py`).
+
+---
+
 ## 9. 선물 · 옵션
 
 ### 종목 지정 방법
@@ -678,6 +710,11 @@ p-value = (가짜가 실제 이상인 횟수 + 1) / (시행 + 1) 이므로, **20
 | `algo_turbulence_pct` | 95 | 이 백분위를 넘으면 난기류로 판정 |
 | `algo_vol_factor_min/max` | 0.6 / 2.5 | 변동성 배수의 하한·상한 (손절·익절 폭 스케일) |
 | `algo_cost_edge_multiple` | 3.0 | 목표 수익 ≥ 왕복비용 × 이 배수 (gate 모드) |
+| `ml_mode` | `observe` | ML 오버레이(8-d장) — `off`/`observe`/`soft` |
+| `ml_weight` | 0.25 | soft 결합 가중 (×확신도) |
+| `ml_horizon_bars` | 5 | 예측 시야 (봉) |
+| `ml_min_val_accuracy` | 0.55 | GBDT 검증 적중률 하한 — 미달이면 미반영 |
+| `ml_min_confidence` | 0.25 | 패치 어텐션 확신도 하한 |
 | `protect_enabled` | 꺼짐 | 보호장치(8-c장) — 매매 이력 기반 진입 잠금 |
 | `protect_cooldown_min` | 30 | 청산 후 같은 종목 재진입 금지(분, 0=끔) |
 | `protect_stoploss_count` | 3 | `protect_stoploss_lookback_min`(240분) 안 손절 한도 → `protect_stoploss_stop_min`(60분) 잠금 |
@@ -780,6 +817,9 @@ engine/feed.py          시세 통합 (주식→토스/네이버/Yahoo, 파생�
 engine/preprocess.py    봉 전처리 — 중복·정합성·액면분할·오틱 (freqtrade/FinRL 이식)
 engine/strategy.py      신호 생성 · 포지션 사이징 · 청산 판단
 engine/ensemble.py      시평선 합치·난기류·변동성 배리어·비용 게이트 (8-c장)
+engine/gbdt.py          XGBoost 이식 — 히스토그램 GBDT 방향 예측 (8-d장)
+engine/patchtst.py      PatchTST 이식 — RevIN·패치 어텐션 예측 (8-d장)
+engine/mlsignal.py      두 ML 예측을 검증 성적으로 가중 결합 + 품질 게이트
 engine/protections.py   매매 이력 기반 진입 잠금 — freqtrade protections 이식
 engine/risk.py          사전 리스크 게이트 (fail-closed)
 engine/broker.py        브로커 포트 + PaperBroker / KISBroker + 멱등 처리
@@ -799,6 +839,7 @@ web/autotrade.html      콘솔 화면 (Next.js 없이 8000번 단독으로 열�
 python tests/test_autotrade.py --offline   # 네트워크 없이 결정 로직만 (약 20초)
 python tests/test_autotrade.py             # 서버가 떠 있으면 API 까지
 python tests/test_algo.py                  # 전처리·앙상블·보호장치 (네트워크 불필요)
+python tests/test_ml.py                    # GBDT·패치 어텐션·품질 게이트 (네트워크 불필요)
 ```
 
 거부 경로(킬 스위치, 손실 한도, 오래된 시세, 자산군 차단, 물타기, 현물 숏,

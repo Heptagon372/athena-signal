@@ -69,21 +69,40 @@ class KoreanPriceProvider(PriceProvider):
     """
 
     def get_daily_history(self, symbol: ResolvedSymbol, days: int = 120) -> pd.DataFrame:
-        # 공식 API 우선 (토스 -> KIS), 없으면 공개 경로
+        # 공식 API 우선 (토스 -> KIS), 없으면 공개 경로.
+        #
+        # "요청보다 뚜렷이 적게 준" 소스는 그대로 쓰지 않고 다음 소스와 비교합니다.
+        # KIS 일봉 TR 이 호출당 100건으로 잘리던 시절, 260봉 요청이 조용히 100봉이
+        # 되어 ML·난기류처럼 긴 이력이 필요한 계산이 표본 부족으로 꺼졌습니다.
+        # 짧은 데이터는 오류를 내지 않고 정확도만 떨어뜨려서, 여기서 막는 게 맞습니다.
+        # (신규 상장처럼 이력 자체가 짧은 종목은 모든 소스가 짧으므로 그중 긴 것을 씁니다)
+        enough = max(30, int(days * 0.8))
+        best = pd.DataFrame()
+
+        def better(df):
+            nonlocal best
+            if len(df) > len(best):
+                best = df
+
         if toss_api.is_configured():
             df = toss_api.get_candles(symbol.key, "1d", count=days)
-            if not df.empty:
+            if len(df) >= enough:
                 return df
+            better(df)
         if kis_client.is_configured() and kis_client.use_for_quotes():
             df = kis_client.get_daily_chart(symbol.key, days=days)
-            if not df.empty:
+            if len(df) >= enough:
                 return df
+            better(df)
 
         df = kr_market.naver_daily_chart(symbol.key, days=days)
-        if not df.empty:
+        if len(df) >= enough:
             return df
-        # 네이버가 막히면 Yahoo(.KS/.KQ)로 폴백
-        return _yahoo_daily(symbol.yahoo_symbol, days)
+        better(df)
+        # 네이버가 막히면 Yahoo(.KS/.KQ)로 최후 폴백
+        if best.empty:
+            return _yahoo_daily(symbol.yahoo_symbol, days)
+        return best
 
     def get_history(self, symbol: ResolvedSymbol, timeframe: str = "day",
                     count: int = 120) -> pd.DataFrame:

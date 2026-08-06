@@ -51,7 +51,8 @@ from data_sources import (community_crawler, credentials, fx, kis_client, kis_re
 from data_sources import price_provider
 from data_sources.price_provider import get_provider
 from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
-                    instruments, protections, recommender, risk, scalping, scoring)
+                    instruments, mlsignal, protections, recommender, risk,
+                    scalping, scoring)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
 from storage import db, derivatives, paper, users
@@ -1530,6 +1531,7 @@ def _autotrade_snapshot(user_id: int, include_positions: bool = True) -> dict:
         # 잠금 조회는 equity=0 으로 부릅니다 — 낙폭·부진 판정(자산 필요)은
         # 엔진 회전이 실제 계좌값으로 하고, 여기는 쿨다운·손절 잠금만 보입니다.
         "algo_modes": ensemble.describe(),
+        "ml_modes": mlsignal.describe(),
         "protections": protections.describe(cfg),
         "protection_locks": protections.evaluate(user_id, mode, cfg).to_dict(),
         "loop": autotrade.loop.status(),
