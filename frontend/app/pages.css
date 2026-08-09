@@ -36,6 +36,31 @@
 .auth-gate h2 { font-size: 20px; margin: 12px 0 8px; }
 .auth-gate p { color: var(--muted); font-size: 13px; line-height: 1.7; margin: 0 0 18px; }
 
+/* ---------- 구글 로그인 ----------
+   구글 브랜드 가이드는 흰 배경 + 회색 테두리를 요구하므로, 다크 테마에서도
+   버튼만은 흰색을 유지합니다. 그래서 글자색을 var(--text) 로 두면 안 됩니다. */
+.btn-google {
+  width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 12px; border-radius: var(--radius); cursor: pointer;
+  background: #fff; color: #1f1f1f; border: 1px solid #dadce0;
+  font-family: inherit; font-size: 14px; font-weight: 500;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+.btn-google:hover:not(:disabled) { background: #f7f8f8; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16); }
+.btn-google:disabled { opacity: 0.6; cursor: default; }
+.btn-google svg { flex: none; }
+
+/* "또는 아이디로" — 양옆으로 선이 뻗는 구분선 */
+.auth-or {
+  display: flex; align-items: center; gap: 12px;
+  margin: 20px 0 18px; color: var(--muted);
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.auth-or::before, .auth-or::after {
+  content: ""; flex: 1; height: 1px; background: var(--hairline);
+}
+
 /* ---------- 헤더 위젯 ---------- */
 .countdown {
   display: flex; align-items: center; gap: 8px;
@@ -374,6 +399,26 @@
   border-radius: 20px; padding: 2px 8px; white-space: nowrap;
 }
 .src-chip b { color: var(--gold); }
+
+/* ---------- 세이브(SAVE) 글로벌 피드 ---------- */
+.terminal-chip {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; padding: 1px 6px;
+  border-radius: 3px; margin-right: 5px; color: var(--gold);
+  border: 1px solid var(--gold); background: rgba(201, 162, 39, 0.10); white-space: nowrap;
+}
+.save-tabs { display: flex; gap: 6px; margin-bottom: 9px; flex-wrap: wrap; }
+.save-tab {
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px; padding: 3px 9px;
+  border-radius: 12px; border: 1px solid var(--hairline); background: transparent;
+  color: var(--muted); cursor: pointer;
+}
+.save-tab:hover { border-color: var(--gold); color: var(--gold); }
+.save-tab.active { border-color: var(--gold); color: var(--gold); background: rgba(201, 162, 39, 0.10); }
+.label-chip {
+  font-family: "IBM Plex Mono", monospace; font-size: 9.5px; padding: 0 5px;
+  border-radius: 3px; margin-left: 4px; color: var(--muted);
+  border: 1px solid var(--hairline); white-space: nowrap;
+}
 
 /* ---------- 없는 종목 ---------- */
 .notfound-card { border-left: 3px solid var(--down); max-width: 720px; }

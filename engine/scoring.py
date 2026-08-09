@@ -256,6 +256,8 @@ def build_rationale(technical: TechnicalAnalysis, news_items: list,
             "source_name": f"{n.source} · 감성 {n.sentiment_score:+.2f} ({keywords})",
             "influence": round(per_article * n.sentiment_score, 4),
             "url": n.url,
+            # 세이브(SAVE) 발 기사는 근거 줄에서도 출처를 한눈에 보이게 표시
+            "badge": "블룸버그 정보" if "SAVE" in n.source else None,
         })
 
     # --- 커뮤니티: 다수 의견 쪽 대표 게시글 ---

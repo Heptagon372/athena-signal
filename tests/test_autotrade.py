@@ -906,6 +906,57 @@ def test_reconcile():
     check("잔고", "필드 의미가 달라 음수가 나오면 0 (자산 부풀리기 금지)",
           KT._securities_value({"tot_evlu_amt": "5000", "dnca_tot_amt": "10000"}) == 0)
 
+    # 계좌 요약은 우리가 다시 계산하지 않고 증권사 값을 받아 적습니다.
+    # 아래 응답은 실계좌 실측값입니다 (2026-08-07, 위탁계좌 1000****-01).
+    # 증권사 앱 화면: 총자산 139,518 · 예수금 132,226 · 출금가능 3,325.
+    saved_get, saved_account = KT._get, KT.account
+    saved_is_mock = KT.kis_client.is_mock
+    saved_cache_snap = dict(KT._balance_cache)
+    try:
+        KT._balance_cache.clear()
+        KT.account = lambda kind="stock": ("10001807", "01")
+        KT.kis_client.is_mock = lambda: False
+        replies = {
+            KT.ACCOUNT_ASSETS_PATH: {"ok": True, "output2": {
+                "tot_asst_amt": "139518", "tot_dncl_amt": "132226",
+                "pchs_amt_smtl": "7605", "evlu_amt_smtl": "7292",
+                "evlu_pfls_amt_smtl": "-313", "nass_tot_amt": "7292",
+                "ovrs_stck_evlu_amt1": "7292.000000"}},
+            KT.OVERSEAS_PRESENT_PATH: {"ok": True, "raw": {
+                "output1": [{"bass_exrt": "1418.80000000"}],
+                "output3": {"tot_asst_amt": "138963", "tot_dncl_amt": "132226",
+                            "wdrw_psbl_tot_amt": "3325", "pchs_amt_smtl": "129379",
+                            "evlu_amt_smtl": "129194", "evlu_pfls_amt_smtl": "-185",
+                            "ustl_buy_amt_smtl": "129692",
+                            "ustl_sll_amt_smtl": "7235"}}},
+            KT.BUYABLE_PATH: {"ok": True, "output": {"ord_psbl_cash": "3325",
+                                                     "max_buy_amt": "9361"}},
+        }
+        KT._get = lambda op, path, params, timeout=15: replies[path]
+        snap = KT.account_snapshot()
+        check("잔고", "총자산은 증권사 '자산현황' 값 그대로",
+              snap["ok"] and snap["total_asset"] == 139_518, f"{snap['total_asset']:,.0f}원")
+        check("잔고", "주문가능현금은 예수금이 아님 (미결제 매수대금 제외)",
+              snap["available_cash"] == 3_325 and snap["deposit"] == 132_226,
+              f"예수금 {snap['deposit']:,.0f} / 주문가능 {snap['available_cash']:,.0f}")
+        check("잔고", "평가금액은 체결기준 — 결제 전 보유분도 셈",
+              snap["eval_amount"] == 129_194 and snap["settled_eval_amount"] == 7_292,
+              f"체결 {snap['eval_amount']:,.0f} / 결제 {snap['settled_eval_amount']:,.0f}")
+        check("잔고", "환율은 증권사 기준환율을 씀",
+              snap["fx_rate"] == 1418.8, f"{snap['fx_rate']}")
+
+        # 한 조각이라도 못 읽으면 반쪽 요약을 정상인 척 돌려주지 않습니다
+        KT._balance_cache.clear()
+        replies[KT.BUYABLE_PATH] = {"ok": False, "error": "조회 실패"}
+        broken = KT.account_snapshot()
+        check("잔고", "주문가능현금을 못 읽으면 요약 전체가 실패",
+              not broken["ok"] and broken["errors"], str(broken["errors"]))
+    finally:
+        KT._get, KT.account = saved_get, saved_account
+        KT.kis_client.is_mock = saved_is_mock
+        KT._balance_cache.clear()
+        KT._balance_cache.update(saved_cache_snap)
+
     # KIS 는 거래소 코드를 넣어도 보유분 전체를 돌려줍니다. 세 거래소를 합치면
     # 같은 종목이 여러 번 잡혀 포지션이 2~3개로 보이고, 평가손익도 그만큼 부풉니다.
     saved_ob = KT.overseas_balance
@@ -928,8 +979,12 @@ def test_reconcile():
     # 예수금 + 포지션 평가액을 더하면 매수대금이 두 번 잡혀 총자산이 부풉니다.
     import engine.broker as BK
     saved = (BK.kis_trading.stock_balance, BK.kis_trading.deriv_balance,
-             BK.kis_trading.overseas_balance_all)
+             BK.kis_trading.overseas_balance_all, BK.kis_trading.account_snapshot,
+             BK.kis_trading.overseas_present)
     try:
+        # 증권사 요약을 못 받는 상황 — 이때만 아래 재구성 식이 쓰입니다
+        BK.kis_trading.account_snapshot = lambda: {"ok": False, "errors": []}
+        BK.kis_trading.overseas_present = lambda: {"ok": False}
         BK.kis_trading.stock_balance = lambda: {
             "ok": True, "positions": [], "cash": 10_000.0,
             "available_cash": 10_000.0, "eval_amount": 0.0}
@@ -955,9 +1010,35 @@ def test_reconcile():
               f"{total:,.0f} = {acc['cash']:,.0f} + {acc['unrealized_pnl']:,.0f}")
         check("잔고", "포지션이 있으면 평가금액이 0이 아님",
               acc["equity_value"] > 0, f"{acc['equity_value']:,.0f}원")
+        check("잔고", "증권사 요약을 못 받으면 출처가 '재구성'으로 표시",
+              acc["account_source"] == "재구성", acc["account_source"])
+
+        # 증권사가 준 요약이 있으면 재구성 값을 **버리고** 그쪽을 씁니다.
+        # 실계좌 실측값(2026-08-07)을 그대로 넣어, 예수금을 주문가능액으로
+        # 쓰는 옛 동작이 되살아나면 바로 잡히게 합니다.
+        BK.kis_trading.account_snapshot = lambda: {
+            "ok": True, "total_asset": 139_518.0, "settled_asset": 138_963.0,
+            "deposit": 132_226.0, "available_cash": 3_325.0, "withdrawable": 3_325.0,
+            "purchase_amount": 129_379.0, "eval_amount": 129_194.0,
+            "unrealized_pnl": -185.0, "unsettled_buy": 129_692.0,
+            "unsettled_sell": 7_235.0, "fx_rate": 1_418.8,
+            "settled_eval_amount": 7_292.0, "sources": ["자산현황"], "errors": []}
+        live = BK.KISBroker(user, BK.LIVE, {}).account()
+        check("잔고", "총자산은 증권사가 계산한 값을 그대로",
+              live["total_value"] == 139_518.0, f"{live['total_value']:,.0f}원")
+        check("잔고", "주문가능 현금은 예수금이 아니라 주문가능현금",
+              live["available_cash"] == 3_325.0 and live["cash"] == 132_226.0,
+              f"예수금 {live['cash']:,.0f} / 주문가능 {live['available_cash']:,.0f}")
+        check("잔고", "예수금에 묶인 미결제 매수대금이 드러남",
+              live["reserved_cash"] == 128_901.0 and live["unsettled_buy"] == 129_692.0,
+              f"묶임 {live['reserved_cash']:,.0f} / 미결제매수 {live['unsettled_buy']:,.0f}")
+        check("잔고", "평가금액은 체결기준 (결제 안 된 보유분도 노출로 계산)",
+              live["equity_value"] == 129_194.0 and live["notional_exposure"] == 129_194.0,
+              f"{live['equity_value']:,.0f}원")
     finally:
         (BK.kis_trading.stock_balance, BK.kis_trading.deriv_balance,
-         BK.kis_trading.overseas_balance_all) = saved
+         BK.kis_trading.overseas_balance_all, BK.kis_trading.account_snapshot,
+         BK.kis_trading.overseas_present) = saved
 
     # 미국 매수 사전 자금 확인 — 못 살 주문을 실제로 내보고 거부당하지 않게.
     import engine.broker as B
@@ -1889,23 +1970,58 @@ def test_recommender_factors():
 
     rng = np.random.default_rng(7)
 
-    # Hill 꼬리지수 — 두꺼운 꼬리(파레토)가 정규분포보다 낮아야 합니다
-    normal = pd.Series(rng.normal(0, 0.02, 500))
-    heavy = pd.Series(rng.pareto(1.6, 500) * 0.01 * rng.choice([-1, 1], 500))
-    a_normal, a_heavy = R._hill_alpha(normal), R._hill_alpha(heavy)
+    # Hill 꼬리지수 — 두꺼운 꼬리(파레토)가 정규분포보다 낮아야 합니다.
+    # 이제 (alpha, se) 튜플을 돌려주고 **좌측 꼬리만** 잽니다.
+    normal = pd.Series(rng.normal(0, 0.02, 800))
+    heavy = pd.Series(rng.pareto(1.6, 800) * 0.01 * rng.choice([-1, 1], 800))
+    (a_normal, se_n), (a_heavy, se_h) = R._hill_alpha(normal), R._hill_alpha(heavy)
     check("물리학", "Hill 꼬리지수 — 급락 상습 분포를 낮게 판정",
           a_normal > a_heavy, f"정규 {a_normal:.2f} > 파레토 {a_heavy:.2f}")
-    check("물리학", "표본 부족 시 중립값",
-          R._hill_alpha(pd.Series([0.01] * 5)) == 3.0)
+    check("물리학", "표준오차를 함께 돌려줌 (점추정만 쓰지 않도록)",
+          np.isfinite(se_n) and se_n > 0, f"se={se_n:.3f}")
+    check("물리학", "표본 부족 시 중립값 + 무한 표준오차",
+          R._hill_alpha(pd.Series([0.01] * 5)) == (3.0, float("inf")))
 
-    # RMT 결합도 — 시장 추종 종목이 독립 종목보다 높아야 합니다
-    market = rng.normal(0, 0.01, 100)
-    follows = [list(market + rng.normal(0, 0.003, 100)) for _ in range(3)]
-    independent = list(rng.normal(0, 0.01, 100))
-    couplings = R._rmt_coupling(follows + [independent])
+    # 좌우 꼬리를 구분하는가 — 예전 구현은 abs() 로 합쳐 급등주를 급락위험으로 읽었습니다
+    left_heavy = pd.Series(np.where(rng.random(800) < 0.5,
+                                    -rng.pareto(1.5, 800) * 0.01,
+                                    rng.normal(0, 0.005, 800)))
+    right_heavy = pd.Series(-left_heavy.to_numpy())
+    check("물리학", "상승 급등을 급락 위험으로 읽지 않음 (좌우 꼬리 구분)",
+          R._hill_alpha(left_heavy)[0] < R._hill_alpha(right_heavy)[0],
+          f"좌꼬리형 {R._hill_alpha(left_heavy)[0]:.2f} < "
+          f"우꼬리형 {R._hill_alpha(right_heavy)[0]:.2f}")
+
+    # 추정오차가 크면 중립(3.0)으로 수축되는가
+    check("물리학", "표준오차가 크면 꼬리지수를 중립으로 수축",
+          abs(R._shrink_tail(1.5, 2.0) - 3.0) < abs(R._shrink_tail(1.5, 0.1) - 3.0),
+          f"se=2.0 -> {R._shrink_tail(1.5, 2.0):.2f} / se=0.1 -> {R._shrink_tail(1.5, 0.1):.2f}")
+
+    # RMT 결합도 — 시장 추종 종목이 독립 종목보다 높아야 합니다.
+    # 시장 모드를 정의하려면 종목이 충분해야 하므로 15종목 이상을 씁니다.
+    dates = pd.date_range("2024-01-01", periods=250, freq="B")
+    market = rng.normal(0, 0.01, 250)
+    follows = [pd.Series(market + rng.normal(0, 0.003, 250), index=dates)
+               for _ in range(15)]
+    independent = [pd.Series(rng.normal(0, 0.01, 250), index=dates) for _ in range(5)]
+    couplings = R._rmt_coupling(follows + independent)
     check("물리학", "RMT — 시장 추종은 결합도↑, 독립은 결합도↓",
-          couplings[3] < min(couplings[:3]),
-          f"추종 {np.mean(couplings[:3]):.2f} vs 독립 {couplings[3]:.2f}")
+          np.mean(couplings[15:]) < np.mean(couplings[:15]),
+          f"추종 {np.mean(couplings[:15]):.2f} vs 독립 {np.mean(couplings[15:]):.2f}")
+
+    # Marchenko-Pastur 게이트 — 순수 잡음이면 시장 모드가 없다고 답해야 합니다
+    pure_noise = [pd.Series(rng.normal(0, 0.01, 250), index=dates) for _ in range(20)]
+    check("물리학", "MP 경계 — 상관 없는 종목뿐이면 전부 중립",
+          all(abs(c - 1.0) < 1e-9 for c in R._rmt_coupling(pure_noise)),
+          "최대 고유값이 잡음 벌크를 못 넘으면 '시장 모드'가 아닙니다")
+
+    # 날짜 정렬 — 거래정지로 봉 수가 다른 종목이 섞여도 같은 날끼리 짝지어야 합니다
+    halted = follows[0].drop(follows[0].index[50:80])      # 30일 거래정지
+    mixed = [halted] + follows[1:] + independent
+    aligned_c = R._rmt_coupling(mixed)
+    check("물리학", "거래정지로 봉 수가 달라도 날짜로 정렬",
+          np.isfinite(aligned_c[0]) and aligned_c[0] > 1.0,
+          f"정지 종목 결합도 {aligned_c[0]:.2f} — 여전히 시장 추종으로 판정")
     check("물리학", "후보 2개 이하면 중립 (노이즈 고유벡터 방지)",
           R._rmt_coupling([follows[0], independent]) == [1.0, 1.0])
 

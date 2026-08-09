@@ -34,7 +34,8 @@ from datetime import datetime
 import numpy as np
 
 from engine import broker as broker_module
-from engine import feed, instruments, protections, risk, strategy, validation
+from engine import (feed, fills, holding, instruments, portfolio, protections,
+                    risk, strategy, validation)
 from engine.broker import make_client_order_id
 from engine.instruments import Instrument
 from storage import autotrade as store
@@ -493,6 +494,54 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
                     f"{record['symbol']} 주문 취소 실패: {cancel.error}")
 
 
+def _exit_realized_krw(inst: Instrument, side: str, entry_price, exit_price,
+                       quantity: float) -> float | None:
+    """청산 왕복의 실현손익(**원화**). 계산할 수 없으면 None.
+
+    왜 엔진이 직접 계산하는가
+        증권사 체결내역은 체결가와 수량만 줍니다. 손익은 주지 않습니다. 그래서
+        `KISBroker` 는 `realized_pnl` 을 채울 수 없는데, 비워 두면 그 값을 재료로
+        쓰는 안전장치가 전부 판단을 못 합니다 — 일일 손실 한도, 최대 낙폭,
+        초단타 `daily_loss_krw`, 보호장치 4종(`closed_trades`), 승률 집계.
+        실제로 실계좌에서는 **손절할 때마다 오늘 손익이 0으로 리셋**됐습니다.
+        평가손실은 포지션과 함께 사라지는데 실현손실이 0으로 들어왔기 때문입니다.
+
+    규약은 `storage/paper.py` 의 매도와 같습니다 — **왕복 비용을 전부 뺀 순손익**.
+    진입 수수료까지 빼는 이유는 그것이 이 매매가 계좌에 남긴 실제 금액이고,
+    한도 판정에서 손실을 크게 보는(=안전한) 방향이기 때문입니다.
+    (`storage/derivatives.py` 는 진입 수수료를 진입 시점에 이미 차감해서 여기서
+     빼지 않습니다. 그만큼 실계좌 파생이 모의계좌보다 조금 보수적으로 잡힙니다.)
+
+    None 을 돌려주는 경우
+        진입가를 모르는 포지션입니다(재동기화로 복원된 것 등). **0 으로 채우면
+        손실이 없었던 것처럼 보이므로** 비워 두고, 부르는 쪽이 경고를 남깁니다.
+    """
+    try:
+        entry = float(entry_price or 0)
+        exit_ = float(exit_price or 0)
+        quantity = float(quantity or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or exit_ <= 0 or quantity <= 0:
+        return None
+
+    direction = -1 if str(side or "").strip() == "short" else 1
+    multiplier = float(inst.multiplier or 1.0)
+    entry_side = "buy" if direction > 0 else "sell"
+    exit_side = "sell" if direction > 0 else "buy"
+
+    entry_fee, entry_tax = inst.costs(entry_side, entry * quantity * multiplier)
+    exit_fee, exit_tax = inst.costs(exit_side, exit_ * quantity * multiplier)
+    gross = (exit_ - entry) * quantity * multiplier * direction
+    realized = gross - entry_fee - entry_tax - exit_fee - exit_tax
+
+    # 미국 종목의 체결가는 달러입니다. 환산하지 않으면 일일 손실 한도(원)와
+    # 초단타 daily_loss_krw(원)가 달러 숫자를 원으로 읽어, 손실을 1/1400 로
+    # 축소해서 봅니다 — 한도가 사실상 없는 것과 같아집니다.
+    from data_sources import fx
+    return float(fx.to_krw(realized, inst.currency))
+
+
 def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
     """체결된 수량을 원장과 포지션 상태에 반영합니다."""
     mode = cfg.get("mode", "paper")
@@ -509,21 +558,53 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
         selling = record.get("action") in ("sell", "close", "open_short")
         slippage = round(-raw if selling else raw, 2)
 
+    is_exit = record.get("action") in ("close", "sell")
+    inst = instruments.try_resolve(record["symbol"])
+    # 청산이 전량 체결되면 상태를 지우므로, 진입가는 **지우기 전에** 읽어 둡니다
+    state = store.get_position_states(user_id, mode).get(record["symbol"], {})
+
+    # 청산 손익 — 증권사가 주지 않아 엔진이 계산합니다 (_exit_realized_krw 참고).
+    # 부분 체결이면 이미 적어 둔 값 위에 **늘어난 만큼만** 더합니다.
+    realized = record.get("realized_pnl")
+    booked = float(realized or 0)
+    if is_exit:
+        total = (_exit_realized_krw(inst, record.get("side") or state.get("side"),
+                                    state.get("entry_price"), fill_price,
+                                    status.filled_quantity)
+                 if inst is not None else None)
+        if total is None:
+            # 조용히 0 으로 채우면 손실이 없었던 것처럼 보입니다. 빠졌다는 사실을
+            # 남겨야 나중에 "왜 한도가 안 걸렸지"를 추적할 수 있습니다.
+            store.log_event(
+                user_id, "error",
+                f"{record['name'] or record['symbol']} 청산 손익을 계산하지 못했습니다 "
+                f"— 진입가를 모르는 포지션입니다. 오늘 손익과 손실 한도 집계에서 "
+                f"이 매매가 빠집니다.",
+                level="warn", symbol=record["symbol"], name=record["name"],
+                detail={"order": record["client_order_id"],
+                        "entry_price": state.get("entry_price"),
+                        "exit_price": fill_price})
+        else:
+            realized = round(total, 2)
+
     store.update_order(record["id"],
                        status="filled" if status.status == "filled" else "partial",
                        filled_quantity=status.filled_quantity,
-                       avg_fill_price=fill_price, slippage_bps=slippage)
+                       avg_fill_price=fill_price, slippage_bps=slippage,
+                       realized_pnl=realized)
 
-    is_exit = record.get("action") in ("close", "sell")
     if is_exit:
+        if realized is not None:
+            # 손익은 체결된 만큼 즉시 반영하고(안 하면 한도가 늦게 걸립니다),
+            # 매매 건수는 그 매매가 끝났을 때 한 번만 셉니다.
+            store.record_daily_trade(user_id, mode, float(realized) - booked,
+                                     count=1 if status.status == "filled" else 0)
         # 청산이 전량 체결되면 손절·목표 기억을 지웁니다
         if status.status == "filled":
             store.clear_position_state(user_id, mode, record["symbol"])
-            store.record_daily_trade(user_id, mode, record.get("realized_pnl") or 0)
     else:
         # 진입 체결 — **실제 체결가 기준으로** 손절·목표를 다시 잡습니다.
         # 주문 낼 때 본 가격으로 손절을 걸어두면, 슬리피지만큼 손절폭이 어긋납니다.
-        state = store.get_position_states(user_id, mode).get(record["symbol"], {})
         detail = record.get("detail") or {}
         plan = detail.get("plan") if isinstance(detail, dict) else None
         entry = float(fill_price or 0)
@@ -553,14 +634,18 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
         "action": record["action"], "filled": status.filled_quantity,
         "ordered": record["quantity"], "avg_price": fill_price,
         "slippage_bps": slippage, "status": status.status,
+        "realized_pnl": realized,
     })
     slip_text = f" (슬리피지 {slippage:+.1f}bp)" if slippage is not None else ""
+    pnl_text = (f" · 실현 {float(realized):+,.0f}원"
+                if is_exit and realized is not None else "")
     store.log_event(
         user_id, "fill",
         f"{record['name'] or record['symbol']} {status.filled_quantity:g}/"
-        f"{record['quantity']:g} 체결 @ {float(fill_price or 0):,.2f}{slip_text}",
+        f"{record['quantity']:g} 체결 @ {float(fill_price or 0):,.2f}{slip_text}{pnl_text}",
         level="trade", symbol=record["symbol"], name=record["name"],
-        detail={"order": record["client_order_id"], "status": status.to_dict()})
+        detail={"order": record["client_order_id"], "status": status.to_dict(),
+                "realized_pnl": realized})
 
 
 def _age_seconds(created_at: str) -> float:
@@ -1131,18 +1216,31 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
         # 접수 시점부터 재는 이유: 체결을 기다리는 동안 또 사면 안 됩니다.
         _last_scalp_exit[(user_id, inst.key)] = time.time()
 
+        # 즉시 체결 브로커(모의계좌)는 손익을 함께 돌려줍니다. 비어 있으면
+        # **0 으로 적지 않고** 직접 계산합니다 — 0 은 '손실이 없었다'로 읽혀서
+        # 일일 손실 한도가 그만큼 늦게 걸립니다 (_exit_realized_krw 참고).
+        realized = order.realized_pnl
+        if realized is None and order.status == "filled":
+            realized = _exit_realized_krw(
+                inst, position.side,
+                state.get("entry_price") or position.avg_price,
+                order.avg_fill_price or order.price,
+                order.filled_quantity or order.quantity)
+
         # 접수만 된 주문은 아직 포지션이 남아 있습니다.
         # 여기서 상태를 지우면 손절선을 잃은 채 포지션만 남습니다.
         if order.status == "filled":
             store.clear_position_state(user_id, mode, inst.key)
-            store.record_daily_trade(user_id, mode, order.realized_pnl or 0)
+            # 끝까지 못 구하면 아예 적지 않습니다. 0 으로 채우면 승률과
+            # 오늘 손익이 조용히 오염됩니다 (정산 패스와 같은 정책입니다).
+            if realized is not None:
+                store.record_daily_trade(user_id, mode, float(realized))
         result["exits"].append({
             "symbol": inst.key, "name": inst.name, "quantity": order.quantity,
-            "price": order.price, "realized_pnl": order.realized_pnl,
+            "price": order.price, "realized_pnl": realized,
             "reason": decision.reason, "status": order.status,
         })
-        pnl = (f" (실현 {order.realized_pnl:+,.0f}원)"
-               if order.realized_pnl is not None else "")
+        pnl = f" (실현 {realized:+,.0f}원)" if realized is not None else ""
         store.log_event(user_id, "exit",
                         f"{inst.name} {order.quantity:g}{_unit(inst)} 청산 — "
                         f"{decision.reason}{pnl}",
@@ -2100,6 +2198,20 @@ def simulate(query: str, cfg: dict = None, days: int = 250,
     out = {"ok": True, "instrument": inst.to_dict(), **metrics,
            "trades": trades[-50:], "curve": curve[-250:],
            "benchmark_curve": benchmark[-250:],
+           # 체결 가정을 결과에 같이 실어 보냅니다. 나중에 이 백테스트를 다시
+           # 볼 때 "어떤 체결 모형에서 나온 숫자인가" 를 못 되짚으면, 모형을
+           # 바꾼 전후 결과를 비교할 수 없습니다.
+           "execution": {
+               "fill": "next_bar_open",
+               "intrabar_stops": True,
+               "stop_priority": "stop_first",
+               "gap_through_stop": "open",
+               "finalize_open_position": True,
+               "slippage_bps": float(cfg.get("slippage_bps", 5)),
+               "note": "판단은 종가, 체결은 다음 봉 시가. 손절·익절은 봉 안 "
+                       "고가/저가로 판정하며 같은 봉에 둘 다 닿으면 손절 우선.",
+           },
+           "rejections": run["rejections"].summary(),
            "bars_used": len(bars), "config": {
                k: cfg[k] for k in ("entry_score", "exit_score", "atr_stop_mult",
                                    "stop_loss_pct", "take_profit_pct",
@@ -2109,7 +2221,292 @@ def simulate(query: str, cfg: dict = None, days: int = 250,
     if falsify:
         out["falsification"] = _falsification(inst, bars, cfg, initial_cash,
                                               metrics, trials=falsify)
+    out["gates"] = _run_gates(inst, cfg, curve, benchmark, trades, days,
+                              out["rejections"])
     return out
+
+
+def simulate_portfolio(queries: list, cfg: dict = None, days: int = 250,
+                       initial_cash: float = 10_000_000,
+                       weights: dict = None) -> dict:
+    """여러 종목을 **하나의 포트폴리오로** 백테스트합니다 (슬리브 모델).
+
+    종목별 백테스트를 따로 돌려 수익률을 나열하는 것과 다릅니다. 분산 효과는
+    합쳐 봐야만 보이고, 그게 이 함수의 존재 이유입니다 (engine/portfolio.py).
+
+    읽는 순서
+        1) `diversification.ratio`  — 종목을 늘린 게 실제로 위험을 줄였는가.
+           1에 가까우면 유니버스가 사실상 한 종목입니다.
+        2) `excess_return_pct`      — 같은 비중으로 그냥 사서 들고 있는 것보다 나은가.
+        3) `rejections`             — 슬리브별 자본이 쪼개져 있어 개별 백테스트보다
+           예수금 부족 거부가 많이 납니다. 많으면 종목 수를 줄이거나 자본을 키우세요.
+
+    시행 장부에는 **포트폴리오 전체가 1건** 으로 올라갑니다. 종목별로 N건을
+    올리면 DSR 의 N 이 부풀어 문턱이 엉뚱하게 높아집니다.
+    """
+    cfg = {**store.DEFAULT_CONFIG, **(cfg or {})}
+    cfg = {**cfg, "intraday_weight": 0.0, "use_news": False}
+
+    queries = [q for q in (queries or []) if str(q).strip()]
+    if len(queries) < 2:
+        return {"ok": False, "error": "포트폴리오는 종목이 2개 이상이어야 합니다."}
+
+    # -- 1단계: 데이터가 실제로 있는 종목만 추립니다 -----------------------
+    #
+    # 자본 배분 전에 걸러야 합니다. 배분 후에 거르면 실패한 종목 몫이 허공에
+    # 남아서, "1/3씩 넣었다" 고 보고하면서 실제로는 2/3만 투입된 결과가 됩니다.
+    resolved, bars_by_key, failures = {}, {}, []
+    raw_weights = dict(weights or {})
+    for query in queries:
+        inst = _resolve_universe_item(query)
+        if inst is None:
+            failures.append(f"'{query}' 종목을 찾을 수 없습니다.")
+            continue
+        bars = feed.bars(inst, "day", count=max(days + 60, 120))
+        if bars is None or len(bars) < strategy.MIN_DAILY_BARS + 20:
+            failures.append(f"{inst.name}: 일봉이 부족합니다.")
+            continue
+        resolved[inst.key] = inst
+        bars_by_key[inst.key] = bars
+        # 사용자가 준 비중은 입력 문자열 기준이므로 종목키로 옮겨 둡니다
+        if query in raw_weights:
+            raw_weights[inst.key] = raw_weights.pop(query)
+
+    if len(resolved) < 2:
+        return {"ok": False,
+                "error": "합칠 수 있는 종목이 2개 미만입니다. "
+                         + (" / ".join(failures) if failures else "")}
+
+    # -- 2단계: 살아남은 종목에만 자본을 배분하고 돌립니다 ------------------
+    weights = portfolio._normalize(raw_weights, list(resolved.keys()))
+    runs = {}
+    rejections = fills.RejectionLog()
+    for key, inst in resolved.items():
+        sleeve_cash = initial_cash * weights[key]
+        if sleeve_cash <= 0:
+            continue
+        run = _run_backtest(inst, bars_by_key[key], cfg, sleeve_cash)
+        runs[key] = {
+            "curve": run["curve"], "trades": run["trades"],
+            "benchmark": _buy_and_hold_curve(inst, bars_by_key[key],
+                                             run["start_index"], sleeve_cash),
+        }
+        rejections.items.extend(run["rejections"].items)
+
+    if len(runs) < 2:
+        return {"ok": False,
+                "error": "합칠 수 있는 종목이 2개 미만입니다. "
+                         + (" / ".join(failures) if failures else "")}
+
+    out = portfolio.combine(runs, weights, initial_cash,
+                            periods_per_year=validation.TRADING_DAYS)
+    if not out.get("ok"):
+        return out
+
+    out["instruments"] = {k: v.to_dict() for k, v in resolved.items()}
+    out["rejections"] = rejections.summary()
+    out["warnings"] = failures
+    out["execution"] = {
+        "model": "sleeve",
+        "note": "종목별로 자본을 미리 쪼개 독립 백테스트한 뒤 합칩니다. "
+                "리밸런싱·슬리브 간 자본 공유·증거금 상계는 없습니다 "
+                "(셋 다 결과를 보수적인 쪽으로 밉니다).",
+    }
+    all_trades = [t for r in runs.values() for t in (r["trades"] or [])]
+    out["gates"] = _run_gates(
+        next(iter(resolved.values())), cfg, out["curve"], out["benchmark_curve"],
+        all_trades, days, out["rejections"],
+        trial_label=f"portfolio:{'+'.join(sorted(runs.keys()))}")
+    return out
+
+
+def _run_gates(inst: Instrument, cfg: dict, curve: list, benchmark: list,
+               trades: list, days: int, rejections: dict = None,
+               trial_label: str = "") -> dict:
+    """★ 백테스트 결과에 **검증 하네스** 를 붙입니다 (설계도 §12).
+
+    총수익률·샤프만 보고 판단하지 않게 만드는 것이 목적입니다. 다섯 가지를 답니다.
+
+      registry  이 설정이 **몇 번째 시행인가**. 장부에 자동 등록됩니다.
+                DSR 의 N 은 사람이 세면 반드시 과소평가됩니다 — 실패한 시행을
+                안 세기 때문입니다. 그래서 실행 자체가 등록이 되게 했습니다.
+      cpcv      단일 경로가 아니라 **경로 분포**. 중앙값보다 최악 경로가 중요합니다.
+      lottery   같은 횟수로 아무렇게나 매매한 것보다 나은가.
+      vol_audit 변동성 스케일링이 두 번 적용되고 있지 않은가 (기울기 ≈ −1 이어야 정상).
+      overfit   시행 수를 반영한 요구 t통계와 최소 백테스트 길이.
+      execution 신호가 **체결되지 못하고 사라진 비율**. 아래 설명 참고.
+
+    **실패해도 백테스트를 막지 않습니다.** 숫자를 함께 보여줄 뿐입니다 —
+    막으면 사람이 게이트를 끄는 쪽으로 움직입니다. 대신 `verdict` 한 줄로
+    "이 결과를 믿어도 되는가" 를 명시합니다.
+    """
+    from engine import cpcv as _cpcv, lottery as _lottery, overfit as _of
+    from engine.registry import TrialRegistry, TrialSpec
+
+    rets = validation.to_returns(curve)
+    bench = validation.to_returns(benchmark)
+    n = len(rets)
+    if n < 60:
+        return {"ok": False, "reason": f"게이트를 돌리기에 표본이 부족합니다 ({n}일)."}
+
+    out: dict = {"ok": True, "n_obs": n}
+
+    # -- 1) 시행 장부 -----------------------------------------------------
+    try:
+        reg = TrialRegistry()
+        spec = TrialSpec(
+            family=(f"portfolio:{inst.asset_class}" if trial_label
+                    else f"autotrade:{inst.asset_class}"),
+            config={k: cfg.get(k) for k in sorted((
+                "entry_score", "exit_score", "atr_stop_mult", "stop_loss_pct",
+                "take_profit_pct", "trailing_stop_pct", "max_hold_days",
+                "risk_per_trade_pct", "position_pct", "algo_mode", "ml_mode",
+                "protect_enabled", "slippage_bps")) if k in cfg},
+            data_fingerprint=f"{trial_label or inst.key}:{days}",
+            label=trial_label or inst.key)
+        tid = reg.register(spec)
+        reg.log_result(tid, returns=rets.tolist())
+        eff = reg.effective_n(spec.family)
+        out["registry"] = {"trial_id": tid, "m_trials": reg.n_trials,
+                           "effective_n": eff["n_hat"], "method": eff["method"]}
+        dsr = reg.deflated_sharpe(tid, family=spec.family)
+        out["dsr"] = {k: dsr.get(k) for k in
+                      ("dsr", "observed_sr", "expected_max_sr_under_null",
+                       "n_trials", "significant_at_95")}
+        if out["dsr"].get("dsr") is None:
+            # 시행이 2개 미만이면 "여러 번 시도해서 최고를 골랐다" 는 보정 자체가
+            # 성립하지 않습니다. 값이 없는 게 정상이고, **아직 안전하다는 뜻이
+            # 아닙니다** — 설정을 바꿔 다시 돌릴수록 이 장부의 N 이 늘고
+            # 문턱이 올라갑니다.
+            out["dsr"]["reason"] = (
+                f"이 전략군의 시행이 {reg.n_trials}건뿐이라 DSR 을 계산하지 "
+                f"않았습니다. 설정을 바꿔 재실행할 때마다 장부에 쌓이고, "
+                f"2건부터 보정이 시작됩니다.")
+    except Exception as exc:
+        out["registry"] = {"error": repr(exc)[:120]}
+
+    # -- 2) CPCV 경로 분포 -------------------------------------------------
+    try:
+        plan = _cpcv.combinatorial_purged_cv(
+            n, n_groups=6, k=2, horizon=int(cfg.get("max_hold_days", 5) or 5),
+            warmup=strategy.MIN_DAILY_BARS, embargo_pct=0.02)
+        if plan is not None:
+            srs = []
+            for sp in plan.splits:
+                seg = rets[sp.test_idx]
+                seg = seg[np.isfinite(seg)]
+                if len(seg) > 8:
+                    srs.append(validation.sharpe_ratio(seg))
+            if len(srs) >= 3:
+                arr = np.asarray(srs, dtype=float)
+                out["cpcv"] = {
+                    "n_folds": plan.n_folds, "n_paths": plan.n_paths,
+                    "sharpe_median": round(float(np.median(arr)), 4),
+                    "sharpe_iqr": [round(float(np.quantile(arr, .25)), 4),
+                                   round(float(np.quantile(arr, .75)), 4)],
+                    "sharpe_worst": round(float(arr.min()), 4),
+                    "share_positive": round(float(np.mean(arr > 0)), 3),
+                }
+    except Exception as exc:
+        out["cpcv"] = {"error": repr(exc)[:120]}
+
+    # -- 3) Lottery + 4) 이중 vol 스케일링 감사 ----------------------------
+    exposure = np.array([float(p.get("exposure") or 0.0) for p in curve],
+                        dtype=float)
+    try:
+        if np.any(np.abs(exposure) > 1e-9) and len(bench) >= n - 1:
+            asset = bench[:len(exposure)]
+            lot = _lottery.lottery_benchmark(
+                exposure[:len(asset)], asset,
+                cost_bps=float(cfg.get("slippage_bps", 5)) * 2 + 20,
+                n_random=400)
+            out["lottery"] = {k: lot.get(k) for k in
+                              ("percentile", "passed", "observed", "null_mean",
+                               "p_value")}
+    except Exception as exc:
+        out["lottery"] = {"error": repr(exc)[:120]}
+
+    try:
+        rv = np.array([float(np.std(rets[max(i - 20, 0):i], ddof=1))
+                       if i >= 21 else np.nan for i in range(len(rets))])
+        out["vol_audit"] = validation.audit_vol_scaling(exposure[1:len(rv) + 1], rv)
+    except Exception as exc:
+        out["vol_audit"] = {"error": repr(exc)[:120]}
+
+    # -- 5) 다중검정 -------------------------------------------------------
+    try:
+        n_tr = int(out.get("registry", {}).get("effective_n") or 1)
+        sr = float(metrics_sr(curve))
+        hc = _of.haircut_sharpe(sr, n_trials=max(n_tr, 1), n_obs=n)
+        out["overfit"] = {
+            "required_tstat": hc.get("required_tstat"),
+            "t_stat": hc.get("t_stat"),
+            "passes_required_t": hc.get("passes_required_t"),
+            "haircut_pct": hc.get("haircut_pct"),
+            "min_backtest_years": _of.min_backtest_length(max(n_tr, 2))["min_years"],
+            "have_years": round(n / 252.0, 2),
+        }
+    except Exception as exc:
+        out["overfit"] = {"error": repr(exc)[:120]}
+
+    # -- 6) 체결 실패율 ----------------------------------------------------
+    #
+    # 거부가 많다는 것은 "이 백테스트가 보여준 매매를 실제로는 낼 수 없었다" 는
+    # 뜻입니다. 성과 숫자보다 먼저 봐야 하는 값인데, 거부를 기록하지 않으면
+    # 매매 횟수가 조용히 줄어들 뿐이라 좋은 결과처럼 보입니다.
+    rej = rejections or {}
+    if rej.get("total"):
+        attempted = len(trades) + rej["total"]
+        out["execution"] = {
+            "rejected": rej["total"],
+            "attempted": attempted,
+            "reject_rate": round(rej["total"] / attempted, 4) if attempted else 0.0,
+            "by_reason": rej.get("by_reason", {}),
+        }
+
+    out["verdict"] = _gate_verdict(out, len(trades))
+    return out
+
+
+def metrics_sr(curve: list) -> float:
+    return validation.sharpe_ratio(validation.to_returns(curve))
+
+
+def _gate_verdict(g: dict, n_trades: int) -> str:
+    """게이트 결과를 한 줄로. **가장 나쁜 신호를 앞에 씁니다.**"""
+    bad = []
+    if n_trades < 30:
+        bad.append(f"거래 {n_trades}회 — 30회 미만이면 샤프 표준오차가 "
+                   f"어떤 엣지보다 큽니다. 통계적으로 판단 불가")
+    c = g.get("cpcv") or {}
+    if c.get("share_positive") is not None and c["share_positive"] < 0.6:
+        bad.append(f"CPCV 경로의 {c['share_positive']:.0%} 만 양수 "
+                   f"(최악 경로 샤프 {c.get('sharpe_worst')})")
+    lot = g.get("lottery") or {}
+    if lot.get("passed") is False:
+        bad.append(f"무작위 매매 대비 {lot.get('percentile')} 백분위 — "
+                   f"같은 횟수로 아무렇게나 매매한 것과 구분되지 않습니다")
+    va = g.get("vol_audit") or {}
+    if va.get("passed") is False:
+        bad.append(f"이중 변동성 스케일링 의심 (기울기 {va.get('slope')})")
+    of = g.get("overfit") or {}
+    if of.get("passes_required_t") is False:
+        bad.append(f"t={of.get('t_stat')} < 요구 {of.get('required_tstat')} "
+                   f"(시행 {g.get('registry', {}).get('effective_n')}회 반영)")
+    if of.get("min_backtest_years") and of.get("have_years") and \
+            of["have_years"] < of["min_backtest_years"]:
+        bad.append(f"데이터 {of['have_years']}년 < 이 시행 수를 지탱하는 "
+                   f"최소 {of['min_backtest_years']}년")
+    ex = g.get("execution") or {}
+    if ex.get("reject_rate", 0) >= 0.10:
+        top = next(iter(ex.get("by_reason", {}).values()), {}).get("label", "")
+        bad.append(f"신호의 {ex['reject_rate']:.0%}({ex['rejected']}건)가 "
+                   f"체결되지 못했습니다{f' — 주로 {top}' if top else ''}. "
+                   f"이 성과는 낼 수 없었던 주문을 뺀 나머지입니다")
+
+    if not bad:
+        return "게이트 통과 — 이 결과는 통상적인 과최적화 검사를 견딥니다."
+    return "⚠ " + " · ".join(bad)
 
 
 def _buy_and_hold_curve(inst: Instrument, bars, start_index: int,
@@ -2196,28 +2593,149 @@ def _falsification(inst: Instrument, bars, cfg: dict, initial_cash: float,
 
 
 def _run_backtest(inst: Instrument, bars, cfg: dict, initial_cash: float) -> dict:
-    """백테스트 루프 본체 (실데이터·합성데이터가 같은 경로를 쓰게 분리했습니다)."""
+    """백테스트 루프 본체 (실데이터·합성데이터가 같은 경로를 쓰게 분리했습니다).
+
+    ★ 봉 하나 안에서의 순서가 이 함수의 전부입니다 (engine/fills.py 참고).
+
+        ① 지난 봉에서 낸 주문을 **이 봉 시가** 에 체결        ← 한 봉 지연
+        ② 보유 중이면 이 봉의 고가/저가로 **손절·익절 판정**   ← 봉 안 체결
+        ③ 종가로 신호를 계산하고 **다음 봉에 낼 주문** 을 예약
+        ④ 종가로 평가금액 기록
+
+    ①과 ③을 갈라놓은 것이 핵심입니다. 예전 구현은 종가로 판단해서 **그 종가에**
+    체결했습니다. 실전에서 불가능한 가정이고, 벡터라이즈 백테스터가 대개 이
+    형태라 "백테스트만 좋은" 결과의 단골 원인입니다.
+
+    ②가 없으면 장중에 손절선을 뚫었다가 회복한 봉이 전부 무손실로 기록됩니다.
+
+    바뀐 뒤 성과는 **거의 항상 나빠집니다.** 그게 맞습니다 — 없어진 만큼이
+    원래부터 받을 수 없던 몫입니다.
+    """
     slippage = float(cfg.get("slippage_bps", 5)) / 10_000.0
     cash = float(initial_cash)
     position = None          # {side, qty, entry, stop, target, peak, opened_at}
+    pending = None           # 다음 봉 시가에 체결할 주문
     trades, curve = [], []
+    rejections = fills.RejectionLog()
     start_index = max(strategy.MIN_DAILY_BARS, 30)
 
+    def close_position(pos: dict, fill, when, reason: str) -> None:
+        """청산 회계 한 곳. 세 경로(보호주문·신호·구간끝)가 모두 여기를 지납니다.
+
+        손익에 **진입 비용까지** 포함시킵니다. 진입 수수료는 진입 시점에 이미
+        현금에서 빠지므로 자산 곡선에는 반영돼 있는데, 매매 기록에서 빼먹으면
+        `sum(매매 손익) ≠ 최종자산` 이 됩니다. 그 차이는 승률·손익비를 전부
+        조금씩 좋은 쪽으로 밀어냅니다 — 매매가 잦을수록 커집니다.
+        """
+        nonlocal cash, position
+        direction = 1 if pos["side"] == strategy.LONG else -1
+        notional = fill.price * pos["qty"] * inst.multiplier
+        gross = (fill.price - pos["entry"]) * pos["qty"] * inst.multiplier * direction
+        # when= 을 넘기는 것이 중요합니다. 빼면 2020년 매매에 오늘 세율이 붙어
+        # 과거 구간이 실제보다 비관적으로 평가됩니다 (instruments.costs 주석).
+        fee, tax = inst.costs("sell" if direction > 0 else "buy", notional, when=when)
+        # 차입비용은 보유 중 매 봉 현금에서 이미 빠졌습니다. 손익에도 반영해야
+        # `sum(매매 손익) = 자산 증감` 이 유지됩니다.
+        pnl = gross - fee - tax - pos["entry_cost"] - pos["borrow_cost"]
+        cash += pos["margin"] + gross - fee - tax
+        trades.append({
+            "entry_at": pos["opened_at"], "exit_at": str(when)[:10],
+            "side": pos["side"], "quantity": pos["qty"],
+            "entry": round(pos["entry"], 4), "exit": round(fill.price, 4),
+            "pnl": round(pnl),
+            "pnl_pct": round(pnl / pos["margin"] * 100, 2) if pos["margin"] else 0,
+            "reason": reason, "fill": fill.reason,
+            "fees": round(fee + pos["entry_fee"]), "taxes": round(tax + pos["entry_tax"]),
+            "borrow": round(pos["borrow_cost"]),
+        })
+        position = None
+
     for i in range(start_index, len(bars)):
-        window = bars.iloc[: i + 1]
         row = bars.iloc[i]
         bar_date = bars.index[i]
+        day = str(bar_date)[:10]
         price = float(row["close"])
+        prev_close = float(bars.iloc[i - 1]["close"]) if i else 0.0
+
+        # -- ① 지난 봉의 주문을 이 봉 시가에 체결 -------------------------
+        if pending:
+            order, pending = pending, None
+            if order["action"] == "exit" and position:
+                fill, why = fills.market_fill(
+                    inst, row, fills.SELL if position["side"] == strategy.LONG
+                    else fills.BUY, slippage, prev_close, i, day)
+                if fill:
+                    close_position(position, fill, bar_date, order["reason"])
+                else:
+                    rejections.add(i, day, why, "exit", order["reason"])
+
+            elif order["action"] == "enter" and not position:
+                side = fills.BUY if order["side"] == strategy.LONG else fills.SELL
+                # 공매도 금지 구간이었는지 **체결 시점 날짜로** 확인합니다.
+                # 이걸 안 보면 2020-03~2021-05, 2023-11~2025-03 처럼 실제로는
+                # 숏을 낼 수 없었던 구간의 수익이 그대로 남습니다 —
+                # 하필 하락장이라 백테스트가 가장 좋아 보이는 구간입니다.
+                short_ok = ({"allowed": True} if order["side"] == strategy.LONG
+                            else holding.short_entry_allowed(inst, bar_date, cfg))
+                fill, why = (None, holding.SHORT_BANNED) if not short_ok["allowed"] \
+                    else fills.market_fill(inst, row, side, slippage,
+                                           prev_close, i, day)
+                if why == holding.SHORT_BANNED:
+                    rejections.add(i, day, holding.SHORT_BANNED, order["side"],
+                                   short_ok["reason"], order["qty"])
+                elif not fill:
+                    rejections.add(i, day, why, order["side"],
+                                   "가격제한폭", order["qty"])
+                else:
+                    margin = inst.margin_required(fill.price, order["qty"], side)
+                    # 진입도 side 를 그대로 넘깁니다. 숏 진입은 '매도' 라서
+                    # 증권거래세가 붙습니다 — "매수" 로 고정하면 그 세금이 빠집니다.
+                    fee, tax = inst.costs(
+                        side, fill.price * order["qty"] * inst.multiplier,
+                        when=bar_date)
+                    if margin + fee + tax > cash:
+                        # 예전에는 여기서 조용히 건너뛰었습니다. 신호가 증발해도
+                        # 매매 횟수가 줄 뿐이라 아무도 몰랐습니다.
+                        rejections.add(
+                            i, day, fills.INSUFFICIENT_CASH, order["side"],
+                            f"필요 {margin + fee + tax:,.0f} > 보유 {cash:,.0f}",
+                            order["qty"])
+                    else:
+                        cash -= margin + fee + tax
+                        position = {
+                            "side": order["side"], "qty": order["qty"],
+                            "entry": fill.price, "stop": order["stop"],
+                            "target": order["target"], "peak": fill.price,
+                            "margin": margin, "opened_at": day,
+                            "entry_fee": fee, "entry_tax": tax,
+                            "entry_cost": fee + tax,
+                            "borrow_cost": 0.0, "last_accrued": bar_date,
+                        }
+
+        # -- ② 봉 안에서의 손절·익절 (같은 봉에 진입했어도 판정합니다) -----
+        if position:
+            protective = fills.protective_fill(
+                inst, row, position["side"], position["stop"],
+                position["target"], slippage, prev_close, i, day)
+            if protective:
+                label = {fills.STOP: "손절 도달",
+                         fills.TARGET: "목표가 도달",
+                         fills.GAP_THROUGH_STOP: "갭 하락으로 손절선 관통 — 시가 체결",
+                         fills.GAP_THROUGH_TARGET: "갭 상승으로 목표가 관통 — 시가 체결",
+                         }.get(protective.reason, protective.reason)
+                close_position(position, protective, bar_date,
+                               f"{label} ({protective.price:g})")
+
+        # -- ③ 종가로 판단 → 다음 봉 주문 예약 ------------------------------
+        window = bars.iloc[: i + 1]
         quote = {"price": price, "price_krw": price, "age_sec": 0.0,
                  "market_open": True}
         sig = strategy.evaluate(inst, cfg, bars_daily=window, quote=quote,
                                 allow_fetch=False)
-        if not sig.ok:
-            continue
 
-        # -- 청산 --
-        if position:
-            position["peak"] = (max(position["peak"], price) if position["side"] == strategy.LONG
+        if sig.ok and position:
+            position["peak"] = (max(position["peak"], price)
+                                if position["side"] == strategy.LONG
                                 else min(position["peak"], price))
             fake = type("P", (), {
                 "side": position["side"], "avg_price": position["entry"],
@@ -2226,55 +2744,79 @@ def _run_backtest(inst: Instrument, bars, cfg: dict, initial_cash: float) -> dic
             state = {"entry_price": position["entry"], "stop_price": position["stop"],
                      "target_price": position["target"], "peak_price": position["peak"],
                      "opened_at": position["opened_at"]}
+            # 손절·익절은 ②가 이미 봉 안에서 처리했습니다. 여기서 보는 것은
+            # 신호 반전·보유기간 초과처럼 **종가로만 알 수 있는** 사유입니다.
             decision = strategy.check_exit(inst, fake, sig, cfg, state,
                                            now=_as_datetime(bar_date))
             if decision.should_exit:
-                exit_price = price * (1 - slippage if position["side"] == strategy.LONG
-                                      else 1 + slippage)
-                direction = 1 if position["side"] == strategy.LONG else -1
-                gross = (exit_price - position["entry"]) * position["qty"] * \
-                    inst.multiplier * direction
-                fee, tax = inst.costs("sell" if direction > 0 else "buy",
-                                      exit_price * position["qty"] * inst.multiplier)
-                pnl = gross - fee - tax
-                cash += position["margin"] + pnl
-                trades.append({
-                    "entry_at": position["opened_at"], "exit_at": str(bar_date)[:10],
-                    "side": position["side"], "quantity": position["qty"],
-                    "entry": round(position["entry"], 4), "exit": round(exit_price, 4),
-                    "pnl": round(pnl), "pnl_pct": round(pnl / position["margin"] * 100, 2)
-                    if position["margin"] else 0,
-                    "reason": decision.reason,
-                })
-                position = None
+                pending = {"action": "exit", "reason": decision.reason}
 
-        # -- 진입 --
-        if not position and sig.direction != strategy.FLAT:
+        elif sig.ok and not position and sig.direction != strategy.FLAT:
             account = {"total_value": cash, "available_cash": cash}
             plan = strategy.plan_entry(inst, sig, cfg, account)
             if plan.ok and plan.quantity > 0:
-                entry_price = price * (1 + slippage if sig.direction == strategy.LONG
-                                       else 1 - slippage)
-                margin = inst.margin_required(entry_price, plan.quantity,
-                                              "buy" if sig.direction == strategy.LONG else "sell")
-                fee, _ = inst.costs("buy", entry_price * plan.quantity * inst.multiplier)
-                if margin + fee <= cash:
-                    cash -= margin + fee
-                    position = {
-                        "side": sig.direction, "qty": plan.quantity,
-                        "entry": entry_price, "stop": plan.stop_price,
-                        "target": plan.target_price, "peak": entry_price,
-                        "margin": margin, "opened_at": str(bar_date)[:10],
-                    }
+                # 손절·목표선은 **판단 시점(종가)** 기준으로 잡힌 값을 그대로
+                # 들고 갑니다. 체결가(다음 봉 시가) 기준으로 다시 잡지 않는 것은
+                # 라이브가 그렇게 동작하기 때문입니다 — 신호를 보고 손절선을
+                # 정한 뒤 주문을 냅니다. 여기서만 재계산하면 백테스트와 실매매가
+                # 갈라집니다.
+                pending = {"action": "enter", "side": sig.direction,
+                           "qty": plan.quantity, "stop": plan.stop_price,
+                           "target": plan.target_price}
+            elif plan.ok:
+                rejections.add(i, day, fills.ZERO_QUANTITY, sig.direction,
+                               "계산된 주문 수량이 0주")
+
+        # -- ④ 숏 차입비용 누적 → 종가로 평가금액 기록 -----------------------
+        #
+        # 달력일 기준이라 주말 이자도 붙습니다. 영업일로 세면 연 2.5% 짜리
+        # 이자의 28%가 조용히 사라집니다 (금→월은 3일치).
+        if position and position["side"] == strategy.SHORT:
+            cost = holding.accrue(
+                inst, price * position["qty"] * inst.multiplier,
+                position["last_accrued"], bar_date, cfg)
+            if cost:
+                cash -= cost
+                position["borrow_cost"] += cost
+            position["last_accrued"] = bar_date
 
         equity = cash
+        exposure = 0.0
         if position:
             direction = 1 if position["side"] == strategy.LONG else -1
             equity += position["margin"] + (price - position["entry"]) * \
                 position["qty"] * inst.multiplier * direction
-        curve.append({"date": str(bar_date)[:10], "equity": round(equity)})
+            # 노출 = 포지션 명목가 / 자산. 게이트(이중 vol 스케일링 감사·
+            # lottery 매칭)가 이 계열을 씁니다. 없으면 "얼마나 들고 있었나" 를
+            # 사후에 복원할 수 없어 두 검정 모두 불가능해집니다.
+            if equity > 0:
+                notional = price * position["qty"] * inst.multiplier
+                exposure = direction * notional / equity
+        curve.append({"date": str(bar_date)[:10], "equity": round(equity),
+                      "exposure": round(exposure, 4)})
 
-    return {"curve": curve, "trades": trades, "start_index": start_index}
+    # -- 구간 끝에 남은 포지션을 청산해서 매매 통계에 넣습니다 --------------
+    #
+    # 안 하면 자산 곡선에는 미실현 손익이 들어가는데 매매 통계에는 안 들어가서,
+    # 승률·매매횟수·손익비가 전부 어긋납니다. 오래 들고 가는 전략일수록 심하고,
+    # "수익률은 +30%인데 매매 0회" 같은 결과가 나옵니다.
+    if position and len(bars) > start_index:
+        last = bars.iloc[-1]
+        exit_side = fills.SELL if position["side"] == strategy.LONG else fills.BUY
+        raw = float(last["close"]) * ((1 - slippage) if exit_side == fills.SELL
+                                      else (1 + slippage))
+        close_position(position,
+                       fills.Fill(fills.snap_adverse(inst, raw, exit_side),
+                                  "close", len(bars) - 1, str(bars.index[-1])[:10]),
+                       bars.index[-1], "구간 종료 — 미청산 포지션 강제 정산")
+        # 마지막 평가금액도 정산 비용을 반영해야 곡선과 매매 통계가 어긋나지
+        # 않습니다 (곡선은 세금 없이 평가, 매매는 세금 차감 — 이 둘이 다르면
+        # `final_equity` 와 매매 손익 합계가 맞지 않습니다).
+        if curve:
+            curve[-1]["equity"] = round(cash)
+
+    return {"curve": curve, "trades": trades, "start_index": start_index,
+            "rejections": rejections}
 
 
 def _as_datetime(value) -> datetime:

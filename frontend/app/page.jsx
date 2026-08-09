@@ -15,6 +15,108 @@ const TIMEFRAMES = [
 ];
 const FAMILY_LABEL = { trend: "추세추종", meanrev: "평균회귀", confirm: "수급확인", info: "참고" };
 
+/* ---------------- 세이브(SAVE) 글로벌 피드 ----------------
+ * 종목과 무관한 시장 전체 피드라 종목 조회와 분리해 스스로 갱신합니다.
+ * 서버가 카테고리별로 2분 캐시를 두므로 그보다 자주 부를 이유가 없습니다.
+ */
+const SAVE_TABS = [
+  { key: "top", label: "주요뉴스" }, { key: "breaking", label: "속보" },
+  { key: "reuters", label: "로이터" }, { key: "news", label: "뉴스" },
+  { key: "report", label: "리포트" },
+];
+const SAVE_REFRESH_MS = 120000;
+
+function SaveFeed() {
+  const [category, setCategory] = useState("top");
+  const [feed, setFeed] = useState(null);
+  const [state, setState] = useState("loading");   // loading | ok | error
+
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const d = await api.get(`/save/feed?category=${category}&limit=20`, { timeout: 30000 });
+        if (!alive) return;
+        setFeed(d);
+        setState("ok");
+      } catch {
+        if (alive) setState("error");
+      }
+    };
+    setState("loading");
+    setFeed(null);
+    pull();
+    const timer = setInterval(pull, SAVE_REFRESH_MS);
+    return () => { alive = false; clearInterval(timer); };
+  }, [category]);
+
+  const items = feed?.items || [];
+  return (
+    <div>
+      <div className="feed-head">
+        <span className="eyebrow">세이브(SAVE) 글로벌</span>
+        <span className="mono row-sub">
+          {feed?.generated_at ? new Date(feed.generated_at).toLocaleTimeString("ko-KR") : ""}
+        </span>
+      </div>
+      <div className="save-tabs">
+        {SAVE_TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            className={`save-tab${category === t.key ? " active" : ""}`}
+            onClick={() => setCategory(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="feed-list">
+        {state === "loading" && <div className="row-sub">불러오는 중…</div>}
+        {state === "error" && <div className="row-sub">세이브 피드를 불러오지 못했습니다.</div>}
+        {state === "ok" && feed?.requires_login && (
+          <div className="row-sub">
+            리포트는 세이브 로그인이 필요합니다 — 세션 쿠키를 SAVETICKER_COOKIE 환경변수에 넣어주세요.
+          </div>
+        )}
+        {state === "ok" && !feed?.requires_login && items.length === 0 && (
+          <div className="row-sub">수집된 항목이 없습니다.</div>
+        )}
+        {items.map((n, i) => {
+          const stance = n.sentiment > 0.1 ? "bullish" : n.sentiment < -0.1 ? "bearish" : "neutral";
+          const Row = n.url ? "a" : "div";
+          const linkProps = n.url
+            ? { href: n.url, target: "_blank", rel: "noopener noreferrer" }
+            : {};
+          return (
+            <Row className="feed-item" key={`${n.title}-${i}`} {...linkProps}>
+              <div className={`feed-stance ${stance}`} />
+              <div style={{ minWidth: 0 }}>
+                <div className="feed-title">
+                  <span className="terminal-chip">{n.badge || "블룸버그 정보"}</span>
+                  {n.title}
+                </div>
+                <div className="row-sub">
+                  {n.source}
+                  {(n.labels || []).slice(0, 2).map((l) => (
+                    <span className="label-chip" key={l}>{l}</span>
+                  ))}
+                  {(n.tickers || []).slice(0, 3).map((t) => (
+                    <span className="label-chip" style={{ color: "var(--gold)" }} key={t}>{t}</span>
+                  ))}
+                  {" · "}
+                  {new Date(n.published_at).toLocaleString("ko-KR",
+                    { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                </div>
+              </div>
+            </Row>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function AnalysisPage() {
   const { symbol: saved, setSymbol, symbolReady } = useSymbol();
   const [query, setQuery] = useState(saved.key);
@@ -376,7 +478,10 @@ export default function AnalysisPage() {
                       {{ technical: "기술", news: "뉴스", community: "커뮤" }[it.source_type] || it.source_type}
                     </span>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="rationale-text">{it.text}</div>
+                      <div className="rationale-text">
+                        {it.badge && <span className="terminal-chip">{it.badge}</span>}
+                        {it.text}
+                      </div>
                       {it.source_name && <div className="row-sub">{it.source_name}</div>}
                     </div>
                     <span className="m" style={{ color: signColor(it.influence) }}>
@@ -386,7 +491,9 @@ export default function AnalysisPage() {
                 ))}
               </div>
               <div>
-                <div className="feed-head"><span className="eyebrow">뉴스</span>
+                <SaveFeed />
+
+                <div className="feed-head" style={{ marginTop: 18 }}><span className="eyebrow">뉴스</span>
                   <span className="mono row-sub">
                     {data.news_summary?.total}건 · 긍정 {data.news_summary?.positive} / 부정 {data.news_summary?.negative}
                   </span>
@@ -396,7 +503,10 @@ export default function AnalysisPage() {
                     <a className="feed-item" key={i} href={nItem.url} target="_blank" rel="noopener noreferrer">
                       <div className={`feed-stance ${nItem.sentiment > 0.1 ? "bullish" : nItem.sentiment < -0.1 ? "bearish" : "neutral"}`} />
                       <div>
-                        <div className="feed-title">{nItem.title}</div>
+                        <div className="feed-title">
+                          {nItem.badge && <span className="terminal-chip">{nItem.badge}</span>}
+                          {nItem.title}
+                        </div>
                         <div className="row-sub">{nItem.source} · {nItem.sentiment >= 0 ? "+" : ""}{nItem.sentiment.toFixed(2)}</div>
                       </div>
                     </a>

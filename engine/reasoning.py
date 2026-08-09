@@ -26,7 +26,7 @@ def generate_reasoning(news_items: list[NewsItem], community: CommunitySentiment
     relevant_news.sort(key=lambda n: abs(n.sentiment_score), reverse=True)
 
     for n in relevant_news[:3]:
-        tag = "오션세이브 속보" if _source_type(n) == "oceansave" else n.source
+        tag = "블룸버그 정보" if _source_type(n) == "oceansave" else n.source
         reasoning.append(ReasoningItem(
             text=f"[{tag}] \"{n.title}\" — {'긍정적' if n.sentiment_score > 0 else '부정적'} 신호로 반영됨",
             source_type=_source_type(n),

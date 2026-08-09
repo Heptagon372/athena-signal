@@ -88,6 +88,26 @@ def post_form(url: str, *, data: dict | None = None, headers: dict | None = None
         return None
 
 
+def post_form_full(url: str, *, data: dict | None = None, headers: dict | None = None,
+                   timeout: int | None = None) -> tuple[int, dict | None, str]:
+    """(상태코드, JSON, 원문) — form POST 판.
+
+    post_form 은 비200을 None 으로 삼켜서 "실패했다"밖에 알 수 없습니다. OAuth2
+    토큰 엔드포인트는 거부 사유를 400 본문의 `error` 에 담아 보냅니다
+    (invalid_grant / redirect_uri_mismatch / invalid_client …). 이걸 못 읽으면
+    설정이 틀렸는지 코드가 만료된 건지 구분할 수 없어 진단이 불가능합니다.
+    """
+    try:
+        res = _session.post(url, data=data, headers=headers or {},
+                            timeout=timeout or HTTP_TIMEOUT)
+    except requests.RequestException as exc:
+        return 0, None, f"네트워크 연결 실패: {exc}"
+    try:
+        return res.status_code, res.json(), res.text[:500]
+    except (ValueError, json.JSONDecodeError):
+        return res.status_code, None, res.text[:500]
+
+
 def post_json(url: str, *, json_body: dict | None = None, headers: dict | None = None,
               timeout: int | None = None):
     """POST 후 JSON 응답을 반환. 실패하면 None. (KIS 토큰 발급 등에 사용)"""

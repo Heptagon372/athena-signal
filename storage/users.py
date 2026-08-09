@@ -97,6 +97,15 @@ def _hash(password: str, salt: str) -> str:
     ).hex()
 
 
+# 비밀번호 로그인이 불가능한 계정을 표시하는 값 (구글 전용 계정 등)
+NO_PASSWORD = "!"
+
+
+def _is_password_hash(value: str) -> bool:
+    """PBKDF2-SHA256 결과(64자 hex)인지 — 아니면 비밀번호 로그인 불가 계정입니다."""
+    return bool(value) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
 def validate_username(username: str) -> str | None:
     """문제가 있으면 사유 문자열, 없으면 None."""
     if not username or len(username) < 3:
@@ -149,8 +158,11 @@ def login(username: str, password: str) -> dict:
     with _conn() as conn:
         row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
-    # 아이디가 없어도 비밀번호를 한 번 계산해 응답 시간 차이를 줄입니다
-    if not row or row["username"] == LEGACY_USER:
+    # 아이디가 없어도 비밀번호를 한 번 계산해 응답 시간 차이를 줄입니다.
+    # 비밀번호로 로그인할 수 없는 계정(LEGACY_USER, 구글 전용 계정)도 여기서 걸러냅니다.
+    # 그 계정들의 password_hash 는 PBKDF2 결과(64자 hex)가 아니라 표식 한 글자라,
+    # 어떤 비밀번호를 넣어도 일치할 수 없지만 시도 자체를 받지 않는 편이 낫습니다.
+    if not row or row["username"] == LEGACY_USER or not _is_password_hash(row["password_hash"]):
         _hash(password or "", "dummy-salt")
         return {"ok": False, "error": "아이디 또는 비밀번호가 올바르지 않습니다."}
 
@@ -221,6 +233,47 @@ def change_password(user_id: int, current: str, new: str) -> dict:
                      (_hash(new, salt), salt, user_id))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))   # 재로그인 유도
     return {"ok": True}
+
+
+def find_by_username(username: str) -> dict | None:
+    """아이디(또는 이메일)로 계정 조회.
+
+    구글 로그인이 "이 이메일로 만들어 둔 로컬 계정이 이미 있는가" 를 확인해
+    기존 기록을 물려받을 때 씁니다 (ACCOUNTS.md 2-4).
+    """
+    username = (username or "").strip()
+    if not username or username == LEGACY_USER:
+        return None
+    init()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, username, display_name FROM users WHERE username = ?",
+            (username,)).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_external_user(user_id: int, username: str, display_name: str = ""):
+    """외부 인증(구글)으로 들어온 계정의 SQLite 행을 보장합니다.
+
+    id 를 **직접 지정해서** 넣습니다. 예측·모의투자·관심종목 테이블이 이 정수를
+    FK 로 쓰고, paper.ensure_account(user_id) 도 이 행이 있다고 전제하기 때문에
+    Mongo 에만 있으면 안 됩니다. 번호는 Mongo 카운터가 발급하므로 여기서는
+    AUTOINCREMENT 를 쓰지 않습니다 (storage/accounts.py 참고).
+
+    password_hash 는 NO_PASSWORD 표식이라 비밀번호로는 로그인할 수 없습니다.
+    """
+    init()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, display_name, password_hash, salt, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, username, (display_name or username).strip(),
+             NO_PASSWORD, secrets.token_hex(16), datetime.now().isoformat()))
+        # 구글에서 이름을 바꿨으면 따라갑니다 (표시 이름만)
+        if display_name:
+            conn.execute(
+                "UPDATE users SET display_name = ? WHERE id = ? AND password_hash = ?",
+                (display_name.strip(), user_id, NO_PASSWORD))
 
 
 def list_users() -> list[dict]:

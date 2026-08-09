@@ -470,6 +470,21 @@ def _overseas_funds_block(inst: Instrument, exchange: str, price: float,
             f"주문가능금액은 ${usable:,.2f} 입니다.{hint}")
 
 
+def _usd_krw() -> float:
+    """원화 환산 환율 — 증권사 기준환율을 먼저 씁니다.
+
+    자체 환율(fx.usd_krw)로 환산하면 같은 보유분인데도 화면 숫자가 증권사와
+    수백 원씩 어긋나 "계좌가 다르다"로 보입니다. 증권사가 실제로 쓴 환율을
+    받아올 수 있으면 그걸 쓰고, 못 받으면 자체 환율로 넘어갑니다.
+    """
+    present = kis_trading.overseas_present()
+    if present.get("ok") and float(present.get("fx_rate") or 0) > 0:
+        return float(present["fx_rate"])
+    from data_sources import fx
+    rate, _ = fx.usd_krw()
+    return rate
+
+
 class KISBroker(Broker):
     """실제 증권사로 주문을 보냅니다.
 
@@ -523,14 +538,13 @@ class KISBroker(Broker):
         # 전부 어긋납니다.
         overseas_purchase = overseas_eval = 0.0
         if overseas.get("ok") and overseas.get("positions"):
-            from data_sources import fx
-            rate, _ = fx.usd_krw()
+            rate = _usd_krw()
             overseas_purchase = sum(p.get("purchase_amount") or 0
                                     for p in overseas["positions"]) * rate
             overseas_eval = sum(p.get("eval_amount") or 0
                                 for p in overseas["positions"]) * rate
         overseas_pnl = overseas_eval - overseas_purchase
-        return {
+        out = {
             "mode": self.mode,
             "label": self.label,
             "cash": cash,
@@ -548,9 +562,47 @@ class KISBroker(Broker):
             "notional_exposure": equity_value + overseas_eval,
             "total_value": cash + equity_value + margin + overseas_pnl,
             "overseas_pnl": overseas_pnl,
+            "unsettled_buy": 0.0,
+            "unsettled_sell": 0.0,
+            "withdrawable": 0.0,
+            "account_source": "재구성",
             "errors": [x.get("error") for x in (stock, deriv, overseas)
                        if not x.get("ok")],
         }
+
+        # 여기까지가 '우리가 다시 계산한' 값입니다. 증권사가 계산해 둔 값을
+        # 받아올 수 있으면 그쪽으로 덮어씁니다 — 위 식은 미결제 매도대금과
+        # 매수 수수료를 모르기 때문에 실계좌에서 반드시 어긋납니다.
+        # (실측: 재구성 132,041원 vs 증권사 화면 139,518원)
+        snap = kis_trading.account_snapshot()
+        if not snap.get("ok"):
+            out["errors"] += snap.get("errors", [])
+            return out
+
+        out.update({
+            "cash": snap["deposit"],
+            # 예수금이 아니라 **주문가능현금**입니다. 미결제 매수대금이 결제일까지
+            # 예수금에 남아 있어서, 예수금을 쓸 수 있는 돈으로 읽으면 이미 써버린
+            # 돈으로 또 주문을 냅니다 (실측 예수금 132,226 / 주문가능 3,325).
+            "available_cash": snap["available_cash"],
+            "reserved_cash": max(snap["deposit"] - snap["available_cash"], 0.0),
+            "total_value": snap["total_asset"],
+            "settled_total_value": snap["settled_asset"],
+            "equity_value": equity_value + snap["eval_amount"],
+            "purchase_amount": snap["purchase_amount"] + (
+                stock.get("purchase_amount", 0.0) if stock.get("ok") else 0.0),
+            "unrealized_pnl": snap["unrealized_pnl"] + (
+                stock.get("total_pnl", 0.0) if stock.get("ok") else 0.0),
+            "notional_exposure": equity_value + snap["eval_amount"],
+            "initial_cash": snap["total_asset"],
+            "overseas_pnl": snap["unrealized_pnl"],
+            "unsettled_buy": snap["unsettled_buy"],
+            "unsettled_sell": snap["unsettled_sell"],
+            "withdrawable": snap["withdrawable"],
+            "fx_rate": snap["fx_rate"],
+            "account_source": " + ".join(snap["sources"]),
+        })
+        return out
 
     def positions(self) -> list[Position]:
         out = []
@@ -577,8 +629,7 @@ class KISBroker(Broker):
         if not overseas.get("ok"):
             self.position_errors.append(overseas.get("error") or "해외 잔고 조회 실패")
         if overseas.get("ok"):
-            from data_sources import fx
-            rate, _ = fx.usd_krw()
+            rate = _usd_krw()
             for p in overseas["positions"]:
                 inst = instruments.try_resolve(p["code"])
                 # 단가는 달러 그대로 둡니다 — 신호·손절선이 달러 기준이라

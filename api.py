@@ -23,8 +23,10 @@
 
 import dataclasses
 import logging
+import secrets
 import socket
 import sys
+import threading
 import time
 
 # 콘솔이 cp949 면 '—' 같은 문자를 못 찍고 **서버가 기동 중 죽습니다.**
@@ -37,25 +39,27 @@ for _stream in (sys.stdout, sys.stderr):
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import INITIAL_WEIGHTS, INTRADAY_BARS, PREDICTION_HORIZONS
-from data_sources import (community_crawler, credentials, fx, kis_client, kis_realtime,
+from data_sources import (community_crawler, credentials, fx, google_oauth, kis_client,
+                          kis_realtime,
                           kis_trading,
-                          market_clock, news_crawler, scrap_store, screener,
-                          symbol_registry, toss_api)
+                          market_clock, news_crawler, oceansave_crawler, scrap_store,
+                          screener, symbol_registry, toss_api)
 from data_sources import price_provider
 from data_sources.price_provider import get_provider
 from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
                     instruments, mlsignal, protections, recommender, risk,
-                    scalping, scoring)
+                    scalping, scoring, strategy)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
-from storage import db, derivatives, paper, users
+from storage import accounts, db, derivatives, paper, users
 
 # 모의투자 평가용 시세 캐시 (종목당 30초)
 _price_cache: dict[str, tuple[float, float | None]] = {}
@@ -103,13 +107,25 @@ def _auto_resolve_loop():
 # 인증
 # ---------------------------------------------------------------------------
 
-def current_user(request: Request) -> dict | None:
-    """Authorization: Bearer <token> 또는 athena_token 쿠키에서 사용자 확인."""
+def _bearer_token(request: Request) -> str:
+    """Authorization: Bearer <token> 또는 athena_token 쿠키에서 토큰만 꺼냅니다."""
     header = request.headers.get("authorization", "")
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    return token or request.cookies.get("athena_token", "")
+
+
+def current_user(request: Request) -> dict | None:
+    """토큰으로 사용자 확인.
+
+    세션이 두 곳에 있습니다 — 구글 계정은 MongoDB, 아이디/비번 계정은 SQLite.
+    Mongo 를 먼저 보고, 없으면 SQLite 를 봅니다. accounts.user_from_token 은
+    Mongo 를 못 쓰는 상태에서도 예외 대신 None 을 돌려주므로, Mongo 가 꺼져
+    있어도 로컬 로그인은 영향을 받지 않습니다.
+    """
+    token = _bearer_token(request)
     if not token:
-        token = request.cookies.get("athena_token", "")
-    return users.user_from_token(token)
+        return None
+    return accounts.user_from_token(token) or users.user_from_token(token)
 
 
 def require_user(request: Request) -> dict:
@@ -153,9 +169,10 @@ def auth_login(req: LoginRequest):
 
 @app.post("/api/auth/logout")
 def auth_logout(request: Request):
-    header = request.headers.get("authorization", "")
-    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
-    users.logout(token or request.cookies.get("athena_token", ""))
+    token = _bearer_token(request)
+    # 어느 쪽 세션인지 모르니 양쪽에서 지웁니다 (없는 쪽은 아무 일도 안 합니다)
+    if not accounts.delete_session(token):
+        users.logout(token)
     return {"ok": True}
 
 
@@ -179,6 +196,204 @@ def auth_change_password(req: PasswordChange, request: Request):
     if not result["ok"]:
         return JSONResponse(status_code=400, content=result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 구글 로그인 (OAuth 2.0 Authorization Code + PKCE)
+# ---------------------------------------------------------------------------
+# 흐름 전체와 각 선택의 근거는 ACCOUNTS.md 3장에 있습니다. 코드를 읽을 때 걸리는
+# 두 가지만 여기 옮겨 둡니다.
+#
+#   1) start 는 302 가 아니라 JSON 을 돌려줍니다.
+#      Next 의 /api 프록시(frontend/app/api/[...path]/route.js)가 응답에서
+#      content-type·cache-control 만 되돌려주고 Location 을 버립니다. 302 를 보내면
+#      리다이렉트가 프록시에서 사라집니다. JSON 은 온전히 통과합니다.
+#
+#   2) redirect_uri 는 8000번(이 서버)입니다.
+#      구글이 브라우저를 이쪽으로 직접 보내므로 프록시를 타지 않고, 302 와 쿠키가
+#      살아 있습니다. 여기서 세션을 만든 뒤 프론트로 넘깁니다.
+
+def _safe_frontend_origin(candidate: str) -> str:
+    """되돌아갈 프론트엔드 오리진을 검증합니다.
+
+    사용자가 127.0.0.1:3000 으로 들어왔는데 localhost:3000 으로 되돌리면,
+    localStorage 가 오리진별이라 토큰이 딴 오리진에 저장됩니다. 로그인한 것처럼
+    보였다가 새로고침하면 풀립니다. 그래서 시작한 오리진을 그대로 지켜야 합니다.
+
+    동시에 아무 값이나 받으면 오픈 리다이렉트가 됩니다. 로컬호스트와 명시적으로
+    설정한 공개 오리진만 허용하고, 그 밖은 기본값으로 대체합니다.
+    """
+    from urllib.parse import urlparse
+
+    default = FRONTEND_ORIGIN
+    candidate = (candidate or "").strip().rstrip("/")
+    if not candidate:
+        return default
+
+    allowed_public = credentials.get("ATHENA_PUBLIC_ORIGIN", "").strip().rstrip("/")
+    if allowed_public and candidate == allowed_public:
+        return candidate
+
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return default
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return default
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+        return candidate
+    return default
+
+
+def _safe_next_path(candidate: str) -> str:
+    """로그인 후 돌아갈 경로. `//evil.com` 같은 프로토콜 상대 URL 은 거부합니다."""
+    candidate = (candidate or "").strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    return candidate
+
+
+def _google_status() -> dict:
+    """구글 로그인을 지금 쓸 수 있는지 — 클라이언트 설정과 Mongo 둘 다 필요합니다."""
+    google = google_oauth.status()
+    if not google["configured"]:
+        return google
+    mongo = accounts.status()
+    if not mongo["configured"]:
+        return {"configured": False, "reason": mongo["reason"]}
+    return {"configured": True, "reason": "", "redirect_uri": google_oauth.redirect_uri()}
+
+
+@app.get("/api/auth/google/config")
+def auth_google_config():
+    """로그인 화면이 구글 버튼을 그릴지 판단하는 근거.
+
+    설정이 없으면 버튼을 아예 그리지 않습니다 — 눌러도 안 되는 버튼을 보여주는
+    것보다 없는 게 낫습니다. 아이디/비번 로그인은 이 값과 무관하게 동작합니다.
+    """
+    return _google_status()
+
+
+@app.get("/api/auth/google/start")
+def auth_google_start(request: Request, next: str = "/", origin: str = ""):
+    """구글 동의 화면 URL 을 만들어 돌려줍니다 (이동은 브라우저가 합니다).
+
+    origin 을 쿼리로 받는 이유: 이 요청은 브라우저가 아니라 **Next 서버**가
+    프록시로 대신 보냅니다. 그래서 Origin·Referer 헤더가 여기까지 오지 않습니다.
+    프론트엔드가 window.location.origin 을 직접 실어 보내야 합니다.
+    """
+    state_info = _google_status()
+    if not state_info["configured"]:
+        return JSONResponse(status_code=503,
+                            content={"error": state_info["reason"]})
+
+    verifier, challenge = google_oauth.new_pkce()
+    state = secrets.token_urlsafe(24)
+    nonce = secrets.token_urlsafe(16)
+
+    try:
+        accounts.save_oauth_state(
+            state, verifier,
+            redirect_origin=_safe_frontend_origin(origin),
+            next_path=_safe_next_path(next),
+            nonce=nonce,
+        )
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+    return {"auth_url": google_oauth.build_authorize_url(state, challenge, nonce)}
+
+
+def _google_callback_redirect(origin: str, params: dict):
+    from urllib.parse import urlencode
+
+    return RedirectResponse(f"{origin}/auth/callback?{urlencode(params)}", status_code=302)
+
+
+@app.get("/api/auth/google/callback")
+def auth_google_callback(request: Request, code: str = "", state: str = "",
+                         error: str = ""):
+    """구글이 브라우저를 되돌려 보내는 자리.
+
+    이 화면은 사용자가 직접 보게 되므로, 실패해도 JSON 을 띄우지 않고 프론트엔드의
+    /auth/callback 으로 사유를 실어 보냅니다. 성공하면 세션 토큰 대신 **60초·1회용
+    핸드오프 코드**를 넘깁니다 — 30일짜리 토큰이 URL·브라우저 히스토리·서버 로그에
+    남지 않게 하기 위한 것입니다 (ACCOUNTS.md 3-3).
+    """
+    origin = FRONTEND_ORIGIN
+
+    if error:
+        # 사용자가 동의 화면에서 취소한 경우가 대부분입니다
+        return _google_callback_redirect(origin, {"error": error})
+
+    if not code or not state:
+        return _google_callback_redirect(origin, {"error": "missing_code"})
+
+    try:
+        saved = accounts.consume_oauth_state(state)
+    except accounts.AccountsUnavailable as exc:
+        return _google_callback_redirect(origin, {"error": "mongo_unavailable",
+                                                  "message": str(exc)})
+
+    if not saved:
+        # state 가 없다 = 만료됐거나 이미 쓰였거나 우리가 시작한 요청이 아님
+        return _google_callback_redirect(origin, {"error": "bad_state"})
+
+    origin = _safe_frontend_origin(saved.get("redirect_origin", ""))
+    next_path = _safe_next_path(saved.get("next", "/"))
+
+    try:
+        profile = google_oauth.fetch_identity(
+            code, saved["code_verifier"], nonce=saved.get("nonce", ""))
+        result = accounts.upsert_google_account(profile)
+    except google_oauth.GoogleAuthError as exc:
+        return _google_callback_redirect(origin, {"error": exc.code, "message": str(exc)})
+    except accounts.AccountsUnavailable as exc:
+        return _google_callback_redirect(origin, {"error": "mongo_unavailable",
+                                                  "message": str(exc)})
+
+    user = result["user"]
+    # 기존 로그인 경로와 같게 — 계정마다 모의투자 계좌를 자동 개설합니다
+    paper.ensure_account(user["id"])
+
+    try:
+        token = accounts.create_session(
+            user["id"], user_agent=request.headers.get("user-agent", ""))
+        handoff = accounts.create_handoff(token)
+    except accounts.AccountsUnavailable as exc:
+        return _google_callback_redirect(origin, {"error": "mongo_unavailable",
+                                                  "message": str(exc)})
+
+    return _google_callback_redirect(origin, {"handoff": handoff, "next": next_path})
+
+
+class GoogleExchange(BaseModel):
+    handoff: str
+
+
+@app.post("/api/auth/google/exchange")
+def auth_google_exchange(req: GoogleExchange):
+    """핸드오프 코드를 세션 토큰으로 바꿔줍니다 (1회용).
+
+    같은 코드로 두 번 오면 두 번째는 실패합니다 — Mongo 의 find_one_and_delete 로
+    원자적으로 소비하기 때문입니다.
+    """
+    try:
+        token = accounts.consume_handoff(req.handoff)
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+    if not token:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "로그인 인계 코드가 만료되었거나 이미 사용됐습니다. "
+                              "다시 로그인해 주세요."})
+
+    user = accounts.user_from_token(token)
+    if not user:
+        return JSONResponse(status_code=400, content={"error": "세션을 찾을 수 없습니다."})
+
+    return {"token": token, "user": user}
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +694,8 @@ def predict(query: str, request: Request):
         "news_sample": [
             {"title": n.title, "sentiment": n.sentiment_score, "source": n.source,
              "url": n.url, "keywords": n.matched_keywords,
-             "published_at": n.published_at.isoformat()}
+             "published_at": n.published_at.isoformat(),
+             "badge": "블룸버그 정보" if "SAVE" in n.source else None}
             for n in news_items[:8]
         ],
         "community": {
@@ -910,6 +1126,60 @@ def community_feed(query: str):
     }
 
 
+# 세이브(SAVE) 피드는 티커와 무관한 시장 전체 피드라 사용자·종목 구분 없이
+# 카테고리별로 캐시합니다. 대시보드 폴링이 세이브 서버를 두드리지 않게 하는 목적.
+_save_feed_cache: dict[str, tuple[float, list]] = {}
+_SAVE_FEED_TTL = 120.0
+
+SAVE_CATEGORIES = {
+    "top": "오늘 주요뉴스", "breaking": "속보", "reuters": "로이터",
+    "news": "뉴스", "report": "리포트",
+}
+
+
+@app.get("/api/save/feed")
+def save_feed(category: str = "top", limit: int = 20):
+    """세이브(SAVE) 글로벌 피드 — 아테나 시그널 분석 화면 전용 (자동매매 미사용)."""
+    if category not in SAVE_CATEGORIES:
+        return JSONResponse(
+            {"error": f"category 는 {', '.join(SAVE_CATEGORIES)} 중 하나여야 합니다"},
+            status_code=400)
+    hit = _save_feed_cache.get(category)
+    if hit and time.time() - hit[0] < _SAVE_FEED_TTL:
+        items = hit[1]
+    else:
+        items = oceansave_crawler.feed_payload(category, limit=max(limit, 20))
+        if items or not hit:      # 일시 실패 시 직전 캐시를 유지
+            _save_feed_cache[category] = (time.time(), items)
+        else:
+            items = hit[1]
+    return {
+        "category": category,
+        "label": SAVE_CATEGORIES[category],
+        "generated_at": datetime.now().isoformat(),
+        "requires_login": category == "report" and not items,
+        "items": items[:limit],
+    }
+
+
+@app.get("/api/save/report/{report_id}/pdf")
+def save_report_pdf(report_id: str):
+    """리포트 PDF 원본을 세이브에서 받아 그대로 전달.
+
+    브라우저에는 세이브 로그인 세션이 없을 수 있으므로(대시보드는 localhost),
+    서버가 저장된 쿠키로 받아서 중계합니다.
+    """
+    fetched = oceansave_crawler.fetch_report_pdf(report_id)
+    if fetched is None:
+        return JSONResponse(
+            {"error": "리포트 PDF를 받지 못했습니다. 세이브 로그인 쿠키"
+                      "(SAVETICKER_COOKIE)가 없거나 만료되었을 수 있습니다."},
+            status_code=502)
+    content, filename = fetched
+    return Response(content=content, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{filename}"'})
+
+
 @app.get("/api/news/{query}")
 def news_feed(query: str, limit: int = 20):
     try:
@@ -926,7 +1196,8 @@ def news_feed(query: str, limit: int = 20):
         "items": [
             {"title": n.title, "source": n.source, "sentiment": n.sentiment_score,
              "keywords": n.matched_keywords, "url": n.url,
-             "published_at": n.published_at.isoformat()}
+             "published_at": n.published_at.isoformat(),
+             "badge": "블룸버그 정보" if "SAVE" in n.source else None}
             for n in items
         ],
     }
@@ -1438,6 +1709,19 @@ class BacktestRequest(BaseModel):
     falsify: int = 0
 
 
+class PortfolioBacktestRequest(BaseModel):
+    """여러 종목을 한 포트폴리오로 백테스트합니다 (슬리브 모델).
+
+    `weights` 를 비우면 동일가중입니다. 비중 최적화는 표본 안에서 거의 항상
+    이기고 표본 밖에서 거의 항상 지므로, 기본값을 동일가중으로 둡니다.
+    """
+    queries: list[str]
+    days: int = 250
+    config: dict | None = None
+    initial_cash: float = 10_000_000
+    weights: dict | None = None
+
+
 def _account_identity(mode: str) -> dict:
     """이 화면의 숫자가 **어느 계좌의 돈인지**를 명시합니다.
 
@@ -1464,14 +1748,20 @@ def _account_identity(mode: str) -> dict:
 # 서버가 옛 코드면 스스로 "재시작하세요"를 띄우게 합니다.
 # 콘솔이 쓰는 엔드포인트를 추가/변경할 때마다 1씩 올리세요 (autotrade.html 의
 # REQUIRED_API 와 짝).
-CONSOLE_API_VERSION = 6
+CONSOLE_API_VERSION = 7
 
 
 # 포지션·계좌 블록 캐시 — 스냅샷의 유일하게 비싼 부분입니다 (시세·잔고 실호출).
 # 화면 폴링(7초)마다 새로 조회하면 보유 종목 수만큼 네트워크가 나가고,
 # 탭을 여러 개 열면 그 배수가 됩니다. 주문이 나가면 즉시 무효화합니다.
+#
+# TTL 이 폴링 주기(7초)보다 길어야 합니다. 실계좌 재구축은 KIS 호출이 묶여
+# 수 초가 걸리는데(실측 ~10초), TTL 8초 시절에는 사실상 **모든 폴링이 콜드**
+# 였고, 잠금이 없어 재구축이 겹쳐 돌면서 KIS 호출 간격 규칙(throttle)을 서로
+# 기다렸습니다 — "불러오기가 느리다"의 두 번째 원인이었습니다.
 _snap_cache: dict[tuple, tuple[float, dict]] = {}
-_SNAP_TTL = 8.0
+_snap_build_lock = threading.Lock()
+_SNAP_TTL = 20.0
 
 
 def _invalidate_snapshot(user_id: int):
@@ -1480,13 +1770,25 @@ def _invalidate_snapshot(user_id: int):
 
 
 def _positions_block(user_id: int, mode: str, cfg: dict) -> dict:
-    """계좌·포지션 조회 (8초 캐시). 실패도 형태를 갖춰 돌려줍니다."""
+    """계좌·포지션 조회 (20초 캐시 · 동시 재구축 방지). 실패도 형태를 갖춰 돌려줍니다."""
     key = (user_id, mode)
     now = time.time()
     hit = _snap_cache.get(key)
     if hit and now - hit[0] < _SNAP_TTL:
         return hit[1]
 
+    # 재구축은 한 번에 하나만. 탭 두 개가 동시에 폴링해도 뒤에 온 쪽은
+    # 앞선 재구축이 채운 캐시를 그대로 받아 갑니다 (single-flight).
+    with _snap_build_lock:
+        now = time.time()
+        hit = _snap_cache.get(key)
+        if hit and now - hit[0] < _SNAP_TTL:
+            return hit[1]
+        return _build_positions_block(key, user_id, mode, cfg)
+
+
+def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> dict:
+    now = time.time()
     block: dict = {}
     try:
         brk = broker.get_broker(user_id, mode, cfg)
@@ -2099,6 +2401,140 @@ def autotrade_backtest(req: BacktestRequest, request: Request):
     return result
 
 
+@app.post("/api/autotrade/portfolio")
+def autotrade_portfolio(req: PortfolioBacktestRequest, request: Request):
+    """여러 종목을 **합쳐서** 백테스트합니다 — 분산 효과는 합쳐야만 보입니다.
+
+    종목별로 따로 돌려 수익률을 나열하는 것과 다릅니다. `diversification.ratio`
+    가 1에 가까우면 그 유니버스는 사실상 한 종목이고, 종목 수를 늘려도 위험이
+    줄지 않습니다.
+
+    시행 장부에는 포트폴리오 전체가 1건으로 올라갑니다 (종목마다 세면 DSR 의
+    N 이 부풀어 문턱이 엉뚱하게 높아집니다).
+    """
+    user = require_user(request)
+    cfg = {**at_store.get_config(user["id"]), **(req.config or {})}
+    queries = [q for q in (req.queries or []) if str(q).strip()][:20]
+    result = autotrade.simulate_portfolio(
+        queries, cfg, days=max(60, min(req.days, 1000)),
+        initial_cash=req.initial_cash, weights=req.weights)
+    if not result.get("ok"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.get("/api/autotrade/position/{symbol}")
+def autotrade_position_detail(symbol: str, request: Request, days: int = 90):
+    """보유 포지션 한 종목의 상세 — 슬라이드 화면 한 장에 필요한 전부.
+
+    돌려주는 것
+        position   보유 정보 + 엔진이 기억하는 손절·목표·진입시각
+        chart      일봉 캔들 + 이동평균·볼린저 (build_chart_series 와 같은 공식)
+        fills      이 종목에서 실제 체결된 매수/매도 — 차트 봉 인덱스에 매핑
+        signal     지금 신호를 다시 계산한 결과. stages 에 점수가 만들어진
+                   순서(일봉→분봉→앙상블→뉴스→최종)가 담깁니다 — 화면은 이걸
+                   재현하지 않고 **그대로 그립니다** (재현하면 엔진과 어긋납니다).
+
+    매수/매도 마커는 체결 기록(fills_for)에서만 찍습니다. 접수만 된 주문을
+    찍으면 "여기서 샀다"가 거짓말이 됩니다.
+    """
+    user = require_user(request)
+    cfg = at_store.get_config(user["id"])
+    mode = cfg.get("mode", "paper")
+    code = str(symbol).strip()
+    days = max(min(int(days or 90), 365), 20)
+
+    try:
+        inst = instruments.resolve(code)
+    except SymbolNotFoundError as exc:
+        return _not_found(exc)
+
+    # 보유 정보 — 스냅샷과 같은 8초 캐시를 태웁니다 (같은 잔고를 두 번 조회 금지)
+    block = _positions_block(user["id"], mode, cfg)
+    position = next((p for p in (block.get("positions") or [])
+                     if p.get("key") == code), None)
+    state = (block.get("position_states") or {}).get(code) or {}
+
+    # 일봉은 **한 번만** 받아 차트·신호·지표표가 나눠 씁니다. 개수가 다르면
+    # 캐시 키가 갈려 같은 종목 일봉을 두 번 받는데(미국 주식 실측 +2초),
+    # 봉 개수가 다르면 국면 판정까지 갈립니다. 260은 신호(ML 워밍업) 요건입니다.
+    frame = feed.bars(inst, "day", count=max(days + 80, 260))
+    chart = indicators.build_chart_series(frame, days=days, timeframe="day")
+
+    # --- 체결 기록을 봉 인덱스에 붙입니다 ---
+    # 일봉 차트라 날짜로 맞춥니다. 주말 체결(미국 야간 등)은 다음 봉에 붙입니다 —
+    # 마커가 사라지는 것보다 하루 어긋나는 것이 낫고, 어긋남은 시각으로 확인됩니다.
+    bar_dates = [t[:10] for t in (chart.get("timestamps") or [])]
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    fills = at_store.fills_for(user["id"], mode, code, since=since)
+    for fill in fills:
+        day_key = str(fill.get("at") or "")[:10]
+        idx = None
+        if bar_dates:
+            if day_key in bar_dates:
+                idx = bar_dates.index(day_key)
+            else:
+                later = [i for i, d in enumerate(bar_dates) if d >= day_key]
+                idx = later[0] if later else len(bar_dates) - 1
+        fill["bar_index"] = idx
+
+    # 지금 신호 — 엔진 회전과 같은 함수를, **같은 일봉을 주입해서** 부릅니다.
+    # 실패해도 화면은 떠야 하므로(차트·체결은 신호 없이도 의미가 있습니다)
+    # 오류만 담아 계속 갑니다.
+    signal = None
+    try:
+        sig = strategy.evaluate(inst, cfg, bars_daily=frame)
+        signal = sig.to_dict()
+    except Exception as exc:
+        signal = {"ok": False, "error": f"신호 계산 실패: {exc}", "stages": []}
+
+    # 일봉 지표 상세 — 어떤 지표가 점수를 끌었는지 (기여도 순).
+    # 신호와 같은 frame 을 씁니다. 봉 개수가 다르면 국면 판정이 갈려, 위 신호는
+    # "방향성 불분명"인데 이 표는 "추세 국면"이라고 말하는 화면이 됩니다
+    # (실측으로 확인한 어긋남입니다).
+    indicator_rows = []
+    try:
+        analysis = indicators.analyze(frame)
+        indicator_rows = [
+            {"key": i.key, "label": i.label, "value_text": i.value_text,
+             "score": i.score, "weight": i.weight, "verdict": i.verdict,
+             "contribution": i.contribution, "family": i.family,
+             "reason": i.reason}
+            for i in analysis.indicators]
+        regime = analysis.regime or {}
+    except Exception:
+        regime = {}
+
+    return {
+        "symbol": code,
+        "name": (position or {}).get("name") or inst.name,
+        "market": inst.market,
+        "asset_label": (position or {}).get("asset_label") or inst.asset_class,
+        "holding": position is not None,
+        "position": position,
+        "state": {
+            "entry_price": state.get("entry_price"),
+            "stop_price": state.get("stop_price"),
+            "target_price": state.get("target_price"),
+            "peak_price": state.get("peak_price"),
+            "opened_at": state.get("opened_at"),
+            "strategy": state.get("strategy"),
+        },
+        "chart": chart,
+        "fills": fills,
+        "signal": signal,
+        "indicators": indicator_rows,
+        "regime": {
+            "label": regime.get("label", ""),
+            "trend_score": regime.get("trend_score"),
+            "strategy": regime.get("strategy", ""),
+            "evidence": regime.get("evidence") or [],
+        },
+        "weights_note": "지표 → 국면 가중 → 결합 → 오버레이 → 최종 점수 순서는 "
+                        "signal.stages 에 그대로 담겨 있습니다.",
+    }
+
+
 @app.get("/api/autotrade/instrument/{query}")
 def autotrade_instrument(query: str, request: Request):
     """유니버스에 넣기 전 종목 확인 — 자산군·승수·증거금·호가단위를 보여줍니다."""
@@ -2254,6 +2690,14 @@ def serve_paper():
 @app.get("/login", include_in_schema=False)
 def serve_login():
     return _frontend_response("/login")
+
+
+@app.get("/auth/callback", include_in_schema=False)
+def serve_auth_callback(request: Request):
+    # 구글 콜백은 프론트 오리진으로 바로 보내므로 보통 여기 오지 않습니다.
+    # 다만 오리진 검증이 기본값으로 대체되는 경우가 있어 막다른 길을 막아둡니다.
+    query = request.url.query
+    return _frontend_response(f"/auth/callback{'?' + query if query else ''}")
 
 
 # 구버전 단일 페이지 — 프론트엔드를 못 켰을 때의 비상용으로만 남겨둡니다.

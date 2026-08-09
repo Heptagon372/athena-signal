@@ -1022,15 +1022,21 @@ def touch_daily(user_id: int, mode: str, total_value: float,
 
 
 def record_daily_trade(user_id: int, mode: str, realized_pnl: float = 0.0,
-                       trade_date: str = None):
+                       trade_date: str = None, count: int = 1):
+    """오늘의 실현손익을 누적합니다.
+
+    count=0 은 **부분 체결**용입니다. 손익은 체결된 만큼 그때그때 더해야 하지만
+    (안 더하면 손실 한도가 늦게 걸립니다), 매매 건수는 그 매매가 끝났을 때 한 번만
+    세야 합니다. 부분 체결 3회를 3건으로 세면 승률과 평균손익이 통째로 어긋납니다.
+    """
     init()
     trade_date = trade_date or date.today().isoformat()
     with _conn() as conn:
         conn.execute(
             "UPDATE at_daily SET realized_pnl = realized_pnl + ?, "
-            "trade_count = trade_count + 1 "
+            "trade_count = trade_count + ? "
             "WHERE user_id = ? AND mode = ? AND trade_date = ?",
-            (float(realized_pnl or 0), user_id, mode, trade_date))
+            (float(realized_pnl or 0), int(count), user_id, mode, trade_date))
 
 
 def get_daily_history(user_id: int, limit: int = 30, mode: str = None) -> list[dict]:

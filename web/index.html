@@ -662,6 +662,15 @@
   .feed-title{ font-size:12.3px; line-height:1.42; }
   .feed-meta{ font-family:'IBM Plex Mono',monospace; font-size:10px; color: var(--muted); margin-top:3px; }
   .sentiment-chip{ font-family:'IBM Plex Mono',monospace; font-size:10px; padding:1px 5px; border-radius:3px; margin-left:5px;}
+  .terminal-chip{ font-family:'IBM Plex Mono',monospace; font-size:10px; padding:1px 6px; border-radius:3px;
+    margin-right:5px; color:var(--gold); border:1px solid var(--gold); background:rgba(201,162,39,0.10); white-space:nowrap;}
+  .save-tabs{ display:flex; gap:6px; margin-bottom:9px; flex-wrap:wrap; }
+  .save-tab{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; padding:3px 9px; border-radius:12px;
+    border:1px solid var(--hairline); background:transparent; color:var(--muted); cursor:pointer; }
+  .save-tab:hover{ border-color:var(--gold); color:var(--gold); }
+  .save-tab.active{ border-color:var(--gold); color:var(--gold); background:rgba(201,162,39,0.10); }
+  .label-chip{ font-family:'IBM Plex Mono',monospace; font-size:9.5px; padding:0 5px; border-radius:3px;
+    margin-left:4px; color:var(--muted); border:1px solid var(--hairline); white-space:nowrap; }
 
   /* ---------- Watchlist / stats ---------- */
   .watch-grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(215px,1fr)); gap:14px; }
@@ -980,6 +989,20 @@
     <div class="rc-grid">
       <div><div class="rationale-list" id="rationale-list"></div></div>
       <div>
+        <div class="feed-block">
+          <div class="live-feed-head">
+            <span class="eyebrow" style="margin:0;"><span class="live-dot"></span>세이브(SAVE) 글로벌</span>
+            <span class="mono" style="font-size:10.5px; color:var(--muted);" id="save-updated"></span>
+          </div>
+          <div class="save-tabs" id="save-tabs">
+            <button class="save-tab active" data-cat="top">주요뉴스</button>
+            <button class="save-tab" data-cat="breaking">속보</button>
+            <button class="save-tab" data-cat="reuters">로이터</button>
+            <button class="save-tab" data-cat="news">뉴스</button>
+            <button class="save-tab" data-cat="report">리포트</button>
+          </div>
+          <div class="feed-list" id="save-list"></div>
+        </div>
         <div class="feed-block">
           <div class="live-feed-head">
             <span class="eyebrow" style="margin:0;">한국 뉴스</span>
@@ -1882,7 +1905,7 @@ function renderRationale(items){
     <div class="rationale-item">
       <span class="rationale-tag ${it.source_type}">${tagName[it.source_type]||it.source_type}</span>
       <div style="flex:1; min-width:0">
-        <div class="rationale-text">${text}</div>
+        <div class="rationale-text">${it.badge ? `<span class="terminal-chip">${esc(it.badge)}</span>` : ""}${text}</div>
         ${it.source_name ? `<div class="rationale-source">${esc(it.source_name)}</div>` : ""}
       </div>
       <span class="rationale-influence" style="color:${color}">${it.influence>=0?"+":""}${it.influence}</span>
@@ -1906,13 +1929,68 @@ function renderNews(data){
     <div class="feed-item">
       <div class="feed-stance ${stance}"></div>
       <div class="feed-body">
-        <div class="feed-title">${n.url ? `<a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a>` : esc(n.title)}
+        <div class="feed-title">${n.badge ? `<span class="terminal-chip">${esc(n.badge)}</span>` : ""}${n.url ? `<a href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a>` : esc(n.title)}
           <span class="sentiment-chip" style="background:${color}22; color:${color}">${n.sentiment>=0?"+":""}${n.sentiment.toFixed(2)}</span>
         </div>
         <div class="feed-meta">${esc(n.source)}${kw} · ${new Date(n.published_at).toLocaleString("ko-KR",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}</div>
       </div>
     </div>`;
   }).join("");
+}
+
+/* ---------------- 세이브(SAVE) 글로벌 피드 ---------------- */
+let saveCategory = "top";
+let saveTimer = null;
+const SAVE_REFRESH_MS = 120000;   // 서버 캐시 TTL 과 동일 — 더 자주 불러도 같은 값
+
+async function loadSaveFeed(){
+  const list = $("save-list");
+  try{
+    const data = await apiGet(`/save/feed?category=${saveCategory}&limit=20`);
+    $("save-updated").textContent = new Date(data.generated_at).toLocaleTimeString("ko-KR");
+    if(data.requires_login){
+      list.innerHTML = `<div class="empty">리포트는 세이브 로그인이 필요합니다 — 구독 계정의 세션 쿠키를 SAVETICKER_COOKIE 환경변수에 넣으면 표시됩니다.</div>`;
+      return;
+    }
+    const items = data.items || [];
+    if(items.length === 0){ list.innerHTML = `<div class="empty">수집된 항목이 없습니다.</div>`; return; }
+    list.innerHTML = items.map(n => {
+      const stance = n.sentiment > 0.1 ? "bullish" : n.sentiment < -0.1 ? "bearish" : "neutral";
+      const color = stance === "bullish" ? "var(--up)" : stance === "bearish" ? "var(--down)" : "var(--muted)";
+      const labels = (n.labels||[]).slice(0,2).map(l => `<span class="label-chip">${esc(l)}</span>`).join("");
+      const tickers = (n.tickers||[]).slice(0,3).map(t => `<span class="label-chip" style="color:var(--gold)">${esc(t)}</span>`).join("");
+      // 리포트 PDF 는 우리 서버가 중계하므로 상대경로로 내려옵니다
+      const href = n.url && n.url.startsWith("/api/")
+        ? API_BASE.replace(/\/api$/, "") + n.url : n.url;
+      return `
+      <div class="feed-item">
+        <div class="feed-stance ${stance}"></div>
+        <div class="feed-body">
+          <div class="feed-title"><span class="terminal-chip">${esc(n.badge||"블룸버그 정보")}</span>${href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(n.title)}</a>` : esc(n.title)}
+            <span class="sentiment-chip" style="background:${color}22; color:${color}">${n.sentiment>=0?"+":""}${n.sentiment.toFixed(2)}</span>
+          </div>
+          <div class="feed-meta">${esc(n.source)}${labels}${tickers} · ${new Date(n.published_at).toLocaleString("ko-KR",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})}</div>
+        </div>
+      </div>`;
+    }).join("");
+  }catch(e){
+    list.innerHTML = `<div class="empty">세이브 피드를 불러오지 못했습니다.</div>`;
+  }
+}
+
+function initSaveFeed(){
+  document.querySelectorAll("#save-tabs .save-tab").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#save-tabs .save-tab").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      saveCategory = btn.dataset.cat;
+      $("save-list").innerHTML = `<div class="empty">불러오는 중…</div>`;
+      loadSaveFeed();
+    });
+  });
+  loadSaveFeed();
+  if(saveTimer) clearInterval(saveTimer);
+  saveTimer = setInterval(loadSaveFeed, SAVE_REFRESH_MS);
 }
 
 function renderCommunityFeed(feed){
@@ -2616,6 +2694,7 @@ async function renderServiceStatus(){
 (async function init(){
   initTheme();
   renderServiceStatus();
+  initSaveFeed();
 
   // 주소에 #성적표/#모의투자가 있으면 그 탭으로 시작
   const hash = (location.hash || "").replace("#", "");

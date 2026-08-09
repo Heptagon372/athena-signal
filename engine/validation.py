@@ -311,6 +311,77 @@ HEALTH_NORMAL, HEALTH_CAUTION, HEALTH_SUSPEND = "normal", "caution", "suspend"
 HEALTH_LABELS = {HEALTH_NORMAL: "정상", HEALTH_CAUTION: "주의", HEALTH_SUSPEND: "중단"}
 
 
+def audit_vol_scaling(positions, realized_vol) -> dict:
+    """★ 변동성 스케일링이 **두 번** 적용되고 있는가.
+
+    이 시스템에서 가장 교활한 버그입니다.
+
+    국면 탐지기가 이미 고변동성 구간의 비중을 낮추고, **동시에** 사이징 계층이
+    `σ_target/σ̂_t` 를 적용하면 변동성으로 두 번 나누는 셈입니다. 결과는
+    위기 구간에서 극단적으로 언더리스크된 시스템이고, 그래서
+    **2008·2020 이 들어간 백테스트에서 환상적으로 보입니다.**
+    백테스트 샤프를 제조하는 고전적인 방법입니다.
+
+    진단은 간단합니다. log|포지션| 을 log(실현변동성) 에 회귀합니다.
+
+        기울기 ≈ −1  단일 스케일링 (정상)
+        기울기 ≈ −2  이중 스케일링 (버그)
+        기울기 ≈  0  스케일링 없음
+
+    **이 저장소에서 확인할 곳**: `engine/ensemble.py` 의 `volatility_factor()` +
+    `scale_barriers()` 조합이 이미 변동성으로 포지션을 줄이고 있습니다.
+    거기에 별도의 변동성 타게팅을 얹으면 정확히 이 버그가 됩니다.
+    실제 체결 기록으로 이 함수를 돌려 확인하세요.
+
+    Parameters
+    ----------
+    positions : 각 시점의 **실현 포지션 크기** (절댓값을 씁니다). 목표 비중이
+        아니라 실제로 들고 있던 크기여야 합니다 — 한도·반올림·체결실패가
+        중간에 개입하므로 의도와 실현이 다릅니다.
+    realized_vol : 같은 시점의 실현 변동성.
+    """
+    p = _clean(np.abs(np.asarray(positions, dtype=float)))
+    v = _clean(np.asarray(realized_vol, dtype=float))
+    n = min(len(p), len(v))
+    if n < 30:
+        return {"slope": None, "n": n,
+                "reason": "표본 30개 미만 — 회귀가 무의미합니다."}
+
+    p, v = p[:n], v[:n]
+    ok = (p > 1e-12) & (v > 1e-12)
+    if int(ok.sum()) < 30:
+        return {"slope": None, "n": int(ok.sum()),
+                "reason": "0이 아닌 포지션·변동성 쌍이 30개 미만입니다."}
+
+    x = np.log(v[ok])
+    y = np.log(p[ok])
+    sxx = float(np.sum((x - x.mean()) ** 2))
+    if sxx <= 1e-12:
+        return {"slope": None, "reason": "실현변동성의 분산이 없습니다."}
+
+    slope = float(np.sum((x - x.mean()) * (y - y.mean())) / sxx)
+    resid = y - (slope * x + (y.mean() - slope * x.mean()))
+    se = math.sqrt(float(np.sum(resid ** 2)) / max(len(x) - 2, 1) / sxx)
+
+    if slope < -1.4:
+        state, reason = "double_scaling", (
+            f"⚠ 이중 스케일링 의심 (기울기 {slope:.2f}). 국면 계층과 사이징 계층이 "
+            f"둘 다 변동성으로 나누고 있는지 확인하세요.")
+    elif slope > -0.5:
+        state, reason = "no_scaling", (
+            f"변동성 스케일링이 거의 없습니다 (기울기 {slope:.2f}).")
+    else:
+        state, reason = "single_scaling", (
+            f"정상 — 단일 변동성 스케일링 (기울기 {slope:.2f}).")
+
+    return {
+        "slope": round(slope, 3), "se": round(se, 3),
+        "n": int(ok.sum()), "state": state, "reason": reason,
+        # CI 게이트: 기울기 < −1.4 이면 실패
+        "passed": bool(slope >= -1.4),
+    }
+
+
 def health_from_tstat(values, min_obs: int = 20,
                       t_caution: float = -1.0, t_suspend: float = -2.0) -> dict:
     """최근 실적이 통계적으로 유의하게 나쁜가.

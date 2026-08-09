@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from config import INDICATOR_WEIGHTS, MIN_BARS_FOR_TECHNICAL
-from engine import quant
+from engine import econophysics, quant
 from models import IndicatorResult, TechnicalAnalysis
 
 # 지표를 성격별로 묶습니다. 국면(regime)에 따라 어느 군을 더 믿을지 달라집니다.
@@ -859,6 +859,16 @@ def detect_regime(df: pd.DataFrame) -> dict:
         · Hurst 지수 (Anis-Lloyd 보정) — 시계열이 지속적인가 반지속적인가
         · ADX — 방향성 추세의 강도가 있는가
 
+    참고용으로만 함께 계산하는 것 (**trend_score 에는 넣지 않습니다**)
+        · DFA α (Peng 1994, 2차, 경험적 귀무보정)
+        · Lo(1991) 수정 R/S — 단기 자기상관을 뺀 장기기억
+
+        왜 점수에 안 넣는가: 백테스트에서 DFA 를 신호에 결합했을 때 홀드아웃
+        액티브샤프 변화가 KR +0.011 / US +0.004 로 **사실상 0** 이었습니다
+        (288개 설정 전체 평균, AUTOTRADE.md 16장). 효과 없는 항을 점수에 넣으면
+        자유도만 늘어납니다. 다만 두 통계량은 위 세 재료가 놓치는 것을 잡아내므로
+        **근거 표시용**으로 남깁니다 — 특히 Hurst 와 어긋날 때가 정보입니다.
+
     결과
         trend_score  -1(강한 평균회귀) ~ +1(강한 추세)
         multipliers  지표군별 가중치 배수
@@ -900,6 +910,32 @@ def detect_regime(df: pd.DataFrame) -> dict:
     if hl and hl.get("half_life"):
         evidence.append(f"평균회귀 반감기 {hl['half_life']:.1f}봉")
 
+    # --- 참고 통계량 (점수에 미반영) -------------------------------------
+    log_ret = np.diff(np.log(close[close > 0])) if len(close) > 2 else np.array([])
+    dfa_res = econophysics.dfa(log_ret) if len(log_ret) >= 64 else None
+    if dfa_res:
+        t_cal = dfa_res.get("t_calibrated")
+        verdict = ("지속성" if (t_cal or 0) > 2 else
+                   "반지속성" if (t_cal or 0) < -2 else "판정 보류")
+        evidence.append(
+            f"DFA α={dfa_res['alpha']:.3f} (보정 t={t_cal:+.2f}, {verdict})"
+            if t_cal is not None else f"DFA α={dfa_res['alpha']:.3f}")
+
+    mrs = econophysics.modified_rs(log_ret) if len(log_ret) >= 64 else None
+    if mrs:
+        evidence.append(
+            f"수정 R/S V={mrs['v_stat']:.3f} ("
+            + {"long_memory": "장기기억 있음", "anti_memory": "반지속 장기기억",
+               "short_memory_only": "단기의존성으로 설명됨"}[mrs["verdict"]] + ")")
+
+    # Hurst 와 DFA 가 어긋나면 그 자체가 정보입니다 — 둘 중 하나는 추세에 오염된 것
+    if hurst and dfa_res:
+        gap = abs(hurst["hurst"] - dfa_res["alpha"])
+        if gap > 0.15:
+            evidence.append(
+                f"⚠ Hurst({hurst['hurst']:.2f})와 DFA({dfa_res['alpha']:.2f})가 "
+                f"{gap:.2f} 어긋남 — 추세 오염 가능. 국면 판정을 약하게 믿으세요")
+
     trend_score = float(np.mean(score_parts)) if score_parts else 0.0
 
     if trend_score >= 0.25:
@@ -927,6 +963,9 @@ def detect_regime(df: pd.DataFrame) -> dict:
         "hurst": hurst,
         "adx": adx_value,
         "half_life": hl,
+        # 참고 통계량 — 표시용이며 trend_score 에 반영되지 않습니다
+        "dfa": dfa_res,
+        "modified_rs": mrs,
     }
 
 

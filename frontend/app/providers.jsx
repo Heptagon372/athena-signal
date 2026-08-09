@@ -132,6 +132,33 @@ export function Providers({ children }) {
     return data.user;
   }, []);
 
+  /**
+   * 구글 로그인 시작 — 동의 화면으로 **페이지 전체를 이동**시킵니다.
+   *
+   * 팝업이나 iframe 을 쓰지 않는 이유: 파이어폭스는 Total Cookie Protection 이
+   * 기본값이라 서드파티 쿠키를 격리합니다. 구글 One Tap 류는 파폭에서 조용히
+   * 실패합니다. 전체 페이지 이동은 그 문제를 아예 만들지 않습니다.
+   *
+   * origin 을 직접 실어 보내는 이유: 이 요청은 브라우저가 아니라 Next 서버가
+   * 프록시로 대신 보내므로 Origin·Referer 헤더가 백엔드까지 가지 않습니다.
+   * 127.0.0.1 로 들어온 사람을 localhost 로 되돌리면 localStorage 가 오리진별이라
+   * 토큰이 딴 곳에 저장돼 로그인이 풀립니다.
+   */
+  const loginWithGoogle = useCallback(async (next = "/") => {
+    const query = new URLSearchParams({ next, origin: window.location.origin });
+    const data = await api.get(`/auth/google/start?${query}`, { timeout: 15000 });
+    if (!data?.auth_url) throw new Error("구글 로그인 주소를 받지 못했습니다.");
+    window.location.href = data.auth_url;
+  }, []);
+
+  /** 콜백 페이지에서 호출 — 1회용 핸드오프 코드를 세션 토큰으로 교환합니다. */
+  const completeGoogleLogin = useCallback(async (handoff) => {
+    const data = await api.post("/auth/google/exchange", { handoff });
+    setToken(data.token);
+    setUser(data.user);
+    return data.user;
+  }, []);
+
   const logout = useCallback(async () => {
     try { await api.post("/auth/logout"); } catch {}
     clearToken();
@@ -141,7 +168,9 @@ export function Providers({ children }) {
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       <SymbolContext.Provider value={{ symbol, setSymbol, symbolReady }}>
-        <AuthContext.Provider value={{ user, ready, login, register, logout }}>
+        <AuthContext.Provider
+          value={{ user, ready, login, register, logout,
+                   loginWithGoogle, completeGoogleLogin }}>
           {children}
         </AuthContext.Provider>
       </SymbolContext.Provider>

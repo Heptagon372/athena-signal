@@ -5,6 +5,80 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>자동매매 — 아테나 시그널</title>
 <link rel="stylesheet" href="/static/at_common.css">
+<style>
+/* ---- 포지션 상세 슬라이드 (오른쪽에서 왼쪽으로) ---- */
+#posTable tbody tr.clickable{cursor:pointer}
+#posTable tbody tr.clickable:hover td{background:rgba(201,162,39,.05)}
+
+#slideOverlay{position:fixed;inset:0;z-index:55;background:rgba(15,12,8,.6);
+  backdrop-filter:blur(2px);opacity:0;pointer-events:none;transition:opacity .25s}
+#slideOverlay.open{opacity:1;pointer-events:auto}
+#slidePanel{position:fixed;top:0;right:0;bottom:0;z-index:56;width:min(980px,100vw);
+  background:var(--bg);border-left:1px solid var(--line);box-shadow:-18px 0 48px rgba(0,0,0,.5);
+  transform:translateX(102%);transition:transform .28s cubic-bezier(.3,.8,.3,1);
+  display:flex;flex-direction:column}
+#slidePanel.open{transform:translateX(0)}
+.slide-head{display:flex;align-items:center;gap:10px;padding:12px 18px;
+  border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+.slide-head .idx{font-family:Consolas,monospace;color:var(--gold);font-size:15px;white-space:nowrap}
+.slide-head .nm{font-size:16px;font-weight:600}
+.slide-head .cd{color:var(--muted);font-family:Consolas,monospace;font-size:12px}
+.slide-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:16px 18px;display:grid;gap:14px;
+  align-content:start}
+/* 안의 내용이 통째로 오른쪽에서 미끄러져 들어옵니다 (다음/이전 넘길 때) */
+.slide-body.fly-next{animation:fly-next .3s cubic-bezier(.25,.8,.3,1)}
+.slide-body.fly-prev{animation:fly-prev .3s cubic-bezier(.25,.8,.3,1)}
+@keyframes fly-next{from{transform:translateX(56px);opacity:.15}to{transform:none;opacity:1}}
+@keyframes fly-prev{from{transform:translateX(-56px);opacity:.15}to{transform:none;opacity:1}}
+
+.slide-stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:8px}
+.slide-stat .box{background:var(--raised);border:1px solid var(--line);border-radius:var(--radius);
+  padding:8px 10px}
+.slide-stat .k{font-size:10.5px;color:var(--muted)}
+.slide-stat .v{font-size:14.5px;font-family:Consolas,monospace;margin-top:1px}
+
+#slideChartWrap{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px 12px}
+#slideChart{width:100%;display:block}
+.chart-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:6px}
+.chart-legend b{font-weight:500}
+.lg{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px}
+
+/* AI 계산 파이프라인 — 점수가 만들어진 순서를 화살표로 */
+.pipe{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:4px 0}
+.pipe .st{min-width:118px;flex:1;background:var(--raised);border:1px solid var(--line);
+  border-radius:var(--radius);padding:8px 10px;position:relative}
+.pipe .st .lb{font-size:10.5px;color:var(--muted)}
+.pipe .st .vl{font-size:16px;font-family:Consolas,monospace;margin:1px 0}
+.pipe .st .dt{font-size:10px;color:var(--muted);line-height:1.5}
+.pipe .arrow{align-self:center;color:var(--gold);padding:0 6px;font-size:15px;flex:0 0 auto}
+.pipe .st.final{border-color:var(--gold);background:rgba(201,162,39,.07)}
+
+/* 점수 게이지 (-1 ~ +1, 진입 임계값 표시) */
+.gauge{position:relative;height:34px;margin:8px 2px 2px}
+.gauge .track{position:absolute;top:14px;left:0;right:0;height:6px;border-radius:3px;
+  background:linear-gradient(90deg,var(--down),#3a3226 45%,#3a3226 55%,var(--up))}
+.gauge .tick{position:absolute;top:8px;width:1.5px;height:18px;background:var(--muted);opacity:.6}
+.gauge .tick.thr{background:var(--gold);opacity:1}
+.gauge .needle{position:absolute;top:2px;width:3px;height:30px;border-radius:2px;background:var(--text);
+  box-shadow:0 0 8px rgba(236,227,208,.5)}
+.gauge .lab{position:absolute;top:-14px;transform:translateX(-50%);font-size:10px;color:var(--gold);
+  white-space:nowrap}
+
+/* 지표 기여도 바 (0 을 가운데로 ±) */
+.contrib{display:grid;gap:4px}
+.contrib .row2{display:grid;grid-template-columns:150px 1fr 76px;gap:8px;align-items:center;font-size:11.5px}
+.contrib .bar{position:relative;height:13px;background:#14110d;border-radius:3px;overflow:hidden}
+.contrib .bar i{position:absolute;top:1.5px;bottom:1.5px;border-radius:2px}
+.contrib .bar .mid{position:absolute;top:0;bottom:0;left:50%;width:1px;background:var(--line)}
+.contrib .val{font-family:Consolas,monospace;text-align:right}
+.contrib .nm2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.slide-note{font-size:11.5px;color:var(--muted);line-height:1.7}
+.slide-sec h3{font-size:12px;margin:0 0 8px;color:var(--gold);letter-spacing:.06em;font-weight:600}
+.slide-sec{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
+@media(max-width:640px){.contrib .row2{grid-template-columns:96px 1fr 64px}}
+</style>
 </head>
 <body>
 <main>
@@ -15,10 +89,11 @@
 
   <div class="grid side">
     <section>
-      <h2>보유 포지션 <span class="sub">자동 손절·익절이 걸려 있습니다</span></h2>
+      <h2>보유 포지션 <span class="sub">자동 손절·익절이 걸려 있습니다 · 행을 누르면 상세 슬라이드</span>
+        <button id="btnSlides" class="sm" style="margin-left:auto">1번부터 차례로 보기 ▶</button></h2>
       <div class="scroll-x"><table id="posTable">
         <thead><tr>
-          <th>종목</th><th>구분</th><th class="num">수량</th><th class="num">진입가</th>
+          <th>#</th><th>종목</th><th>구분</th><th class="num">수량</th><th class="num">진입가</th>
           <th class="num">현재가</th><th class="num">평가손익</th><th class="num">손절</th>
           <th class="num">목표</th><th></th>
         </tr></thead><tbody></tbody>
@@ -153,6 +228,23 @@
   </section>
 </main>
 
+<!-- 포지션 상세 슬라이드 — 오른쪽에서 왼쪽으로 넘어가며 1번부터 차례로 봅니다 -->
+<div id="slideOverlay"></div>
+<aside id="slidePanel" aria-hidden="true">
+  <div class="slide-head">
+    <button id="slPrev" class="sm">◀ 이전</button>
+    <span class="idx" id="slIdx">— / —</span>
+    <button id="slNext" class="sm">다음 ▶</button>
+    <span class="nm" id="slName"></span><span class="cd" id="slCode"></span>
+    <span class="pill" id="slTag"></span>
+    <div style="flex:1"></div>
+    <button id="slClose" class="sm">닫기 ✕</button>
+  </div>
+  <div class="slide-body" id="slBody">
+    <div class="center">불러오는 중…</div>
+  </div>
+</aside>
+
 <script>
 window.PAGE = {
   nav: "main",
@@ -167,6 +259,8 @@ window.PAGE = {
     A.$("btnSave").onclick = () => this.saveConfig();
     A.$("btnReload").onclick = () => { this._dirty = false; this.hint(); A.refresh(); };
     A.$("btnDiagnose").onclick = () => this.diagnose();
+    A.$("btnSlides").onclick = () => SLIDES.open(0);
+    SLIDES.init();
     [...this.FIELDS, ...this.BOOLS].forEach((k) => {
       const el = A.$("cfg_" + k);
       if (el) el.onchange = () => { this._dirty = true; this.hint(); };
@@ -214,10 +308,18 @@ window.PAGE = {
     // 기준이라 입출금과 무관합니다 — storage/autotrade.touch_daily 참고.
     const dayPnl = day.pnl != null ? day.pnl : null;
     const dayPct = day.pnl_pct != null ? day.pnl_pct : null;
+    // 미결제 매수대금은 결제일까지 예수금에 남아 있습니다. 이 줄을 안 보여주면
+    // "예수금 13만원인데 주문가능이 3천원"이 화면 오류로 보입니다 — 오류가 아니라
+    // 그 차액이 이미 산 주식값입니다.
+    const settle = [];
+    if (acc.unsettled_buy) settle.push(["미결제 매수", A.won(acc.unsettled_buy), ""]);
+    if (acc.unsettled_sell) settle.push(["미결제 매도", A.won(acc.unsettled_sell), ""]);
+
     A.$("accStat").innerHTML = [
       ["총자산", A.won(acc.total_value), ""],
       ["총예수금", A.won(acc.cash), ""],
       ["주문가능 현금", A.won(acc.available_cash), ""],
+      ...settle,
       ["매입금액", A.won(acc.purchase_amount), ""],
       ["평가금액", A.won(acc.equity_value), ""],
       ["평가손익", acc.unrealized_pnl == null ? "—"
@@ -230,21 +332,27 @@ window.PAGE = {
       ["누적 손익", A.won(snap.summary?.cumulative_pnl), A.sign(snap.summary?.cumulative_pnl)],
       ["└ 실현", A.won(snap.summary?.realized_pnl), A.sign(snap.summary?.realized_pnl)],
     ].map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("");
+    // 잔고 출처를 적어 둡니다. 증권사 앱과 숫자가 다를 때 "우리가 다시 계산한
+    // 값"인지 "증권사가 준 값"인지부터 알아야 어디를 볼지 정해집니다.
     A.$("accSub").textContent = `${snap.identity?.label || ""} 기준 · 주문 ${snap.summary?.orders ?? 0}건 · `
-      + `청산 ${snap.summary?.closed_trades ?? 0}건 · 승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`;
+      + `청산 ${snap.summary?.closed_trades ?? 0}건 · 승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`
+      + (acc.account_source ? ` · 잔고 출처 ${acc.account_source}` : "");
 
     // 포지션
     const positions = snap.positions || [];
     const states = snap.position_states || {};
+    SLIDES.setPositions(positions);
+    A.$("btnSlides").classList.toggle("hide", positions.length === 0);
     A.$("posEmpty").classList.toggle("hide", positions.length > 0);
     A.$("posTable").classList.toggle("hide", positions.length === 0);
-    A.$("posTable").querySelector("tbody").innerHTML = positions.map((p) => {
+    A.$("posTable").querySelector("tbody").innerHTML = positions.map((p, i) => {
       const s = states[p.key] || {};
       const off = p.managed === false;
       // 초단타가 잡은 포지션은 청산 규칙이 다릅니다(틱·초). 같은 표에 섞여
       // 있으면서 표시가 없으면, 왜 이 종목만 3분 만에 팔렸는지 알 수 없습니다.
       const scalp = s.strategy === "scalp";
-      return `<tr class="${off ? "pos-unmanaged" : ""}">
+      return `<tr class="clickable ${off ? "pos-unmanaged" : ""}" data-slide="${i}">
+        <td class="muted mono">${i + 1}</td>
         <td>${A.esc(p.name)}${off ? '<span class="tag-unmanaged">관리 안 함</span>' : ""}
             ${scalp ? '<span class="tag-unmanaged">페니 초단타</span>' : ""}
             <div class="muted mono" style="font-size:11px">${p.key}</div></td>
@@ -259,7 +367,9 @@ window.PAGE = {
       </tr>`;
     }).join("");
     document.querySelectorAll("[data-close]").forEach((b) =>
-      b.onclick = () => this.closePosition(b.dataset.close));
+      b.onclick = (e) => { e.stopPropagation(); this.closePosition(b.dataset.close); });
+    document.querySelectorAll("[data-slide]").forEach((tr) =>
+      tr.onclick = () => SLIDES.open(Number(tr.dataset.slide)));
 
     // 체결 대기
     const open = snap.open_orders || [];
@@ -392,6 +502,345 @@ window.PAGE = {
           <b class="${r.ok ? "up" : "muted"}">${r.ok ? "자동매매를 붙일 수 있습니다" : "위 항목을 먼저 해결하세요"}</b></div>`;
     } catch (e) { A.$("diagBox").innerHTML = `<div class="note up">${A.esc(e.message)}</div>`; }
     finally { A.$("btnDiagnose").disabled = false; }
+  },
+};
+
+/* ==========================================================================
+   포지션 상세 슬라이드
+   --------------------------------------------------------------------------
+   보유 종목을 1번부터 차례로 넘겨 봅니다 (오른쪽 → 왼쪽).
+   한 장에: 보유 정보 · 일봉 차트(매수/매도 지점, 손절·목표선) · AI 계산 과정.
+
+   AI 계산 과정은 여기서 **재현하지 않습니다** — 서버 신호(signal.stages)가
+   실제로 거친 단계를 그대로 그립니다. 화면이 따로 계산하면 반드시 엔진과
+   어긋나고, 어긋난 화면은 없느니만 못합니다.
+   ========================================================================== */
+const SLIDES = {
+  _positions: [],
+  _idx: -1,
+  _cache: {},          // symbol -> 상세 응답 (슬라이드를 오가도 다시 안 부름)
+  _open: false,
+
+  setPositions(list) { this._positions = list || []; },
+
+  init() {
+    const A = AT;
+    A.$("slClose").onclick = () => this.close();
+    A.$("slideOverlay").onclick = () => this.close();
+    A.$("slPrev").onclick = () => this.move(-1);
+    A.$("slNext").onclick = () => this.move(1);
+    document.addEventListener("keydown", (e) => {
+      if (!this._open) return;
+      if (e.key === "Escape") this.close();
+      else if (e.key === "ArrowRight") this.move(1);
+      else if (e.key === "ArrowLeft") this.move(-1);
+    });
+    // 패널이 열린 채 창 크기가 바뀌면 캔버스만 다시 그립니다
+    window.addEventListener("resize", () => {
+      if (this._open && this._last) this.drawChart(this._last);
+    });
+  },
+
+  open(idx) {
+    if (!this._positions.length) return AT.toast("보유 중인 포지션이 없습니다.", true);
+    this._idx = Math.max(0, Math.min(idx, this._positions.length - 1));
+    this._open = true;
+    AT.$("slideOverlay").classList.add("open");
+    AT.$("slidePanel").classList.add("open");
+    this.load("none");
+  },
+
+  close() {
+    this._open = false;
+    AT.$("slideOverlay").classList.remove("open");
+    AT.$("slidePanel").classList.remove("open");
+  },
+
+  move(step) {
+    const next = this._idx + step;
+    if (next < 0 || next >= this._positions.length) return;
+    this._idx = next;
+    this.load(step > 0 ? "next" : "prev");
+  },
+
+  async load(dir) {
+    const A = AT, pos = this._positions[this._idx];
+    A.$("slIdx").textContent = `${this._idx + 1} / ${this._positions.length}`;
+    A.$("slPrev").disabled = this._idx === 0;
+    A.$("slNext").disabled = this._idx === this._positions.length - 1;
+    A.$("slName").textContent = pos.name || pos.key;
+    A.$("slCode").textContent = pos.key;
+    A.$("slTag").textContent = pos.asset_label || "";
+
+    const body = A.$("slBody");
+    // 넘김 방향대로 내용이 미끄러져 들어오게 애니메이션 클래스를 다시 겁니다
+    body.classList.remove("fly-next", "fly-prev");
+    if (!this._cache[pos.key]) body.innerHTML = '<div class="center">차트와 AI 계산 과정을 불러오는 중…</div>';
+
+    // 60초 캐시 — 슬라이드를 오갈 때마다 다시 부르지 않되, 오래 열어둔 화면이
+    // 옛 체결·옛 신호를 계속 보여주지는 않게 합니다
+    const hit = this._cache[pos.key];
+    let d = hit && Date.now() - hit.at < 60_000 ? hit.data : null;
+    if (!d) {
+      try { d = await A.call(`/autotrade/position/${encodeURIComponent(pos.key)}?days=90`); }
+      catch (e) { body.innerHTML = `<div class="center up">${A.esc(e.message)}</div>`; return; }
+      this._cache[pos.key] = {at: Date.now(), data: d};
+    }
+    if (this._positions[this._idx]?.key !== pos.key) return;   // 로딩 중 다른 장으로 넘어감
+
+    this._last = d;
+    this.render(d, pos);
+    void body.offsetWidth;               // 애니메이션 재시작 트릭
+    if (dir === "next") body.classList.add("fly-next");
+    else if (dir === "prev") body.classList.add("fly-prev");
+  },
+
+  render(d, pos) {
+    const A = AT, st = d.state || {}, sig = d.signal || {};
+    const opened = (st.opened_at || pos.opened_at || "").replace("T", " ").slice(0, 16);
+    const pnlPct = pos.avg_price && pos.current_price
+      ? ((pos.current_price - pos.avg_price) / pos.avg_price * 100 * (pos.side === "short" ? -1 : 1)) : null;
+
+    const stats = [
+      ["수량", A.num(pos.quantity, 4)],
+      ["진입가(평단)", A.num(pos.avg_price)],
+      ["현재가", A.num(pos.current_price)],
+      ["평가손익", `<span class="${A.sign(pos.unrealized_pnl)}">${A.won(pos.unrealized_pnl)}`
+        + (pnlPct == null ? "" : ` (${A.pct(pnlPct)})`) + "</span>"],
+      ["손절선", st.stop_price ? A.num(st.stop_price) : "—"],
+      ["목표가", st.target_price ? A.num(st.target_price) : "—"],
+      ["진입 시각", opened || "—"],
+    ];
+
+    AT.$("slBody").innerHTML = `
+      <div class="slide-stat">${stats.map(([k, v]) =>
+        `<div class="box"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}</div>
+
+      <div id="slideChartWrap">
+        <div class="chart-legend">
+          <span><i class="lg" style="background:var(--up)"></i>▲ 매수 체결</span>
+          <span><i class="lg" style="background:var(--down)"></i>▼ 매도 체결</span>
+          <span><i class="lg" style="background:var(--gold)"></i>진입가</span>
+          <span><i class="lg" style="background:#d24b3a;opacity:.7"></i>손절선</span>
+          <span><i class="lg" style="background:var(--olive)"></i>목표가</span>
+          <span class="muted">MA20 · MA60 · 볼린저밴드 — 최근 90일</span>
+        </div>
+        <canvas id="slideChart" height="360"></canvas>
+        <div class="slide-note" id="slFillNote"></div>
+      </div>
+
+      <div class="slide-sec">
+        <h3>AI 계산 과정 — 점수가 만들어진 순서</h3>
+        ${this.pipeHTML(sig)}
+        ${this.gaugeHTML(sig)}
+        <div class="slide-note" style="margin-top:6px">${A.esc((sig.reasons || []).join(" · "))}</div>
+      </div>
+
+      <div class="slide-sec">
+        <h3>지표별 기여도 — 무엇이 점수를 끌었나 <span class="sub" style="text-transform:none">
+          ${A.esc(d.regime?.label || "")} ${d.regime?.trend_score != null ? `(추세점수 ${Number(d.regime.trend_score) >= 0 ? "+" : ""}${Number(d.regime.trend_score).toFixed(2)})` : ""}</span></h3>
+        ${this.contribHTML(d.indicators || [])}
+        <div class="slide-note" style="margin-top:8px">${A.esc(d.regime?.strategy || "")}</div>
+        <div class="slide-note">${(d.regime?.evidence || []).map((e) => "· " + A.esc(e)).join("<br>")}</div>
+      </div>`;
+
+    this.drawChart(d);
+  },
+
+  /* ---- AI 파이프라인 (서버 stages 그대로) ---- */
+  pipeHTML(sig) {
+    const A = AT;
+    const stages = sig.stages || [];
+    if (!stages.length) {
+      return `<div class="slide-note">${A.esc(sig.error || "신호 계산 결과가 없습니다.")}</div>`;
+    }
+    const fmt = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + Number(v).toFixed(2);
+    return `<div class="pipe">` + stages.map((s, i) => `
+      ${i > 0 ? '<span class="arrow">→</span>' : ""}
+      <div class="st ${s.key === "final" ? "final" : ""}">
+        <div class="lb">${A.esc(s.label)}</div>
+        <div class="vl ${A.sign(s.value)}">${fmt(s.value)}</div>
+        <div class="dt">${A.esc(s.detail || "")}</div>
+      </div>`).join("") + `</div>`;
+  },
+
+  /* ---- 점수 게이지 (-1 ~ +1, 진입 임계값 표시) ---- */
+  gaugeHTML(sig) {
+    if (sig.score == null) return "";
+    const cfg = AT.SNAP?.config || {};
+    const thr = Number(cfg.entry_score ?? 0.35);
+    const pct = (v) => ((Math.max(-1, Math.min(1, v)) + 1) / 2 * 100).toFixed(1) + "%";
+    const dirLabel = sig.direction === "long" ? "매수 신호"
+      : sig.direction === "short" ? "매도(숏) 신호" : "관망";
+    return `<div class="gauge">
+      <div class="track"></div>
+      <div class="tick" style="left:50%"></div>
+      <div class="tick thr" style="left:${pct(thr)}"></div>
+      <div class="tick thr" style="left:${pct(-thr)}"></div>
+      <div class="needle" style="left:${pct(sig.score)}"></div>
+      <div class="lab" style="left:${pct(sig.score)}">${Number(sig.score).toFixed(2)} · ${dirLabel}</div>
+    </div>
+    <div class="slide-note" style="display:flex;justify-content:space-between">
+      <span>-1 (강한 매도)</span><span>진입 임계값 ±${thr}</span><span>+1 (강한 매수)</span>
+    </div>`;
+  },
+
+  /* ---- 지표 기여도 바 ---- */
+  contribHTML(rows) {
+    const A = AT;
+    const top = rows.filter((r) => r.weight > 0).slice(0, 8);
+    if (!top.length) return '<div class="slide-note">지표 데이터가 없습니다.</div>';
+    const maxC = Math.max(...top.map((r) => Math.abs(r.contribution || 0)), 1e-9);
+    return `<div class="contrib">` + top.map((r) => {
+      const c = r.contribution || 0;
+      const w = Math.abs(c) / maxC * 48;          // 최대 절반 폭
+      const left = c >= 0 ? 50 : 50 - w;
+      const color = c > 0 ? "var(--up)" : c < 0 ? "var(--down)" : "var(--line)";
+      return `<div class="row2">
+        <span class="nm2" title="${A.esc(r.reason || "")}">${A.esc(r.label)}
+          <span class="muted" style="font-size:10px">${A.esc(r.value_text || "")}</span></span>
+        <span class="bar"><span class="mid"></span>
+          <i style="left:${left}%;width:${w}%;background:${color}"></i></span>
+        <span class="val ${A.sign(c)}">${(c >= 0 ? "+" : "") + c.toFixed(3)}</span>
+      </div>`;
+    }).join("") + `</div>`;
+  },
+
+  /* ---- 일봉 캔들 차트 (캔버스) ---- */
+  drawChart(d) {
+    const A = AT, cv = document.getElementById("slideChart");
+    if (!cv) return;
+    const ch = d.chart || {};
+    const closes = ch.close || [];
+    const noteEl = document.getElementById("slFillNote");
+    if (!closes.length) {
+      const g = cv.getContext("2d");
+      g.clearRect(0, 0, cv.width, cv.height);
+      if (noteEl) noteEl.textContent = ch.note || "차트 데이터를 받지 못했습니다.";
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth || cv.parentElement.clientWidth - 24;
+    const H = 360;
+    cv.width = W * dpr; cv.height = H * dpr;
+    cv.style.height = H + "px";
+    const g = cv.getContext("2d");
+    g.scale(dpr, dpr);
+    g.clearRect(0, 0, W, H);
+
+    const st = d.state || {}, pos = d.position || {};
+    const pad = {l: 8, r: 62, t: 8, b: 22};
+    const n = closes.length;
+
+    // y 범위 — 봉뿐 아니라 손절·목표·진입선도 화면 안에 들어와야 합니다
+    const extra = [st.stop_price, st.target_price, st.entry_price || pos.avg_price]
+      .filter((v) => v != null && v > 0).map(Number);
+    let lo = Math.min(...(ch.low || closes).filter((v) => v != null), ...extra);
+    let hi = Math.max(...(ch.high || closes).filter((v) => v != null), ...extra);
+    const span = (hi - lo) || hi * 0.02 || 1;
+    lo -= span * 0.06; hi += span * 0.06;
+
+    const x = (i) => pad.l + (i + 0.5) * (W - pad.l - pad.r) / n;
+    const y = (v) => pad.t + (hi - v) / (hi - lo) * (H - pad.t - pad.b);
+    const cw = Math.max(1.5, Math.min(9, (W - pad.l - pad.r) / n * 0.62));
+
+    // 가격 눈금 (오른쪽)
+    g.font = "10px Consolas, monospace";
+    g.textAlign = "left"; g.textBaseline = "middle";
+    const steps = 5;
+    for (let i = 0; i <= steps; i++) {
+      const v = lo + (hi - lo) * i / steps;
+      g.strokeStyle = "rgba(58,50,38,.45)"; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(W - pad.r, y(v)); g.stroke();
+      g.fillStyle = "#9c8f73";
+      g.fillText(Number(v).toLocaleString("ko-KR", {maximumFractionDigits: v < 10 ? 2 : 0}),
+                 W - pad.r + 6, y(v));
+    }
+    // 날짜 눈금 (아래, 4~5개만)
+    g.textAlign = "center"; g.textBaseline = "top";
+    const dates = ch.dates || [];
+    for (let i = 0; i < n; i += Math.max(1, Math.floor(n / 4))) {
+      g.fillStyle = "#9c8f73";
+      g.fillText((dates[i] || "").slice(5), x(i), H - pad.b + 6);
+    }
+
+    // 볼린저밴드 (은은한 면)
+    const bu = ch.bb_upper || [], bl = ch.bb_lower || [];
+    g.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) if (bu[i] != null) {
+      started ? g.lineTo(x(i), y(bu[i])) : g.moveTo(x(i), y(bu[i])); started = true;
+    }
+    for (let i = n - 1; i >= 0; i--) if (bl[i] != null) g.lineTo(x(i), y(bl[i]));
+    g.closePath();
+    g.fillStyle = "rgba(201,162,39,.05)"; g.fill();
+
+    // 이동평균
+    const line = (arr, color, width) => {
+      g.strokeStyle = color; g.lineWidth = width; g.beginPath();
+      let on = false;
+      for (let i = 0; i < n; i++) {
+        if (arr[i] == null) { on = false; continue; }
+        on ? g.lineTo(x(i), y(arr[i])) : g.moveTo(x(i), y(arr[i])); on = true;
+      }
+      g.stroke();
+    };
+    line(ch.ma20 || [], "rgba(201,162,39,.75)", 1.2);
+    line(ch.ma60 || [], "rgba(63,127,208,.75)", 1.2);
+
+    // 캔들 (한국 관례: 상승 빨강 · 하락 파랑)
+    for (let i = 0; i < n; i++) {
+      const o = ch.open?.[i], c = closes[i], h = ch.high?.[i], l = ch.low?.[i];
+      if (o == null || c == null) continue;
+      const up = c >= o;
+      g.strokeStyle = g.fillStyle = up ? "#d24b3a" : "#3f7fd0";
+      g.lineWidth = 1;
+      if (h != null && l != null) {
+        g.beginPath(); g.moveTo(x(i), y(h)); g.lineTo(x(i), y(l)); g.stroke();
+      }
+      const top = y(Math.max(o, c)), bh = Math.max(1, Math.abs(y(o) - y(c)));
+      g.fillRect(x(i) - cw / 2, top, cw, bh);
+    }
+
+    // 진입가·손절·목표 수평선
+    const hline = (v, color, label, dash) => {
+      if (v == null || !(v > 0)) return;
+      g.strokeStyle = color; g.lineWidth = 1.2; g.setLineDash(dash || [5, 4]);
+      g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(W - pad.r, y(v)); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = color; g.font = "10px Consolas, monospace";
+      g.textAlign = "right"; g.textBaseline = "bottom";
+      g.fillText(label + " " + Number(v).toLocaleString("ko-KR", {maximumFractionDigits: 2}),
+                 W - pad.r - 4, y(v) - 2);
+    };
+    hline(st.entry_price || pos.avg_price, "#c9a227", "진입", [2, 3]);
+    hline(st.stop_price, "#d24b3a", "손절");
+    hline(st.target_price, "#74815b", "목표");
+
+    // 매수/매도 체결 마커 — 서버가 체결 기록으로 확인한 지점만 찍습니다
+    const fills = (d.fills || []).filter((f) => f.bar_index != null);
+    const tri = (cx, cy, up2, color) => {
+      g.fillStyle = color; g.beginPath();
+      if (up2) { g.moveTo(cx, cy - 6); g.lineTo(cx - 5.5, cy + 4); g.lineTo(cx + 5.5, cy + 4); }
+      else { g.moveTo(cx, cy + 6); g.lineTo(cx - 5.5, cy - 4); g.lineTo(cx + 5.5, cy - 4); }
+      g.closePath(); g.fill();
+      g.strokeStyle = "rgba(25,21,16,.9)"; g.lineWidth = 1; g.stroke();
+    };
+    fills.forEach((f) => {
+      const i = f.bar_index;
+      const isBuy = f.action === "buy" || f.action === "open_long";
+      const base = isBuy ? (ch.low?.[i] ?? closes[i]) : (ch.high?.[i] ?? closes[i]);
+      tri(x(i), y(base) + (isBuy ? 12 : -12), isBuy, isBuy ? "#d24b3a" : "#3f7fd0");
+    });
+
+    if (noteEl) {
+      const buys = fills.filter((f) => f.action === "buy" || f.action === "open_long").length;
+      const sells = fills.length - buys;
+      noteEl.textContent = fills.length
+        ? `최근 90일 체결 ${fills.length}건 (매수 ${buys} · 매도 ${sells}) — 실제 체결 기록만 표시합니다.`
+        : "최근 90일 안에 이 계좌의 체결 기록이 없습니다. 진입가 선은 증권사 평단 기준입니다.";
+    }
   },
 };
 </script>

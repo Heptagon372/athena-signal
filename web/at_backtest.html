@@ -78,6 +78,7 @@ window.PAGE = {
         body: {query: q, days: Number(A.$("btDays").value) || 250, falsify}});
       A.$("btResult").innerHTML = `
         ${this.verdict(r)}
+        ${this.rejectBox(r.rejections)}
         <div class="stat">
           ${[["초과수익 (핵심)", A.pct(r.excess_return_pct), A.sign(r.excess_return_pct)],
              ["총수익률", A.pct(r.total_return_pct), A.sign(r.total_return_pct)],
@@ -91,6 +92,7 @@ window.PAGE = {
              ["최종 평가금", A.won(r.final_equity), ""]]
             .map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("")}
         </div>
+        ${this.gatesBox(r.gates)}
         ${this.falsifyBox(r.falsification)}
         <div class="scroll-x" style="max-height:240px;margin-top:10px"><table>
           <thead><tr><th>진입</th><th>청산</th><th>방향</th><th class="num">손익</th><th>사유</th></tr></thead>
@@ -100,7 +102,8 @@ window.PAGE = {
             <td class="num ${A.sign(t.pnl)}">${A.won(t.pnl)}</td>
             <td class="muted">${A.esc(t.reason)}</td></tr>`).join("")
             || '<tr><td colspan="5" class="center">체결된 매매가 없습니다 (임계값을 낮춰보세요).</td></tr>'}
-          </tbody></table></div>`;
+          </tbody></table></div>
+        ${this.executionNote(r.execution)}`;
     } catch (e) { A.$("btResult").innerHTML = `<div class="note up">${A.esc(e.message)}</div>`; }
     finally { A.$("btnBacktest").disabled = false; }
   },
@@ -116,6 +119,64 @@ window.PAGE = {
            매매가 실제로 무언가를 보탰습니다.`
         : `<b>그냥 사서 들고 있는 편이 ${Math.abs(r.excess_return_pct).toFixed(2)}%p 나았습니다.</b>
            이 설정은 수수료를 내며 시장을 따라갔습니다 — 총수익률이 양수여도 마찬가지입니다.`}
+    </div>`;
+  },
+
+  // 체결되지 못하고 사라진 신호 — 성과 숫자보다 먼저 봐야 합니다.
+  //
+  // 거부를 안 보여주면 "매매를 적게 하는 신중한 설정" 처럼 보입니다. 실제로는
+  // 낼 수 없었던 주문이 조용히 빠진 것이고, 남은 매매만으로 만든 성과입니다.
+  rejectBox(rej) {
+    if (!rej || !rej.total) return "";
+    const rows = Object.entries(rej.by_reason || {})
+      .map(([, v]) => `${AT.esc(v.label)} ${v.count}건`).join(" · ");
+    return `<div class="warnbox" style="margin-bottom:10px;border-color:var(--up);color:#f0917f">
+      <b>신호 ${rej.total}건이 체결되지 못했습니다.</b>
+      아래 성과는 이 주문들을 뺀 나머지로 만든 것입니다.
+      <div class="note" style="margin-top:4px">${rows}</div>
+    </div>`;
+  },
+
+  // 어떤 체결 가정에서 나온 숫자인가 — 모형이 바뀌면 성과도 바뀝니다.
+  executionNote(ex) {
+    if (!ex) return "";
+    return `<div class="note" style="margin-top:8px">
+      체결 모형 — ${AT.esc(ex.note || "")}
+      갭으로 손절선을 관통하면 손절값이 아니라 시가에 체결하고, 구간 끝에 남은
+      포지션도 정산해 매매 통계에 포함합니다. 슬리피지 ${ex.slippage_bps}bp.
+    </div>`;
+  },
+
+  // 과최적화 검증 하네스 — 계산은 진작 되고 있었는데 화면에 안 나왔습니다.
+  //
+  // 총수익률·샤프만 보고 판단하지 않게 만드는 것이 목적입니다. 판정을 먼저
+  // 쓰고 근거 숫자를 뒤에 놓습니다 (숫자를 먼저 보면 판정을 안 읽습니다).
+  gatesBox(g) {
+    if (!g) return "";
+    if (!g.ok) return `<div class="note" style="margin-top:10px">${AT.esc(g.reason || "")}</div>`;
+    const pass = String(g.verdict || "").startsWith("게이트 통과");
+    const num = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
+    const c = g.cpcv || {}, o = g.overfit || {}, l = g.lottery || {}, dsr = g.dsr || {};
+    const rows = [
+      ["CPCV 최악 경로 샤프", c.sharpe_worst == null ? "—"
+        : `${num(c.sharpe_worst)} (양수 경로 ${c.share_positive == null ? "—"
+          : (c.share_positive * 100).toFixed(0) + "%"})`],
+      ["무작위 매매 대비", l.percentile == null ? "—"
+        : `${num(l.percentile, 1)} 백분위`],
+      ["요구 t통계", o.required_tstat == null ? "—"
+        : `${num(o.t_stat)} / ${num(o.required_tstat)} 필요`],
+      ["시행 수 (DSR 보정)", g.registry?.effective_n == null ? "—"
+        : `${g.registry.effective_n}회${dsr.dsr == null ? "" : ` · DSR ${num(dsr.dsr)}`}`],
+      ["데이터 길이", o.have_years == null ? "—"
+        : `${num(o.have_years)}년 / 최소 ${num(o.min_backtest_years)}년`],
+    ];
+    return `<div class="warnbox" style="margin-top:10px;${pass
+        ? "border-color:var(--olive);color:#b6c496" : "border-color:var(--up);color:#f0917f"}">
+      <b>${pass ? "과최적화 게이트 통과" : "과최적화 게이트 경고"}</b>
+      <div style="margin-top:4px">${AT.esc(g.verdict || "")}</div>
+      <div class="note" style="margin-top:6px">
+        ${rows.map(([k, v]) => `${AT.esc(k)} <b>${AT.esc(String(v))}</b>`).join(" · ")}
+      </div>
     </div>`;
   },
 

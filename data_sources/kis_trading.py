@@ -53,6 +53,9 @@ TR_CANDIDATES = {
     "stock_balance_mock": ["VTTC8434R"],
     "stock_buyable_real": ["TTTC8908R"],
     "stock_buyable_mock": ["VTTC8908R"],
+    # 계좌 요약 — 증권사 앱 '총자산' 화면이 쓰는 TR 입니다.
+    # 모의투자에는 없으므로(V- 코드 없음) 실전에서만 호출합니다.
+    "account_assets_real": ["CTRP6548R"],
     # 체결 조회 — 실계좌 매매의 핵심입니다. '주문 접수'와 '체결'은 다른 사건이라,
     # 접수만 보고 포지션을 잡았다고 착각하면 계좌와 내부 상태가 어긋납니다.
     "stock_executions_real": ["TTTC8001R", "CTSC9115R"],
@@ -75,6 +78,9 @@ TR_CANDIDATES = {
     "overseas_sell_mock": ["VTTT1001U"],
     "overseas_balance_real": ["TTTS3012R"],
     "overseas_balance_mock": ["VTTS3012R"],
+    # 체결기준 현재잔고 — 원화 환산·미결제·출금가능을 증권사 계산으로 받습니다
+    "overseas_present_real": ["CTRP6504R"],
+    "overseas_present_mock": ["VTRP6504R"],
     "overseas_buyable_real": ["TTTS3007R"],
     "overseas_buyable_mock": ["VTTS3007R"],
     "overseas_executions_real": ["TTTS3035R"],
@@ -91,9 +97,16 @@ _tr_lock = threading.Lock()
 # 잔고 조회 캐시 — 화면(7초 폴링)과 엔진(회전당 2~4회)이 같은 잔고를 반복 조회합니다.
 # KIS 는 초당 호출 한도가 있어서, 캐시 없이는 잔고 조회만으로 한도를 다 씁니다.
 # 주문을 내면 잔고가 바뀌므로 그때는 즉시 비웁니다.
+#
+# TTL 이 20초인 이유: 계좌 화면 한 번을 다 그리는 데 KIS 호출이 ~10초 걸립니다
+# (실측 2026-08-07 — 해외잔고 3회 5.8초 포함 합계 10.4초). TTL 이 그보다 짧으면
+# **한 번의 갱신이 끝나기도 전에 캐시가 만료**되어, 같은 화면 안에서 같은 잔고를
+# 두 번씩 조회합니다 (positions() 10.5초 뒤 account() 가 또 11.8초 — 실측).
+# 잔고는 주문·체결 때만 바뀌고 주문 경로는 clear_balance_cache() 로 즉시 비우므로,
+# 20초 묵은 값이 화면에 남는 위험은 사실상 없습니다.
 _balance_cache: dict[str, tuple[float, dict]] = {}
 _balance_lock = threading.Lock()
-BALANCE_TTL = 5.0
+BALANCE_TTL = 20.0
 
 
 def _balance_cached(key: str, fetch) -> dict:
@@ -121,6 +134,7 @@ OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
 DERIV_EXECUTIONS_PATH = "/uapi/domestic-futureoption/v1/trading/inquire-ccnl"
 BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 BUYABLE_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+ACCOUNT_ASSETS_PATH = "/uapi/domestic-stock/v1/trading/inquire-account-balance"
 DERIV_ORDER_PATH = "/uapi/domestic-futureoption/v1/trading/order"
 DERIV_CANCEL_PATH = "/uapi/domestic-futureoption/v1/trading/order-rvsecncl"
 DERIV_BALANCE_PATH = "/uapi/domestic-futureoption/v1/trading/inquire-balance"
@@ -128,6 +142,7 @@ DERIV_QUOTE_PATH = "/uapi/domestic-futureoption/v1/quotations/inquire-price"
 DERIV_CHART_PATH = "/uapi/domestic-futureoption/v1/quotations/inquire-daily-fuopchartprice"
 OVERSEAS_ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 OVERSEAS_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
+OVERSEAS_PRESENT_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 OVERSEAS_BUYABLE_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 OVERSEAS_EXECUTIONS_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 
@@ -515,6 +530,7 @@ def _stock_balance_fetch() -> dict:
         # 그 값은 **예수금을 포함**해서, 여기에 현금을 더하면 현금이 두 번 세어집니다
         # (보유 종목이 하나도 없는 계좌의 총평가금액이 예수금과 같은 것이 그 증거입니다).
         "eval_amount": _securities_value(summary),
+        "purchase_amount": _num(summary.get("pchs_amt_smtl_amt")),
         "total_eval": _num(summary.get("tot_evlu_amt")),     # 참고용(예수금 포함)
         "total_pnl": _num(summary.get("evlu_pfls_smtl_amt")),
         "raw": res.get("raw"),
@@ -555,6 +571,210 @@ def buyable_cash(code: str, price: float = 0) -> dict:
         "available_cash": _num(out.get("ord_psbl_cash")),
         "max_quantity": _num(out.get("nrcvb_buy_qty") or out.get("max_buy_qty")),
         "raw": res.get("raw"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 계좌 요약 — 증권사 앱 '총자산' 화면과 같은 숫자
+# ---------------------------------------------------------------------------
+#
+# 총자산을 우리가 다시 계산하면 증권사 화면과 반드시 어긋납니다. 예수금·평가금액
+# 사이에 미결제 매수대금, 미결제 매도대금, 통합증거금, 환율 기준이 끼어 있는데
+# 그 규칙이 계좌 유형마다 다르기 때문입니다. 그래서 아래 함수들은 **계산하지
+# 않고 증권사가 계산한 값을 받아 적습니다.**
+#
+# 실계좌로 확인한 예 (2026-08-07, 위탁계좌 1000****-01)
+#     예수금 132,226 · 주문가능 3,325 · 매입 129,379 · 평가 129,194
+#     미결제매수 129,692 · 미결제매도 7,235 · 총자산 139,518
+# 예수금을 '쓸 수 있는 돈'으로 읽으면 3,325원짜리 계좌로 132,226원어치 주문을
+# 냅니다 — 40배입니다. 이게 이 코드가 있는 이유입니다.
+
+def account_assets() -> dict:
+    """투자계좌 자산현황 (CTRP6548R) — 증권사 앱 '총자산' 화면의 원본.
+
+    여기서 오는 매입금액·평가금액은 **결제완료분만** 셉니다. 오늘 산 종목은
+    아직 미결제라 잡히지 않고, 그 매수대금은 예수금에 그대로 남아 있습니다
+    (그래서 총자산 = 예수금 + 결제완료 평가금액 으로 맞아떨어집니다).
+    지금 실제로 들고 있는 물량의 평가금액이 필요하면 overseas_present() 쪽을
+    보세요 — 그건 체결기준입니다.
+    """
+    return _balance_cached("account_assets", _account_assets_fetch)
+
+
+def _account_assets_fetch() -> dict:
+    acc = account()
+    if not acc:
+        return {"ok": False, "error": "KIS_ACCOUNT 가 설정되지 않았습니다."}
+    if kis_client.is_mock():
+        return {"ok": False, "error": "모의투자 서버는 자산현황(CTRP6548R)을 제공하지 않습니다."}
+
+    cano, prdt = acc
+    res = _get(_op("account_assets"), ACCOUNT_ASSETS_PATH, {
+        "CANO": cano, "ACNT_PRDT_CD": prdt,
+        "INQR_DVSN_1": "", "BSPR_BF_DT_APLY_YN": "",
+    })
+    if not res.get("ok"):
+        return res
+
+    summary = res.get("output2") or {}
+    if isinstance(summary, list):
+        summary = summary[0] if summary else {}
+    if not summary:
+        return {"ok": False, "error": "자산현황 응답이 비어 있습니다."}
+    return {
+        "ok": True,
+        "total_asset": _num(summary.get("tot_asst_amt")),      # 총자산 (앱 화면 숫자)
+        "deposit": _num(summary.get("tot_dncl_amt") or summary.get("dncl_amt")),
+        "purchase_amount": _num(summary.get("pchs_amt_smtl")),  # 결제완료분 매입금액
+        "eval_amount": _num(summary.get("evlu_amt_smtl")),      # 결제완료분 평가금액
+        "pnl": _num(summary.get("evlu_pfls_amt_smtl")),
+        "net_asset": _num(summary.get("nass_tot_amt")),
+        "overseas_eval": _num(summary.get("ovrs_stck_evlu_amt1")),
+        "raw": res.get("raw"),
+    }
+
+
+def overseas_present() -> dict:
+    """해외주식 체결기준 현재잔고 (CTRP6504R) — 원화 환산·미결제·출금가능.
+
+    overseas_balance() 와 다른 점
+        · 금액이 **원화로** 옵니다 (증권사 기준환율로 환산된 값 그대로).
+          우리가 별도 환율로 곱하면 화면 숫자가 증권사와 미세하게 어긋납니다.
+        · 미결제 매수/매도 금액과 출금가능금액이 함께 옵니다. 예수금에서
+          아직 빠져나가지 않은 매수대금이 얼마인지는 여기서만 알 수 있습니다.
+    """
+    return _balance_cached("overseas_present", _overseas_present_fetch)
+
+
+def _overseas_present_fetch() -> dict:
+    acc = account()
+    if not acc:
+        return {"ok": False, "error": "KIS_ACCOUNT 가 설정되지 않았습니다."}
+    cano, prdt = acc
+    res = _get(_op("overseas_present"), OVERSEAS_PRESENT_PATH, {
+        "CANO": cano, "ACNT_PRDT_CD": prdt,
+        "WCRC_FRCR_DVSN_CD": "01",       # 01 = 원화 환산
+        "NATN_CD": "000",                # 전체 국가
+        "TR_MKET_CD": "00",              # 전체 시장
+        "INQR_DVSN_CD": "00",            # 전체 (01 일반 / 02 통합증거금)
+    })
+    if not res.get("ok"):
+        return res
+
+    raw = res.get("raw") or {}
+    summary = raw.get("output3") or {}
+    if isinstance(summary, list):
+        summary = summary[0] if summary else {}
+    if not summary:
+        return {"ok": False, "error": "체결기준잔고 응답이 비어 있습니다."}
+
+    # 기준환율은 종목 줄에 실려 옵니다. 보유분이 없으면 0 이고, 그때는
+    # 호출부가 자체 환율로 넘어가야 합니다 (0 을 곱하면 자산이 사라집니다).
+    rate = 0.0
+    for row in (raw.get("output1") or []):
+        rate = _num(row.get("bass_exrt"))
+        if rate > 0:
+            break
+
+    return {
+        "ok": True,
+        # 결제까지 반영한 순자산. 증권사 앱의 총자산(=자산현황 TR)과 몇백 원
+        # 차이가 날 수 있습니다 — 한쪽은 결제기준, 한쪽은 체결기준입니다.
+        "total_asset": _num(summary.get("tot_asst_amt")),
+        "deposit": _num(summary.get("tot_dncl_amt")),
+        "withdrawable": _num(summary.get("wdrw_psbl_tot_amt")),
+        "purchase_amount": _num(summary.get("pchs_amt_smtl")
+                                or summary.get("pchs_amt_smtl_amt")),
+        "eval_amount": _num(summary.get("evlu_amt_smtl")
+                            or summary.get("evlu_amt_smtl_amt")),
+        "pnl": _num(summary.get("evlu_pfls_amt_smtl")
+                    or summary.get("tot_evlu_pfls_amt")),
+        "pnl_pct": _num(summary.get("evlu_erng_rt1")),
+        "unsettled_buy": _num(summary.get("ustl_buy_amt_smtl")),
+        "unsettled_sell": _num(summary.get("ustl_sll_amt_smtl")),
+        "fx_rate": rate,
+        "raw": raw,
+    }
+
+
+# 주문가능현금 조회는 종목코드를 요구하지만, ord_psbl_cash 자체는 종목과 무관한
+# '계좌에 남은 현금'입니다. 그래서 아무 종목이나 하나 넣어 물어봅니다.
+CASH_PROBE_CODE = "005930"      # 삼성전자 — 상장폐지 걱정이 없는 조회용 더미
+
+
+def orderable_cash() -> dict:
+    """지금 실제로 주문에 쓸 수 있는 원화 (주문가능현금).
+
+    예수금과 다릅니다. 미결제 매수대금이 결제일까지 예수금에 남아 있어서,
+    예수금을 주문 가능액으로 쓰면 이미 써버린 돈으로 또 주문을 냅니다.
+    """
+    def fetch():
+        res = buyable_cash(CASH_PROBE_CODE)
+        if not res.get("ok"):
+            return res
+        return {"ok": True, "available_cash": res.get("available_cash", 0.0)}
+
+    return _balance_cached("orderable_cash", fetch)
+
+
+def account_snapshot() -> dict:
+    """계좌 요약 한 장 — 화면·엔진이 쓰는 숫자를 전부 증권사 값으로.
+
+    돌려주는 값 (원)
+        total_asset       총자산 — 증권사 앱과 같은 숫자
+        deposit           총예수금 (미결제 매수대금 포함)
+        available_cash    주문가능현금 — 지금 진짜 쓸 수 있는 돈
+        withdrawable      출금가능금액
+        purchase_amount   매입금액 (체결기준)
+        eval_amount       평가금액 (체결기준)
+        unrealized_pnl    평가손익
+        unsettled_buy     미결제 매수대금 (예수금에 아직 남아 있는 금액)
+        unsettled_sell    미결제 매도대금
+        fx_rate           증권사 기준환율 (USD/KRW)
+        sources           어느 TR 에서 온 값인지 (진단용)
+        errors            실패한 조회 (전부 실패해도 ok=False 로만 알립니다)
+
+    **한 조각이라도 실패하면 ok=False 입니다.** 반쪽짜리 요약을 정상인 척
+    돌려주면 호출부가 "예수금 0원"을 진짜로 믿고 매매를 멈추거나, 반대로
+    주문가능액을 못 읽은 채 예수금 전액을 쓸 수 있다고 착각합니다.
+    """
+    assets = account_assets()
+    present = overseas_present()
+    cash = orderable_cash()
+
+    sources, errors = [], []
+    for name, res in (("자산현황", assets), ("체결기준잔고", present),
+                      ("주문가능현금", cash)):
+        if res.get("ok"):
+            sources.append(name)
+        else:
+            errors.append(f"{name}: {res.get('error') or '조회 실패'}")
+
+    total = assets.get("total_asset") if assets.get("ok") else None
+    if not total:
+        total = present.get("total_asset") if present.get("ok") else None
+
+    deposit = (assets.get("deposit") if assets.get("ok")
+               else present.get("deposit") if present.get("ok") else None)
+
+    return {
+        "ok": total is not None and cash.get("ok") and present.get("ok"),
+        "total_asset": total or 0.0,
+        # 결제기준 순자산 — 총자산과 몇백 원 차이 나는 것이 정상입니다
+        "settled_asset": present.get("total_asset", 0.0) if present.get("ok") else 0.0,
+        "deposit": deposit or 0.0,
+        "available_cash": cash.get("available_cash", 0.0) if cash.get("ok") else 0.0,
+        "withdrawable": present.get("withdrawable", 0.0) if present.get("ok") else 0.0,
+        "purchase_amount": present.get("purchase_amount", 0.0) if present.get("ok") else 0.0,
+        "eval_amount": present.get("eval_amount", 0.0) if present.get("ok") else 0.0,
+        "unrealized_pnl": present.get("pnl", 0.0) if present.get("ok") else 0.0,
+        "unsettled_buy": present.get("unsettled_buy", 0.0) if present.get("ok") else 0.0,
+        "unsettled_sell": present.get("unsettled_sell", 0.0) if present.get("ok") else 0.0,
+        "fx_rate": present.get("fx_rate", 0.0) if present.get("ok") else 0.0,
+        # 결제완료분만 센 평가금액 (앱 '총자산' 화면의 평가금액과 같은 값)
+        "settled_eval_amount": assets.get("eval_amount", 0.0) if assets.get("ok") else 0.0,
+        "sources": sources,
+        "errors": errors,
     }
 
 
@@ -1015,32 +1235,50 @@ def overseas_buyable(ticker: str, exchange: str, price: float) -> dict:
 
 
 def overseas_balance_all() -> dict:
-    """미국 보유분 전체 (NASD·NYSE·AMEX 합산).
+    """미국 보유분 전체.
 
-    KIS 잔고 조회는 거래소를 하나씩 지정해야 해서 세 번 호출합니다.
-    엔진이 회전마다 부르므로 잔고 캐시(5초)를 태웁니다 — 이게 없으면
-    잔고 조회만으로 초당 호출 한도를 다 씁니다.
+    실전 서버의 NASD 코드는 **미국 전체**(나스닥+뉴욕+아멕스)를 돌려줍니다 —
+    이 계좌로 실측했습니다(NASD 조회에 NYSE 종목 4개가 그대로 왔습니다).
+    그래서 실전은 한 번만 조회합니다. 예전처럼 세 거래소를 다 부르면 이것만
+    5.8초였고(호출당 ~1.9초), 계좌 화면이 느린 첫 번째 원인이었습니다.
 
-    **거래소 하나라도 실패하면 ok=False 입니다.** 일부만 성공한 결과를
+    모의투자 서버는 거래소를 정확히 지정해야 해서 세 번 그대로 부릅니다.
+
+    **조회가 하나라도 실패하면 ok=False 입니다.** 일부만 성공한 결과를
     "전체 보유분"으로 돌려주면, 엔진이 못 본 포지션을 청산 대상에서
     빼버려 손절 없는 포지션이 방치됩니다.
     """
     def fetch():
-        # KIS 는 거래소 코드를 넣어도 **보유분 전체**를 돌려줍니다(필터가 안 먹습니다).
-        # 그래서 세 번 조회하면 같은 종목이 세 번 잡힙니다 — 종목코드로 한 번만
-        # 남깁니다. 합치는 것을 그만두지 않는 이유는, 어느 거래소 조회가 빠질지
-        # 보장할 수 없어 하나만 믿으면 포지션을 놓칠 수 있기 때문입니다.
+        # 같은 종목이 여러 조회에 겹쳐 나오면 한 번만 남깁니다
         merged, seen, failures = [], set(), []
-        for code in ("NASD", "NYSE", "AMEX"):
+
+        def collect(code) -> bool:
             res = overseas_balance(code)
             if not res.get("ok"):
                 failures.append(f"{code}: {res.get('error') or '조회 실패'}")
-                continue
+                return False
             for p in (res.get("positions") or []):
                 key = str(p.get("code") or "")
                 if key and key not in seen:
                     seen.add(key)
                     merged.append(p)
+            return True
+
+        if kis_client.is_mock():
+            exchanges = ("NASD", "NYSE", "AMEX")
+        else:
+            exchanges = ("NASD",)
+        for code in exchanges:
+            collect(code)
+
+        # 실전 NASD 가 "보유 없음"이면, 필터가 먹는 계좌일 가능성에 대비해
+        # 나머지 거래소로 한 번 더 확인합니다. 진짜 빈 계좌에서만 도는 경로라
+        # 느려질 일이 없고, 잘못된 "포지션 없음"은 손절 방치로 이어지므로
+        # 이 확인은 생략하면 안 됩니다.
+        if not kis_client.is_mock() and not failures and not merged:
+            for code in ("NYSE", "AMEX"):
+                collect(code)
+
         if failures:
             return {"ok": False, "positions": [],
                     "error": "해외 잔고 조회 실패 — " + " / ".join(failures)}
@@ -1117,7 +1355,8 @@ def diagnose() -> dict:
                 "live_enabled": st["live_enabled"], "checks": checks}
 
     token = kis_client.access_token()
-    add("접근토큰 발급", bool(token), "OK" if token else "APP KEY/SECRET 을 확인하세요")
+    add("접근토큰 발급", bool(token),
+        "OK" if token else (kis_client.token_error() or "APP KEY/SECRET 을 확인하세요"))
 
     if token:
         quote = kis_client.get_quote("005930")
@@ -1128,6 +1367,15 @@ def diagnose() -> dict:
         add("주식 잔고 조회", balance.get("ok"),
             f"예수금 {balance.get('cash', 0):,.0f}원 / 보유 {len(balance.get('positions', []))}종목"
             if balance.get("ok") else balance.get("error", ""))
+
+        # 증권사 앱과 대조할 수 있게 요약 숫자를 그대로 보여줍니다.
+        # 이게 실패하면 화면 총자산은 '우리가 다시 계산한 값'으로 떨어집니다.
+        snap = account_snapshot()
+        add("계좌 요약(총자산)", snap.get("ok"),
+            (f"총자산 {snap['total_asset']:,.0f}원 / 주문가능 {snap['available_cash']:,.0f}원"
+             f" / 출금가능 {snap['withdrawable']:,.0f}원"
+             + (f" · 미결제매수 {snap['unsettled_buy']:,.0f}원" if snap["unsettled_buy"] else ""))
+            if snap.get("ok") else " / ".join(snap.get("errors", [])))
 
         executions = stock_executions()
         add("주문·체결 조회", executions.get("ok"),

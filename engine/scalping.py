@@ -46,7 +46,18 @@ from engine.instruments import ETF, STOCK, Instrument
 # 보수적인 쪽(비싼 쪽)으로 잡아둡니다. 실제보다 싸게 잡으면 손익분기를 낮게
 # 계산해서, 사실은 지는 자리에 들어가게 됩니다.
 FEE_RATE = 0.00015      # 위탁수수료 (편도, 온라인 기준)
-TAX_RATE = 0.00150      # 증권거래세 + 농어촌특별세 (매도 시에만)
+
+# ⚠ 증권거래세는 시행일마다 바뀝니다 (2025년 0.15% → 2026-01-01 0.20% 인상).
+#   이 값이 5bp 낮으면 **본전 틱수가 낙관적으로 계산되어**, 사실은 지는 자리에
+#   들어갑니다. 회전율이 가장 높은 경로라 오차가 가장 크게 누적됩니다.
+#   engine/markets.py 의 시행일 테이블에서 조회합니다.
+def _tax_rate(when=None) -> float:
+    """해당 시점의 매도 증권거래세율 (농특세 포함)."""
+    from engine import markets
+    return markets.sell_tax_rate(when, "KOSPI")
+
+
+TAX_RATE = _tax_rate()   # 하위호환 — 현재 시점 값
 
 # KRX 호가단위 (2023.1.25 개편 이후 · 코스피/코스닥 동일)
 # (이 가격 미만이면, 호가단위)
@@ -178,19 +189,22 @@ def ticks_to_price(price: float, ticks: int, market: str = "KR") -> float:
     return round(out, 4 if market == "US" else 0)
 
 
-def breakeven_ticks(fill_price: float, market: str = "KR") -> int:
+def breakeven_ticks(fill_price: float, market: str = "KR", when=None) -> int:
     """체결가 기준, 수수료·세금을 덮으려면 몇 틱 올라야 본전인가.
 
     매수는 수수료만, 매도는 수수료+거래세가 붙습니다. 그래서 손익분기는
     체결가보다 항상 위에 있고, 저가주일수록 틱 하나가 차지하는 비율이 커서
     **오히려 유리합니다**(100원에서 1틱은 1%). 진짜 비용은 세금이 아니라
     스프레드인데, 그건 진입 방식(지정가/시장가)으로 다룹니다.
+
+    `when` — 백테스트는 그 봉의 날짜를 넘기세요. 세율이 시행일마다 다릅니다.
     """
     price = float(fill_price or 0)
     if price <= 0:
         return 0
     unit = tick_size(price, market)
-    needed = price * ((1 + FEE_RATE) / (1 - FEE_RATE - TAX_RATE) - 1)
+    tax = _tax_rate(when) if market != "US" else 0.0
+    needed = price * ((1 + FEE_RATE) / (1 - FEE_RATE - tax) - 1)
     return max(1, math.ceil(needed / unit)) if needed > 0 else 0
 
 

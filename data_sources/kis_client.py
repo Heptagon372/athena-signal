@@ -33,12 +33,15 @@ KIS가 네이버 대비 좋은 점
       `python -m data_sources.kis_client` 로 자체 점검을 돌려보세요.
 """
 
+import hashlib
+import json
 import threading
 import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 
+from config import CACHE_DIR
 from data_sources import credentials, http_client
 
 REAL_BASE = "https://openapi.koreainvestment.com:9443"
@@ -47,6 +50,11 @@ MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
 _token_lock = threading.Lock()
 _token: str | None = None
 _token_expires_at: float = 0.0
+_token_error: str = ""
+
+# 발급받은 토큰을 프로세스 밖에도 남겨 둡니다 (.cache 는 .gitignore 대상).
+# 토큰은 계좌 조회 권한 그 자체이므로 이 파일은 공유하면 안 됩니다.
+TOKEN_FILE = CACHE_DIR / "kis_token.json"
 
 
 def app_key() -> str:
@@ -129,18 +137,85 @@ def throttle():
         _last_call_at = time.time()
 
 
+def _token_cache_key() -> str:
+    """앱키나 서버가 바뀌면 저장해 둔 토큰은 무효입니다 (키 값은 남기지 않습니다)."""
+    return hashlib.sha256(f"{app_key()}|{_base_url()}".encode()).hexdigest()[:16]
+
+
+def _load_saved_token() -> tuple[str, float]:
+    try:
+        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return "", 0.0
+    if data.get("key") != _token_cache_key():
+        return "", 0.0
+    try:
+        return str(data.get("token") or ""), float(data.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        return "", 0.0
+
+
+def _save_token(token: str, expires_at: float):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(json.dumps({
+            "key": _token_cache_key(), "token": token, "expires_at": expires_at,
+        }), encoding="utf-8")
+    except OSError:
+        pass        # 저장에 실패해도 이번 프로세스 안에서는 정상 동작합니다
+
+
+def _token_failure(status: int, body, raw: str) -> str:
+    """발급 실패 사유를 KIS 문구 그대로 남깁니다.
+
+    "APP KEY/SECRET 을 확인하세요"로 뭉뚱그리면, 실제로는 1분 제한에 걸린
+    것뿐인데 멀쩡한 키를 다시 발급받으러 갑니다.
+    """
+    message = code = ""
+    if isinstance(body, dict):
+        message = str(body.get("error_description") or body.get("msg1") or "")
+        code = str(body.get("error_code") or body.get("msg_cd") or "")
+    if not message:
+        message = (raw or "").strip().replace("\n", " ")[:200]
+
+    if code == "EGW00133" or "1분" in message:
+        return (f"{message} — 키 문제가 아닙니다(발급은 1분에 1회). "
+                "잠시 뒤 자동으로 다시 시도합니다.")
+    if status in (401, 403) and code:
+        return (f"{message} (HTTP {status}, {code}) — 실전용 앱키와 모의투자용 "
+                "앱키는 서로 다릅니다. 지금 붙는 서버와 맞는지 확인하세요.")
+    return f"{message or '응답 없음'} (HTTP {status})"
+
+
+def token_error() -> str:
+    """마지막 토큰 발급 실패 사유 (성공했으면 빈 문자열)."""
+    return _token_error
+
+
 def _get_token() -> str | None:
-    """접근토큰 발급 (KIS는 24시간 유효, 재발급 호출에 제한이 있어 캐시 필수)."""
-    global _token, _token_expires_at
+    """접근토큰 발급.
+
+    KIS 는 토큰을 **1분에 한 번**만 내줍니다(EGW00133). 토큰 자체는 24시간
+    유효한데 프로세스 메모리에만 들고 있으면, 서버를 재시작할 때마다 새로
+    받으려다 이 제한에 걸려 **키가 멀쩡한데도 계좌가 통째로 안 읽히는** 상태로
+    뜹니다. 그래서 파일에도 남겨 재시작 후 그대로 씁니다.
+    """
+    global _token, _token_expires_at, _token_error
 
     if not is_configured():
+        _token_error = "APP KEY / SECRET 이 설정되지 않았습니다."
         return None
 
     with _token_lock:
         if _token and time.time() < _token_expires_at - 300:
             return _token
 
-        res = http_client.post_json(
+        saved, saved_expires = _load_saved_token()
+        if saved and time.time() < saved_expires - 300:
+            _token, _token_expires_at, _token_error = saved, saved_expires, ""
+            return _token
+
+        status, body, raw = http_client.post_full(
             _base_url() + "/oauth2/tokenP",
             json_body={
                 "grant_type": "client_credentials",
@@ -150,12 +225,15 @@ def _get_token() -> str | None:
             headers={"Content-Type": "application/json"},
             timeout=15,
         )
-        if not res or not res.get("access_token"):
+        if not isinstance(body, dict) or not body.get("access_token"):
+            _token_error = _token_failure(status, body, raw)
             return None
 
-        _token = res["access_token"]
+        _token = body["access_token"]
         # expires_in 이 없으면 보수적으로 12시간만 신뢰
-        _token_expires_at = time.time() + float(res.get("expires_in") or 43200)
+        _token_expires_at = time.time() + float(body.get("expires_in") or 43200)
+        _token_error = ""
+        _save_token(_token, _token_expires_at)
         return _token
 
 

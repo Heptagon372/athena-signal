@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from engine import feed, indicators, instruments, quant
+from engine import econophysics, feed, indicators, instruments, quant
 from engine.instruments import ETF, STOCK, Instrument
 
 # 팩터 기본 비중 (국면에 따라 아래에서 조정됩니다)
@@ -239,9 +239,9 @@ def compute_factors(inst: Instrument, bars: pd.DataFrame = None,
         factors["technical"] = 0.0
         factors["regime"] = ""
 
-    # --- 경제물리학 ①: Hill 꼬리지수 — 수익률 분포의 꼬리가 얼마나 두꺼운가.
+    # --- 경제물리학 ①: Hill 꼬리지수 — 수익률 분포의 **하락** 꼬리가 얼마나 두꺼운가.
     #     α가 낮을수록(≈2) 급락이 '가끔'이 아니라 '구조적으로' 나오는 종목입니다.
-    factors["tail_alpha"] = _hill_alpha(returns)
+    factors["tail_alpha"], factors["tail_alpha_se"] = _hill_alpha(returns)
 
     # --- CCI(20) 흐름 — 스마트머니 판정의 한 축
     cci_now, cci_slope = _cci_state(bars)
@@ -278,35 +278,36 @@ def compute_factors(inst: Instrument, bars: pd.DataFrame = None,
 
     factors["price"] = float(close.iloc[-1])
     factors["bars"] = len(bars)
-    # RMT 결합도 계산용 수익률 (rank() 에서 쓰고 저장 전에 버립니다)
-    factors["_returns"] = [float(x) for x in returns.iloc[-120:]]
+    # RMT 결합도 계산용 수익률 (rank() 에서 쓰고 저장 전에 버립니다).
+    # **날짜 인덱스를 유지합니다** — 종목마다 거래일이 다를 수 있어, 인덱스를
+    # 버리고 길이로만 자르면 서로 다른 날의 수익률이 짝지어집니다.
+    factors["_returns"] = returns.iloc[-120:].astype(float)
 
     with _cache_lock:
         _factor_cache[cache_key] = (now, factors)
     return factors
 
 
-def _hill_alpha(returns: pd.Series, tail_fraction: float = 0.1) -> float:
-    """Hill 추정량 — 수익률 분포 꼬리의 멱지수 α.
+def _hill_alpha(returns: pd.Series) -> tuple[float, float]:
+    """Hill 추정량 — 수익률 분포 **좌측(하락) 꼬리**의 멱지수 α와 그 표준오차.
 
     α ≈ 2 는 분산이 겨우 존재하는 수준의 두꺼운 꼬리(급락 상습),
     α ≥ 4 는 정규분포에 가까운 얌전한 꼬리입니다.
-    마스터플랜의 econophysics(tail index) 항목을 그대로 구현한 것입니다.
+
+    **좌측만 재는 이유**: 이 팩터가 답해야 하는 질문은 "이 종목이 급락을 자주
+    내는가"입니다. 예전 구현은 `returns.abs()` 로 양쪽 꼬리를 합쳐 재서, 상한가를
+    자주 치는 급등주가 급락 위험 종목으로 계산됐습니다. 수익률 분포의 좌우 꼬리
+    두께는 다릅니다(Cont 2001 정형사실). 계산은 engine/econophysics.hill_tail 에
+    있고, k 선택은 Hill plot 평탄 구간 자동탐색을 씁니다.
+
+    표준오차 α/√k 를 함께 돌려줍니다 — 호출부가 추정 불확실성을 반영할 수 있도록.
+    표본이 부족하면 (3.0, inf) 로 중립 처리합니다. 3.0 은 주식 수익률 꼬리지수의
+    실증값입니다(Gopikrishnan et al. 1999, inverse cubic law).
     """
-    absolute = returns.abs().sort_values(ascending=False)
-    absolute = absolute[absolute > 0]
-    k = max(int(len(absolute) * tail_fraction), 8)
-    if len(absolute) <= k:
-        return 3.0                      # 표본 부족 — 중립값
-    tail = absolute.iloc[:k]
-    x_min = float(absolute.iloc[k])
-    if x_min <= 0:
-        return 3.0
-    logs = np.log(tail.values / x_min)
-    mean_log = float(logs.mean())
-    if mean_log <= 0:
-        return 3.0
-    return float(min(1.0 / mean_log, 8.0))
+    res = econophysics.hill_tail(returns.to_numpy(dtype=float), side="left")
+    if res is None:
+        return 3.0, float("inf")
+    return float(min(res["alpha"], 8.0)), float(res["se"])
 
 
 def _trend_template_checks(close: pd.Series) -> list[bool]:
@@ -441,30 +442,56 @@ def _zscore(values: list[float]) -> list[float]:
     return [float(max(-3.0, min(3.0, v))) for v in z]
 
 
-def _rmt_coupling(returns_lists: list) -> list[float]:
-    """상관행렬 첫 고유벡터 기준 시장 결합도 (평균 = 1.0).
+TAIL_PRIOR_MEAN = 3.0      # Gopikrishnan et al. (1999) inverse cubic law
+TAIL_PRIOR_SD = 0.6        # 이 유니버스에서 실측한 꼬리지수의 횡단면 표준편차
 
-    후보가 3개 미만이거나 수익률이 짧으면 전부 중립(1.0)을 돌려줍니다 —
-    표본이 부족한 상태에서 억지로 계산한 고유벡터는 노이즈입니다.
+
+def _shrink_tail(alpha: float, se: float) -> float:
+    """추정오차가 클수록 꼬리지수를 중립값(3.0)으로 당깁니다 (정규-정규 사후평균)."""
+    if se is None or not math.isfinite(se) or se <= 0:
+        return TAIL_PRIOR_MEAN
+    w_data = 1.0 / (se ** 2)
+    w_prior = 1.0 / (TAIL_PRIOR_SD ** 2)
+    return (alpha * w_data + TAIL_PRIOR_MEAN * w_prior) / (w_data + w_prior)
+
+
+def _rmt_coupling(returns_series: list) -> list[float]:
+    """상관행렬 시장 모드 기준 결합도 (평균 = 1.0). 잡음이면 전부 중립.
+
+    Laloux et al. (1999), Plerou et al. (2002). 계산은
+    engine/econophysics.rmt_decompose 에 있습니다.
+
+    이전 구현에서 고친 두 가지
+      1) **Marchenko-Pastur 판정이 없었습니다.** 최대 고유값을 무조건 시장 모드로
+         썼는데, RMT 의 요지는 λ₊ = σ²(1+√(N/T))² 를 넘는 고유값만 정보를
+         담는다는 것입니다. 이제 못 넘으면 전부 중립을 돌려줍니다.
+      2) **날짜 정렬이 없었습니다.** 수익률을 리스트로 받아 뒤에서 min_len 개를
+         잘랐기 때문에, 거래정지·신규상장으로 봉 수가 다른 종목끼리 서로 다른
+         날짜의 수익률이 짝지어졌습니다. 이제 pd.Series 를 받아 날짜로
+         inner join 합니다.
+
+    최소 자산 수도 3 → 15 로 올렸습니다. 3종목의 첫 고유벡터는 '시장'이 아니라
+    그 세 종목의 공통 성분입니다 (원논문은 406·1000 종목을 씁니다).
     """
-    usable = [(i, r) for i, r in enumerate(returns_lists) if r and len(r) >= 40]
-    if len(usable) < 3:
-        return [1.0] * len(returns_lists)
+    n_total = len(returns_series)
+    usable = [(i, s) for i, s in enumerate(returns_series)
+              if s is not None and len(s) >= 40]
+    if len(usable) < econophysics.RMT_MIN_ASSETS:
+        return [1.0] * n_total
 
-    min_len = min(len(r) for _, r in usable)
-    matrix = np.array([r[-min_len:] for _, r in usable])       # (n_assets, n_obs)
-    try:
-        corr = np.corrcoef(matrix)
-        corr = np.nan_to_num(corr, nan=0.0)
-        np.fill_diagonal(corr, 1.0)
-        eigenvalues, eigenvectors = np.linalg.eigh(corr)
-        v1 = eigenvectors[:, -1]                               # 최대 고유값 벡터
-        n = len(usable)
-        couplings = {idx: float(n * v1[j] ** 2) for j, (idx, _) in enumerate(usable)}
-    except np.linalg.LinAlgError:
-        return [1.0] * len(returns_lists)
+    # 날짜 인덱스로 정렬 — 결측이 있는 날은 통째로 버립니다
+    aligned = pd.concat([s.rename(i) for i, s in usable], axis=1, join="inner").dropna()
+    if len(aligned) < len(usable) * 2:
+        return [1.0] * n_total
 
-    return [couplings.get(i, 1.0) for i in range(len(returns_lists))]
+    res = econophysics.rmt_decompose(aligned.to_numpy().T,
+                                     min_assets=econophysics.RMT_MIN_ASSETS)
+    if res is None or not res["market_mode_valid"]:
+        # 최대 고유값이 잡음 벌크 안 — 시장 모드가 없습니다
+        return [1.0] * n_total
+
+    couplings = {int(col): float(v) for col, v in zip(aligned.columns, res["couplings"])}
+    return [couplings.get(i, 1.0) for i in range(n_total)]
 
 
 def _weights_for(regime: str) -> dict:
@@ -525,10 +552,22 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     # 얼마나 실려 있는가. 결합도가 높으면 "시장이 오르니까 오르는" 종목이고,
     # 낮으면 독자적인 이유로 움직이는 종목입니다. 분산 효과도 후자가 큽니다.
     couplings = [1.0] * len(resolved)
-    for indices in buckets.values():
+    market_diag = {}
+    for market_key, indices in buckets.items():
         sub = _rmt_coupling([resolved[i][2].get("_returns") for i in indices])
         for j, i in enumerate(indices):
             couplings[i] = sub[j]
+        # 시장 진단 (표시 전용) — 같은 수익률을 재사용하므로 추가 비용이 없습니다.
+        # **매매 판단에는 쓰지 않습니다.** 게이트로 쓰면 성과가 나빠진다는 것을
+        # 측정했습니다 (AUTOTRADE.md 16장).
+        try:
+            rets = {resolved[i][0].symbol: resolved[i][2].get("_returns")
+                    for i in indices}
+            diag = econophysics.market_diagnostics(rets)
+            if diag:
+                market_diag[str(market_key)] = diag
+        except Exception:
+            pass
     for i, (_, _, f) in enumerate(resolved):
         f["rmt_coupling"] = couplings[i]
         f.pop("_returns", None)          # 저장·직렬화 전에 원시 수익률은 버립니다
@@ -537,7 +576,18 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     columns = {name: _bucketed([f.get(name, 0.0) for _, _, f in resolved])
                for name in BASE_WEIGHTS}
     # econophysics 합성: z(꼬리 얌전함) + z(시장 탈동조) 의 평균
-    z_tail = _bucketed([f.get("tail_alpha", 3.0) for _, _, f in resolved])
+    #
+    # 꼬리지수는 **추정오차를 반영해 수축시킨 뒤** 표준화합니다. Hill 추정량의
+    # 표준오차는 α/√k 라 k 가 작으면 α 가 ±1 씩 흔들립니다. 점추정을 그대로
+    # 횡단면 z 로 만들면 꼬리 위험이 아니라 추정 잡음의 순위를 매기게 됩니다.
+    # engine/validation.py 가 성과에 대해 세운 원칙("점추정을 임계값과 직접
+    # 비교하지 않는다")을 추정량에도 적용한 것입니다.
+    #
+    #   사후평균 = (α/se² + μ₀/τ²) / (1/se² + 1/τ²)
+    #   μ₀ = 3.0 (주식 꼬리지수 실증값), τ = 0.6 (횡단면 실측 표준편차)
+    z_tail = _bucketed([_shrink_tail(f.get("tail_alpha", 3.0),
+                                     f.get("tail_alpha_se", float("inf")))
+                        for _, _, f in resolved])
     z_decouple = _bucketed([-f.get("rmt_coupling", 1.0) for _, _, f in resolved])
     columns["econophysics"] = [(a + b) / 2 for a, b in zip(z_tail, z_decouple)]
 
@@ -585,7 +635,28 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     out.sort(key=lambda r: (r.tradable, r.score), reverse=True)
     for i, rec in enumerate(out, 1):
         rec.rank = i
+
+    # 시장 진단을 남겨 화면이 읽어갈 수 있게 합니다. 추천 순위에는 영향을 주지
+    # 않으며, 이번 회전에 실제로 본 후보들로 계산된 값입니다.
+    global _last_market_diagnostics
+    with _cache_lock:
+        _last_market_diagnostics = market_diag
+
     return out[:max(top_n, 1)] if top_n else out
+
+
+_last_market_diagnostics: dict = {}
+
+
+def last_market_diagnostics() -> dict:
+    """가장 최근 rank() 회전의 시장 진단 (RMT 시스템 리스크 · LPPLS 버블).
+
+    **표시 전용입니다.** 이 값을 진입·청산 판단에 연결하지 마세요 —
+    게이트로 쓰면 홀드아웃 성과가 나빠진다는 것을 측정했습니다
+    (AUTOTRADE.md 16장의 주변효과 표).
+    """
+    with _cache_lock:
+        return dict(_last_market_diagnostics)
 
 
 def _to_instrument(candidate):

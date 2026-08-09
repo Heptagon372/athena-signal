@@ -20,7 +20,7 @@
 (function () {
   const API = "/api";
   // api.py 의 CONSOLE_API_VERSION 과 짝 — 서버가 낮으면 재시작 배너를 띄웁니다
-  const REQUIRED_API = 6;
+  const REQUIRED_API = 7;
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,

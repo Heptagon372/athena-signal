@@ -60,8 +60,18 @@ class Signal:
     ml: dict | None = None             # ML 오버레이 (ml_mode 가 off 가 아닐 때만)
     ma50: float | None = None          # 50일 이동평균 — 승자 보유 판정(check_exit)용
     vol_factor: float = 1.0            # 변동성 배수 — 손절·익절 폭 스케일에 사용
+    # 점수가 만들어진 순서 — 화면에서 계산 과정을 그대로 보여주기 위한 기록입니다.
+    # 화면이 이 과정을 따로 재현하면 반드시 엔진과 어긋납니다(어느 오버레이가
+    # 켜져 있었는지, 어느 값이 실제로 곱해졌는지는 여기서만 알 수 있습니다).
+    stages: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
     error: str = ""
+
+    def stage(self, key: str, label: str, value, detail: str = ""):
+        self.stages.append({
+            "key": key, "label": label, "detail": detail,
+            "value": None if value is None else round(float(value), 4),
+        })
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +89,7 @@ class Signal:
             "ensemble": self.ensemble, "ml": self.ml,
             "ma50": round(self.ma50, 4) if self.ma50 else None,
             "vol_factor": round(self.vol_factor, 3),
+            "stages": self.stages,
             "reasons": self.reasons[:6], "error": self.error,
         }
 
@@ -103,7 +114,8 @@ def _news_score(inst: Instrument) -> float | None:
         return hit[1]
     try:
         from data_sources import news_crawler
-        items = news_crawler.get_news(inst.symbol, limit=15)
+        # include_save=False: 세이브(SAVE) 속보는 분석 화면 검증 중 — 주문 판단 제외
+        items = news_crawler.get_news(inst.symbol, limit=15, include_save=False)
         score = news_crawler.aggregate_news_score(items)
     except Exception:
         return None
@@ -151,6 +163,9 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
     sig.daily_score = float(daily.score)
     sig.bars_used = daily.bars_used
     sig.regime = (daily.regime or {}).get("label", "")
+    sig.stage("daily", "일봉 지표 종합", sig.daily_score,
+              f"{daily.bars_used}봉 · 지표 {len(daily.indicators)}개를 국면 가중으로 합산"
+              + (f" · 국면 {sig.regime}" if sig.regime else ""))
 
     intraday_weight = float(cfg.get("intraday_weight", 0.35))
     if intraday_weight > 0:
@@ -158,6 +173,8 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             bars_intraday = feed.bars(inst, "minute", count=240)
         if bars_intraday is not None and len(bars_intraday) >= MIN_INTRADAY_BARS:
             sig.intraday_score = float(indicators.analyze(bars_intraday).score)
+            sig.stage("intraday", "분봉 단기 점수", sig.intraday_score,
+                      f"같은 지표를 분봉으로 · 결합 비중 {intraday_weight:.0%}")
 
     # 앙상블 (engine/ensemble.py) — 시평선 합치·난기류·변동성 배수·시장 방향.
     # observe 모드는 계산·기록만 하고 점수를 바꾸지 않습니다.
@@ -172,11 +189,17 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
 
     if ens.ok and ens_mode in (ensemble.SOFT, ensemble.GATE):
         blended = ens.score          # 시평선 불일치 감산·난기류 감쇠가 반영된 점수
+        sig.stage("ensemble", "앙상블 결합", blended,
+                  "시평선 불일치 감산 · 난기류 감쇠 반영"
+                  + (f" · {ens.notes[0]}" if ens.notes else ""))
     elif sig.intraday_score is None:
         blended = sig.daily_score
+        sig.stage("blend", "결합 점수", blended, "분봉이 없어 일봉 점수를 그대로")
     else:
         blended = ((1 - intraday_weight) * sig.daily_score
                    + intraday_weight * sig.intraday_score)
+        sig.stage("blend", "일봉·분봉 결합", blended,
+                  f"일봉 {1 - intraday_weight:.0%} + 분봉 {intraday_weight:.0%}")
 
     if cfg.get("use_news"):
         news = _news_score(inst)
@@ -184,6 +207,8 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             sig.news_score = news
             weight = float(cfg.get("news_weight", 0.25))
             blended = (1 - weight) * blended + weight * news
+            sig.stage("news", "뉴스 감성 반영", blended,
+                      f"뉴스 점수 {news:+.2f} 을 {weight:.0%} 비중으로 결합")
 
     # 인버스 ETF 는 기초자산이 내릴 때 오릅니다. 지표는 그 ETF 자체의 가격으로
     # 계산되므로 뒤집을 필요가 없지만, 뉴스 점수는 기초자산 기준이라 뒤집습니다.
@@ -201,6 +226,8 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             blended, note = nnfx.apply_to_score(blended, nnfx_state, cfg)
             if note:
                 nnfx_notes.append(note)
+            sig.stage("nnfx", "NNFX 규칙 결합", blended,
+                      note or "기준선·모멘텀·추세·거래량 슬롯 결합")
 
     # ML 오버레이 (engine/mlsignal.py — XGBoost·PatchTST 이식).
     # observe 는 계산·첨부만, soft 는 검증을 통과한 점수만 가중 결합합니다.
@@ -213,6 +240,8 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             blended, note = mlsignal.apply_to_score(blended, ml_state, cfg)
             if note:
                 nnfx_notes.append(note)
+            sig.stage("ml", "ML 오버레이", blended,
+                      note or "검증을 통과한 모델 점수만 가중 결합")
 
     sig.score = max(-1.0, min(1.0, blended))
     sig.atr, sig.atr_pct = _atr(bars_daily, sig.price)
@@ -247,6 +276,10 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
     if ens.ok and ens.block and sig.direction != FLAT:
         sig.direction = FLAT
         nnfx_notes.insert(0, ens.blocked_by[0] if ens.blocked_by else "앙상블 게이트 차단")
+
+    sig.stage("final", "최종 점수", sig.score,
+              f"진입 임계값 ±{entry:g} · 판정 "
+              + {LONG: "매수", SHORT: "매도(숏)"}.get(sig.direction, "관망"))
 
     sig.confidence = min(1.0, abs(sig.score) / entry) if entry > 0 else 0.0
     # _reasons 가 목록을 새로 만들므로, NNFX·앙상블 사유는 **그 뒤에** 붙여야 남습니다.

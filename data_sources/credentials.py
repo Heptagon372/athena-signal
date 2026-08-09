@@ -65,9 +65,51 @@ PROVIDERS = {
         "portal": "https://www.data.go.kr (금융위원회_주식시세정보 활용신청)",
         "gives": "금융위 주식시세 (KRX 일별 시세 공식 경로)",
     },
+    "google": {
+        "label": "구글 로그인 (OAuth)",
+        "fields": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+        "portal": "https://console.cloud.google.com (사용자 인증 정보 → OAuth 클라이언트 ID, "
+                  "리디렉션 URI: http://localhost:8000/api/auth/google/callback)",
+        "gives": "구글 계정으로 로그인 (아이디/비번 없이 바로 시작)",
+    },
+    "mongo": {
+        "label": "MongoDB 계정 저장소",
+        "fields": ["MONGODB_URI"],
+        "portal": "https://cloud.mongodb.com (무료 M0) 또는 로컬 mongodb://localhost:27017",
+        "gives": "구글 계정 저장 · 세션 (여러 PC에서 같은 계정으로 접속)",
+    },
 }
 
 _file_cache: dict | None = None
+_user_env_cache: dict | None = None
+
+
+def _user_env() -> dict:
+    """Windows 사용자 환경변수 원본 (HKCU\\Environment).
+
+    setup_kis.bat 은 setx 로 키를 저장하는데, setx 는 **그 뒤에 새로 열리는**
+    프로세스에만 반영됩니다. 그래서 이미 떠 있던 창(에디터 터미널·이전 콘솔)에서
+    서버를 재시작하면 키가 하나도 없는 서버가 조용히 뜨고, 화면에는 "KIS 미설정"
+    으로만 보입니다 — 계좌 정보가 통째로 0원이 되는 가장 흔한 원인입니다.
+    환경변수에도 api_keys.json 에도 없을 때 저장된 원본을 직접 읽습니다.
+    """
+    global _user_env_cache
+    if _user_env_cache is not None:
+        return _user_env_cache
+
+    _user_env_cache = {}
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    name, value, _ = winreg.EnumValue(key, i)
+                    if isinstance(value, str):
+                        _user_env_cache[name] = value
+        except (OSError, ImportError):
+            pass        # 레지스트리를 못 읽어도 조회는 계속돼야 합니다
+    return _user_env_cache
 
 
 def _from_file() -> dict:
@@ -85,11 +127,19 @@ def _from_file() -> dict:
 
 
 def get(name: str, default: str = "") -> str:
-    """환경변수 우선, 없으면 api_keys.json 에서 조회."""
+    """환경변수 → api_keys.json → Windows 사용자 환경변수 순으로 조회.
+
+    api_keys.json 에 항목이 있으면 (빈 값이더라도) 거기서 끝냅니다. 파일에
+    적어 둔 '꺼짐'을 레지스트리의 옛 값이 되살리면 안 되기 때문입니다 —
+    실거래 스위치가 그렇게 켜지는 일은 없어야 합니다.
+    """
     value = os.environ.get(name)
     if value:
         return value.strip()
-    return str(_from_file().get(name, default) or "").strip()
+    saved = _from_file()
+    if name in saved:
+        return str(saved.get(name) or "").strip()
+    return str(_user_env().get(name, default) or "").strip()
 
 
 def get_json(name: str, default=None):
@@ -99,13 +149,17 @@ def get_json(name: str, default=None):
     설정으로 빼기 위한 통로입니다 (config as data).
     """
     raw = os.environ.get(name)
+    if not raw:
+        value = _from_file().get(name)
+        if value is not None:
+            return value
+        raw = _user_env().get(name)      # get() 과 같은 순서 (환경 → 파일 → 저장된 환경)
     if raw:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
             return default
-    value = _from_file().get(name)
-    return value if value is not None else default
+    return default
 
 
 def get_bool(name: str, default: bool = False) -> bool:

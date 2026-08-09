@@ -37,12 +37,49 @@ YAHOO_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=
 
 
 # ---------------------------------------------------------------------------
-# 감성 사전
+# ★ 가격서술 표현 — 감성이 아닙니다 (「특징주」 문제)
+# ---------------------------------------------------------------------------
+# 국내 매체는 「특징주」 XX 급등…」, 「XX 상한가」, 「XX 강세」 형태의 기사를
+# 매일 대량 발행합니다.
+#
+#   **이건 뉴스가 아니라 이미 일어난 가격 움직임의 서술이고, 수 분~수 시간
+#   뒤에 발행됩니다.**
+#
+# 이걸 감성 점수로 쓰면 두 가지 중 하나가 됩니다.
+#   · 동시점 스코어링  → 화려하고 완전히 가짜인 IC. 백테스트 샤프를 만들고
+#                        실전에서 잃는 가장 빠른 경로입니다.
+#   · 엄격한 지연 적용 → 뉴스 옷을 입은 순수 모멘텀 피처. 기술적 신호와 이중계산.
+#
+# 어느 쪽도 원하는 게 아니므로 **감성에서 제외** 하고 주목도(attention)와
+# 이벤트 플래그로만 보존합니다. 값은 강도이지 방향이 아닙니다.
+#
+# 검증법: engine/causality.leakage_shift_test() 를 국내 슬리브에 돌리세요.
+# 이 표현들이 감성에 들어가 있으면 +1일 시프트 후에도 IC 가 남습니다.
+PRICE_MOVE_KO = {
+    "급등": 1.0, "상한가": 1.0, "신고가": 0.9, "최고가": 0.8, "돌파": 0.7,
+    "강세": 0.7, "반등": 0.6, "상승": 0.6, "오름": 0.5,
+    "급락": 1.0, "하한가": 1.0, "폭락": 1.0, "신저가": 0.9, "최저가": 0.8,
+    "약세": 0.7, "하락": 0.6, "내림": 0.5, "미끄러": 0.6,
+}
+
+# 제목 **앞부분** 에 이게 있으면 그 기사는 통째로 가격서술로 봅니다.
+HEADLINE_BLOCKLIST_KO = ("특징주", "이 시각", "장중", "시황", "마감", "개장")
+
+# 반전 동사는 단일 토큰이고 실제로 최고 신호입니다 — 감성이 아니라
+# **MWE 이벤트 피처** 로 다룹니다. 가격서술과 달리 이건 사건입니다.
+MWE_EVENT_KO = ("흑자전환", "적자전환", "어닝서프라이즈", "어닝쇼크",
+                "감자", "유상증자", "무상증자", "상장폐지", "거래정지")
+
+# 이 스위치를 False 로 두면 예전 동작(가격서술을 감성에 포함)으로 즉시 되돌아갑니다.
+BLOCK_PRICE_DESCRIPTIVE = True
+
+# ---------------------------------------------------------------------------
+# 감성 사전 — 사건과 전망만 남깁니다
 # ---------------------------------------------------------------------------
 # 값은 표현의 강도(0~1). 국내 증권기사에서 실제로 자주 쓰이는 표현 위주로 구성했습니다.
+# **가격 움직임 서술은 위 PRICE_MOVE_KO 로 옮겼습니다.**
 KO_POSITIVE = {
-    "급등": 1.0, "상한가": 1.0, "신고가": 0.9, "최고가": 0.8, "돌파": 0.7,
-    "강세": 0.7, "반등": 0.6, "상승": 0.6, "오름": 0.5, "회복": 0.5,
+    "회복": 0.5,
     "호실적": 0.9, "실적 개선": 0.8, "어닝서프라이즈": 1.0, "흑자": 0.8,
     "흑자전환": 0.9, "사상 최대": 0.9, "최대 실적": 0.9, "수주": 0.7,
     "계약 체결": 0.7, "공급계약": 0.7, "수출": 0.4, "증설": 0.5,
@@ -55,8 +92,7 @@ KO_POSITIVE = {
 }
 
 KO_NEGATIVE = {
-    "급락": 1.0, "하한가": 1.0, "폭락": 1.0, "신저가": 0.9, "최저가": 0.8,
-    "약세": 0.7, "하락": 0.6, "내림": 0.5, "부진": 0.7, "미끄러": 0.6,
+    "부진": 0.7,
     "어닝쇼크": 1.0, "적자": 0.8, "적자전환": 0.9, "손실": 0.7, "실적 악화": 0.9,
     "감익": 0.7, "역성장": 0.8, "매출 감소": 0.7,
     "목표주가 하향": 1.0, "하향": 0.6, "매도 의견": 0.8, "매도의견": 0.8,
@@ -196,7 +232,54 @@ def _is_negated(lowered: str, key: str, negators: list | None) -> bool:
     return any(n in tail for n in negators)
 
 
+def is_price_descriptive(title: str) -> bool:
+    """제목이 「특징주」류 — 이미 일어난 가격 움직임의 서술인가.
+
+    제목 **앞부분** 만 봅니다. 「특징주」는 관례적으로 맨 앞에 붙고, 본문 중간의
+    '급등' 은 전망일 수 있기 때문입니다("수출 급등 전망").
+    """
+    t = (title or "").strip()
+    if not t:
+        return False
+    head = t[:14]
+    if any(pat in head for pat in HEADLINE_BLOCKLIST_KO):
+        return True
+    # 제목 전체가 사실상 "종목명 + 가격서술" 뿐인 경우
+    hits = [w for w in PRICE_MOVE_KO if w in t]
+    if not hits:
+        return False
+    has_event = any(w in t for w in KO_POSITIVE) or any(w in t for w in KO_NEGATIVE)
+    return not has_event
+
+
+def price_move_strength(title: str) -> float:
+    """가격서술 표현의 강도(0~1). **부호가 없습니다** — 주목도 용도입니다."""
+    t = title or ""
+    hits = [v for w, v in PRICE_MOVE_KO.items() if w in t]
+    return float(max(hits)) if hits else 0.0
+
+
+def event_tags(title: str) -> list:
+    """MWE 이벤트 태그. 감성과 별개로 운반합니다."""
+    t = title or ""
+    return [w for w in MWE_EVENT_KO if w in t]
+
+
 def score_sentiment_ko(title: str) -> tuple[float, list]:
+    """한국어 제목의 감성 점수.
+
+    ★ 가격서술 기사는 **감성 0** 을 돌려줍니다 (BLOCK_PRICE_DESCRIPTIVE=True 일 때).
+    근거는 PRICE_MOVE_KO 주석에 있습니다. 태그는 남겨서 화면에서 왜 0 인지
+    보이게 합니다.
+    """
+    if BLOCK_PRICE_DESCRIPTIVE and is_price_descriptive(title):
+        tags = event_tags(title)
+        marks = ["※가격서술 기사 — 감성 제외(주목도로만 반영)"]
+        if tags:
+            # 「특징주」 기사라도 진짜 사건이 함께 언급되면 그것은 남깁니다
+            score, matched = _score(title, KO_POSITIVE, KO_NEGATIVE, KO_NEGATORS)
+            return score, (matched or []) + marks + [f"이벤트:{','.join(tags)}"]
+        return 0.0, marks
     return _score(title, KO_POSITIVE, KO_NEGATIVE, KO_NEGATORS)
 
 
@@ -370,14 +453,24 @@ def _market_feed_news(symbol, feeds: list, korean: bool, limit: int) -> list[New
     return items
 
 
-def get_news(symbol, limit: int = 20) -> list[NewsItem]:
+def get_news(symbol, limit: int = 20, include_save: bool = True) -> list[NewsItem]:
     """ResolvedSymbol -> 뉴스 목록 (최신순, 중복 제거).
 
     소스를 여러 곳에서 모으는 이유: 종목 전용 피드만 쓰면 감성이 잡히는 기사가
     몇 건뿐이라 표본 확신도 감쇠에 걸려 뉴스 점수가 거의 0이 됩니다.
+
+    include_save=False 는 자동매매 경로 전용입니다 — 세이브(SAVE) 속보는 아직
+    분석 화면에서만 검증 중이라, 주문 판단에는 반영하지 않습니다.
     """
     if symbol.market == MARKET_US:
-        items = _yahoo_news_en(symbol, limit)
+        items = []
+        if include_save:
+            # 세이브(SAVE) 속보가 가장 빠르므로 1순위. 태깅이 없는 종목은 빈 리스트가
+            # 돌아와 아래 소스들이 그대로 채웁니다. (함수 안 import 는 순환참조 회피)
+            from data_sources import oceansave_crawler
+            items = oceansave_crawler.get_news(symbol.key, limit)
+        if len(items) < limit:
+            items += _yahoo_news_en(symbol, limit - len(items))
         if len(items) < limit:
             items += _market_feed_news(symbol, US_MARKET_FEEDS, False, limit - len(items))
     else:
@@ -476,14 +569,52 @@ def aggregate_news_score(news_items: list[NewsItem]) -> float:
     return round(direction * confidence, 4)
 
 
+def news_attention(news_items: list[NewsItem]) -> dict:
+    """주목도 — 가격서술 기사를 **버리지 않고** 여기로 보냅니다.
+
+    「특징주」 기사는 수익률 방향에 대해서는 아무것도 말해주지 않지만,
+    **2차 모멘트(거래량·변동성)에 대해서는 말해줍니다.** 뉴스가 안정적으로
+    예측하는 것은 방향이 아니라 분산입니다 — 이건 모든 연구에서 일관됩니다.
+
+    그래서 용도가 다릅니다.
+        sentiment  → 방향 판단 (사건 기사만)
+        attention  → **사이징 축소** 판단 (전체 기사량)
+
+    주목도가 평소보다 높으면 무조건부 변동성으로 산정한 포지션이 체계적으로
+    과대합니다. 수익률 예측력이 전혀 없어도 리스크 게이트로는 정당합니다.
+    """
+    if not news_items:
+        return {"total": 0, "price_descriptive": 0, "attention_score": 0.0}
+
+    desc = [n for n in news_items if is_price_descriptive(n.title or "")]
+    strengths = [price_move_strength(n.title or "") for n in news_items]
+    tags: list = []
+    for n in news_items:
+        tags.extend(event_tags(n.title or ""))
+
+    return {
+        "total": len(news_items),
+        "price_descriptive": len(desc),
+        "price_descriptive_share": round(len(desc) / len(news_items), 3),
+        # 가격서술의 강도 평균 — 부호 없음. 클수록 "지금 움직이고 있다"
+        "attention_score": round(float(sum(strengths) / len(news_items)), 4),
+        "max_move_strength": round(float(max(strengths)) if strengths else 0.0, 3),
+        "event_tags": sorted(set(tags)),
+        "note": ("가격서술 기사는 감성에서 제외되고 여기에만 잡힙니다. "
+                 "방향이 아니라 사이징에 쓰세요."),
+    }
+
+
 def summarize_news(news_items: list[NewsItem]) -> dict:
     """대시보드 표시용 집계 (긍정/부정/중립 건수)."""
     positive = sum(1 for n in news_items if n.sentiment_score > 0.1)
     negative = sum(1 for n in news_items if n.sentiment_score < -0.1)
-    return {
+    out = {
         "total": len(news_items),
         "positive": positive,
         "negative": negative,
         "neutral": len(news_items) - positive - negative,
         "sources": sorted({n.source.split(" · ")[0] for n in news_items}),
     }
+    out.update({"attention": news_attention(news_items)})
+    return out

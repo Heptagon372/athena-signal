@@ -58,14 +58,30 @@ MARKET_DERIV = "KRX_DERIV"          # 파생상품 시장 (models.MARKET_* 와 �
 # ---------------------------------------------------------------------------
 
 FEE_STOCK_KR = 0.00015        # 위탁수수료 0.015%
-TAX_STOCK_KR = 0.0018         # 증권거래세 0.18% (매도)
 FEE_STOCK_US = 0.0025         # 미국 0.25% (환전 포함 근사)
 FEE_FUTURES = 0.00003         # 선물 위탁수수료 0.003% (명목금액 기준)
 FEE_OPTION = 0.003            # 옵션 위탁수수료 0.3% (프리미엄 기준)
 
 # ETF 는 매도 시 증권거래세가 면제됩니다. 이걸 빼먹으면 백테스트가 실제보다
-# 0.18%씩 나쁘게 나와서, 짧은 회전 전략을 전부 "수익 안 남"으로 잘못 판정합니다.
+# 0.20%씩 나쁘게 나와서, 짧은 회전 전략을 전부 "수익 안 남"으로 잘못 판정합니다.
 TAX_ETF_KR = 0.0
+
+# ⚠ 증권거래세는 상수가 아니라 **시간의 함수**입니다.
+#   2023년 0.20% → 2024년 0.18% → 2025년 0.15% → 2026-01-01 0.20%(인상).
+#   상수 하나로 두면 두 가지가 동시에 틀립니다:
+#     · 오늘 주문의 비용을 과소평가한다        (실매매가 손해)
+#     · 2020년 백테스트에 2026년 세율을 쓴다   (백테스트가 과도하게 비관적)
+#   그래서 engine/markets.py 의 시행일 테이블에서 조회합니다.
+#   `costs(..., when=봉_날짜)` 로 넘기세요. 생략하면 오늘 세율입니다.
+#
+#   하위호환: 아래 이름은 **현재 시점** 세율을 가리킵니다. 새 코드에서는 쓰지 말고
+#   markets.sell_tax_rate(date, board) 를 직접 부르세요.
+def _current_stock_tax_kr() -> float:
+    from engine import markets
+    return markets.sell_tax_rate(None, "KOSPI")
+
+
+TAX_STOCK_KR = _current_stock_tax_kr()
 
 # ---------------------------------------------------------------------------
 # 파생상품 계약 명세
@@ -258,8 +274,14 @@ class Instrument:
             return gross * self.margin_rate
         return gross
 
-    def costs(self, side: str, notional: float) -> tuple[float, float]:
-        """(수수료, 세금). 자산군마다 다릅니다."""
+    def costs(self, side: str, notional: float, when=None) -> tuple[float, float]:
+        """(수수료, 세금). 자산군마다 다릅니다.
+
+        `when` — 이 거래가 일어난 **날짜**. 증권거래세율이 시행일마다 다르므로
+        백테스트에서는 반드시 그 봉의 날짜를 넘기세요. 생략하면 오늘 세율이라,
+        2020년 매매에 2026년 세율(0.20%)이 붙어 성과가 실제보다 나쁘게 나옵니다.
+        실매매는 생략해도 맞습니다 — 오늘이 곧 거래일이니까요.
+        """
         notional = abs(float(notional))
         if self.asset_class == FUTURES:
             return round(notional * FEE_FUTURES, 2), 0.0
@@ -270,8 +292,9 @@ class Instrument:
         fee = round(notional * FEE_STOCK_KR, 2)
         if side != "sell":
             return fee, 0.0
-        tax_rate = TAX_ETF_KR if self.asset_class == ETF else TAX_STOCK_KR
-        return fee, round(notional * tax_rate, 2)
+        from engine import markets
+        board = "ETF" if self.asset_class == ETF else "KOSPI"
+        return fee, round(notional * markets.sell_tax_rate(when, board), 2)
 
     def to_dict(self) -> dict:
         return {

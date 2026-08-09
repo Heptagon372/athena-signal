@@ -7,3 +7,7 @@ feedparser
 fastapi
 uvicorn
 websockets
+
+# 계정 저장소 (구글 로그인). [srv] = Atlas 의 mongodb+srv:// URI 용 dnspython.
+# 설치하지 않아도 앱은 정상 동작하고 구글 로그인만 꺼집니다 (ACCOUNTS.md 2-5).
+pymongo[srv]
