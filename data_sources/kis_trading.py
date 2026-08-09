@@ -1346,7 +1346,7 @@ def diagnose() -> dict:
         checks.append({"name": name, "ok": bool(ok), "detail": str(detail)[:200]})
 
     add("APP KEY / SECRET", st["keys_configured"],
-        "설정됨" if st["keys_configured"] else "setup_kis.bat 으로 등록하세요")
+        "설정됨" if st["keys_configured"] else "아테나.bat → [7] API 키 에서 등록하세요")
     add("계좌번호", st["account_configured"],
         st["account_masked"] or "KIS_ACCOUNT=12345678-01 형식으로 설정")
 
@@ -1430,7 +1430,7 @@ def self_check():
     print(f"  실주문 허용    : {'예' if st['live_enabled'] else '아니오 (잠김)'}")
 
     if not st["keys_configured"]:
-        print("\n  KIS_APP_KEY / KIS_APP_SECRET 을 설정하세요 (setup_kis.bat).")
+        print("\n  KIS_APP_KEY / KIS_APP_SECRET 을 설정하세요 (아테나.bat → [7] API 키).")
         return
     if not st["account_configured"]:
         print("\n  KIS_ACCOUNT=12345678-01 형식으로 계좌번호를 설정하세요.")

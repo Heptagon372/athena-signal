@@ -26,17 +26,23 @@
     </div>
     <div class="row" style="margin-top:8px;align-items:center">
       <span class="muted" style="font-size:12px">추적 시장</span>
-      <label class="chk" style="margin:0"><input type="checkbox" id="cfg_mkt_kr"> 한국 (KRX)</label>
-      <label class="chk" style="margin:0"><input type="checkbox" id="cfg_mkt_us"> 미국 (NYSE·NASDAQ)</label>
+      <span id="segBox" class="row" style="gap:10px;margin:0"></span>
       <span style="flex:1"></span>
       <label class="chk" style="margin:0"><input type="checkbox" id="cfg_auto_universe_keep_manual">
         손으로 넣은 종목은 유지</label>
+    </div>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <span class="muted" style="font-size:12px">탐색 범위</span>
+      <select id="poolSelect" style="width:auto;min-width:190px"></select>
+      <span class="note" id="poolSelectNote" style="margin:0"></span>
     </div>
     <div class="note">
       추적은 <b>종목 선정까지만</b> 합니다. 실제 주문은 상단 [시작] 으로 자동매매를 켜야 나갑니다.
       다중 팩터(모멘텀 · 상대강도(IBD식) · 트렌드템플릿(미너비니) · U/D 거래량비(오닐) ·
       추세품질 · 위험조정 · 스마트머니 · 경제물리학 · 화제성)를 국면 가중으로 합산하며,
       표준화는 <b>같은 시장 후보끼리만</b> 합니다 — 한국·미국을 함께 추적해도 점수가 왜곡되지 않습니다.
+      <br>탐색 범위를 고르면 <b>그 안에서만</b> 찾습니다. 코스피200·KRX100 은 지수 전체를 훑고,
+      코스닥150·섹터는 그 지수를 추종하는 ETF 의 구성종목(비중 상위)에서 찾습니다.
     </div>
   </section>
 
@@ -83,9 +89,13 @@ window.PAGE = {
     A.$("btnAddUni").onclick = () => this.addUniverse();
     A.$("uniInput").onkeydown = (e) => { if (e.key === "Enter") this.addUniverse(); };
     ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score",
-     "auto_universe_keep_manual", "mkt_kr", "mkt_us"].forEach((k) => {
+     "auto_universe_keep_manual"].forEach((k) => {
       const el = A.$("cfg_" + k); if (el) el.onchange = () => { this._dirty = true; };
     });
+    A.$("poolSelect").onchange = () => {
+      this._dirty = true;
+      this.renderPool(A.readSegments("segBox"), A.$("poolSelect").value);
+    };
     this.loadSaved();
     setInterval(() => {
       if (AT.SNAP?.config?.auto_universe) this.loadSaved();
@@ -119,11 +129,25 @@ window.PAGE = {
       ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
         .forEach((k) => { const el = A.$("cfg_" + k); if (el) el.value = cfg[k] ?? ""; });
       A.$("cfg_auto_universe_keep_manual").checked = !!cfg.auto_universe_keep_manual;
-      const markets = cfg.auto_universe_markets || ["KR"];
-      A.$("cfg_mkt_kr").checked = markets.includes("KR");
-      A.$("cfg_mkt_us").checked = markets.includes("US");
+      // 서버가 정규화한 값을 씁니다 — 예전 설정("KR")도 코스피·코스닥으로 풀려서 옵니다
+      const scope = snap.search_scope || {};
+      this.renderScope(scope.segments || ["KOSPI", "KOSDAQ"], scope.universe || "");
     }
     this.renderUniverse(cfg.universe || [], snap.universe_detail || []);
+  },
+
+  /** 시장 체크박스 + 탐색 범위 드롭다운. 시장을 바꾸면 범위 목록도 따라 바뀝니다. */
+  async renderScope(segments, pool) {
+    const A = AT;
+    await A.renderSegments("segBox", segments, (next) => {
+      this._dirty = true;
+      this.renderPool(next, A.$("poolSelect").value);
+    });
+    await this.renderPool(segments, pool);
+  },
+
+  async renderPool(segments, pool) {
+    await AT.renderUniverse("poolSelect", segments, pool);
   },
 
   renderUniverse(list, detail) {
@@ -226,11 +250,16 @@ window.PAGE = {
     ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
       .forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
     patch.auto_universe_keep_manual = A.$("cfg_auto_universe_keep_manual").checked;
-    const markets = [];
-    if (A.$("cfg_mkt_kr").checked) markets.push("KR");
-    if (A.$("cfg_mkt_us").checked) markets.push("US");
-    if (!markets.length) { A.$("cfg_mkt_kr").checked = true; markets.push("KR"); }
+    let markets = A.readSegments("segBox");
+    if (!markets.length) {
+      // 시장을 하나도 안 고르면 훑을 데가 없습니다. 조용히 코스피로 되돌립니다.
+      markets = ["KOSPI"];
+      await A.renderSegments("segBox", markets, (next) => {
+        this._dirty = true; this.renderPool(next, A.$("poolSelect").value);
+      });
+    }
     patch.auto_universe_markets = markets;
+    patch.auto_universe_pool = A.$("poolSelect").value || "";
     try {
       await A.call("/autotrade/config", {method: "POST", body: {config: patch}});
       this._dirty = false; await A.refresh();

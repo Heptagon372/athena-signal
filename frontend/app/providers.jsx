@@ -9,6 +9,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 import { api, clearToken, getToken, setToken, Unauthorized } from "./lib/api";
+import { pickGoogleAccount } from "./lib/firebase";
 
 const AuthContext = createContext(null);
 const ThemeContext = createContext(null);
@@ -133,18 +134,33 @@ export function Providers({ children }) {
   }, []);
 
   /**
-   * 구글 로그인 시작 — 동의 화면으로 **페이지 전체를 이동**시킵니다.
+   * 구글 로그인 (Firebase) — 계정 선택 창을 띄우고 그 자리에서 끝냅니다.
    *
-   * 팝업이나 iframe 을 쓰지 않는 이유: 파이어폭스는 Total Cookie Protection 이
-   * 기본값이라 서드파티 쿠키를 격리합니다. 구글 One Tap 류는 파폭에서 조용히
-   * 실패합니다. 전체 페이지 이동은 그 문제를 아예 만들지 않습니다.
+   * 페이지 이동이 없으므로 콜백 화면도, 1회용 핸드오프 코드도 필요 없습니다.
+   * 세션 토큰은 아이디/비번 로그인과 똑같이 POST 응답 본문으로만 옵니다 —
+   * URL·브라우저 히스토리·서버 로그 어디에도 남지 않습니다.
+   *
+   * @param {{apiKey: string, authDomain: string, projectId: string}} config
+   *        서버(/api/auth/providers)가 내려준 공개 설정
+   */
+  const loginWithGoogle = useCallback(async (config) => {
+    const idToken = await pickGoogleAccount(config);
+    const data = await api.post("/auth/firebase/session", { id_token: idToken });
+    setToken(data.token);
+    setUser(data.user);
+    return data.user;
+  }, []);
+
+  /**
+   * 구글 로그인 (구버전 OAuth) — Firebase 가 설정되지 않았을 때만 씁니다.
+   * 동의 화면으로 **페이지 전체를 이동**시키고, 돌아오는 곳은 /auth/callback 입니다.
    *
    * origin 을 직접 실어 보내는 이유: 이 요청은 브라우저가 아니라 Next 서버가
    * 프록시로 대신 보내므로 Origin·Referer 헤더가 백엔드까지 가지 않습니다.
    * 127.0.0.1 로 들어온 사람을 localhost 로 되돌리면 localStorage 가 오리진별이라
    * 토큰이 딴 곳에 저장돼 로그인이 풀립니다.
    */
-  const loginWithGoogle = useCallback(async (next = "/") => {
+  const loginWithGoogleRedirect = useCallback(async (next = "/") => {
     const query = new URLSearchParams({ next, origin: window.location.origin });
     const data = await api.get(`/auth/google/start?${query}`, { timeout: 15000 });
     if (!data?.auth_url) throw new Error("구글 로그인 주소를 받지 못했습니다.");
@@ -170,7 +186,7 @@ export function Providers({ children }) {
       <SymbolContext.Provider value={{ symbol, setSymbol, symbolReady }}>
         <AuthContext.Provider
           value={{ user, ready, login, register, logout,
-                   loginWithGoogle, completeGoogleLogin }}>
+                   loginWithGoogle, loginWithGoogleRedirect, completeGoogleLogin }}>
           {children}
         </AuthContext.Provider>
       </SymbolContext.Provider>

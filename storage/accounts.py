@@ -54,8 +54,137 @@ class AccountsUnavailable(RuntimeError):
 # 연결
 # ---------------------------------------------------------------------------
 
+# URI 의 사용자정보(아이디:비밀번호) 안에서 그대로 쓰면 주소를 깨뜨리는 글자들.
+# RFC 3986 이 이 자리에 허용하지 않는 문자입니다.
+_MUST_ESCAPE = ":/?#[]@"
+
+
+def _looks_percent_encoded(text: str, index: int) -> bool:
+    """text[index] 의 % 가 %XX 삼중자의 시작인지."""
+    return (index + 2 < len(text)
+            and all(c in "0123456789abcdefABCDEF" for c in text[index + 1:index + 3]))
+
+
+def _escape_userinfo(part: str) -> str:
+    """아이디/비밀번호 한 조각을 URI 에 실을 수 있는 형태로 만듭니다.
+
+    **이미 %XX 로 적혀 있는 것은 건드리지 않습니다.** 그래서 두 번 걸어도 결과가
+    같습니다 — 이미 인코딩해 둔 사람의 비밀번호를 %2540 으로 망가뜨리지 않습니다.
+    (RFC 3986 상 `%40` 은 언제나 `@` 를 뜻하므로, 이 해석이 규격에 맞습니다.)
+    """
+    from urllib.parse import quote
+
+    out = []
+    i = 0
+    while i < len(part):
+        ch = part[i]
+        if ch == "%" and _looks_percent_encoded(part, i):
+            out.append(part[i:i + 3])
+            i += 3
+            continue
+        if ch == "%" or ch in _MUST_ESCAPE or ord(ch) > 127:
+            out.append(quote(ch, safe=""))      # 한글 비밀번호도 UTF-8 로 처리됩니다
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def normalize_mongo_uri(uri: str) -> str:
+    """비밀번호에 `@`·`#` 같은 글자가 있어도 붙게 만듭니다.
+
+    Atlas 가 주는 접속 문자열에 비밀번호를 **그대로** 붙여 넣는 것이 자연스러운
+    동작인데, pymongo 는 거기서
+
+        Username and password must be escaped according to RFC 3986,
+        use urllib.parse.quote_plus
+
+    로 거절합니다. 영문 오류 하나를 보고 비밀번호를 손으로 `%40` 으로 바꿔 적으라고
+    요구하는 대신 여기서 처리합니다. 사용자가 만질 것은 자기 비밀번호뿐이어야 합니다.
+
+    경계를 찾는 순서가 중요합니다. 경로·쿼리(`/` `?` `#`)를 **먼저** 잘라내면
+    `p#w` 같은 비밀번호에서 엉뚱한 자리가 잘립니다. 그래서 `@` 를 먼저 봅니다:
+    호스트에는 `@` 가 올 수 없으므로 **마지막** `@` 가 사용자정보의 끝이고,
+    경로·쿼리는 그 뒤에서 찾습니다. 비밀번호 안에 `@ # / ?` 가 몇 개 있든
+    경계가 흔들리지 않습니다.
+    """
+    uri = (uri or "").strip()
+    scheme, sep, rest = uri.partition("://")
+    if not sep:
+        return uri
+
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at:
+        return uri                                  # 아이디·비밀번호가 없는 URI
+
+    # 호스트가 끝나는 자리 — 경로·쿼리·프래그먼트 앞
+    end = len(hostpart)
+    for mark in ("/", "?", "#"):
+        found = hostpart.find(mark)
+        if found != -1:
+            end = min(end, found)
+    host, tail = hostpart[:end], hostpart[end:]
+    if not host:
+        return uri                                  # 호스트가 없다 = 우리가 손댈 URI 가 아님
+
+    user, colon, password = userinfo.partition(":")     # 첫 : 가 구분자
+    fixed = _escape_userinfo(user)
+    if colon:
+        fixed += ":" + _escape_userinfo(password)
+
+    return f"{scheme}://{fixed}@{host}{tail}"
+
+
 def mongo_uri() -> str:
-    return credentials.get("MONGODB_URI", "")
+    return normalize_mongo_uri(credentials.get("MONGODB_URI", ""))
+
+
+# 접속 실패의 원문 → 무엇을 해야 하는지. 위에서부터 먼저 맞는 것을 씁니다.
+#
+# 이 표가 필요한 이유: pymongo 의 접속 실패 메시지는 영어인 데다, 세 노드의
+# ServerDescription 을 통째로 붙여 2000자가 넘습니다. 그중 정작 필요한 한 줄
+# ("Atlas 에 내 IP 를 등록하세요")은 어디에도 없습니다. 여기서 막히면 진도가
+# 통째로 멈추는 자리라, 원인을 짚어주는 것이 그대로 두는 것보다 훨씬 낫습니다.
+_ERROR_HINTS = (
+    (("escaped", "quote_plus"),
+     "비밀번호에 URI 에 못 쓰는 글자가 있습니다. 보통은 자동으로 처리되니, "
+     "이 오류가 계속 나면 비밀번호를 영문·숫자로만 바꿔 보세요."),
+    # 자리표시자 이름을 그대로 찾습니다. `<`/`>` 만 보면 실패 원문에 섞여 오는
+    # `<ServerDescription ...>` 에 걸려 엉뚱한 안내가 나갑니다.
+    (("<db_password>", "<password>", "<username>", "<db_username>"),
+     "접속 문자열에 <db_password> 같은 자리표시자가 그대로 남아 있습니다. "
+     "Atlas 에서 정한 실제 비밀번호로 바꿔 주세요."),
+    (("Invalid URI scheme", "invalid uri scheme"),
+     "주소는 mongodb:// 또는 mongodb+srv:// 로 시작해야 합니다. "
+     "Atlas 라면 Connect → Drivers → Python 의 문자열을 그대로 쓰세요."),
+    (("bad auth", "Authentication failed", "AuthenticationFailed"),
+     "아이디 또는 비밀번호가 다릅니다. Atlas → Database Access 에서 "
+     "그 사용자의 비밀번호를 다시 지정해 보세요."),
+    (("TLSV1_ALERT_INTERNAL_ERROR", "SSL handshake failed", "handshake"),
+     "Atlas 가 접속을 거부했습니다. 대개 **내 IP 가 등록되지 않은 것**입니다 — "
+     "Atlas → Network Access → Add IP Address → Add Current IP Address. "
+     "(클러스터가 일시중지(paused)된 경우에도 같은 오류가 납니다.)"),
+    (("No servers found", "SRV", "resolution lifetime", "DNS operation timed out"),
+     "클러스터 주소를 DNS 에서 찾지 못했습니다. 주소에 오타가 없는지, "
+     "인터넷이 되는지 확인해 주세요."),
+    (("Connection refused", "10061", "actively refused", "timed out", "Timeout"),
+     "클러스터에 닿지 못했습니다. Atlas 라면 Network Access 의 IP 등록과 "
+     "클러스터가 실행 중인지(일시중지 아님)를, 로컬이라면 MongoDB 서비스가 "
+     "켜져 있는지 확인해 주세요."),
+)
+
+# 원문은 진단에 쓸 만큼만 남깁니다. 전체는 세 노드 상태를 다 붙여 2000자가 넘습니다.
+_ERROR_TEXT_LIMIT = 180
+
+
+def explain_mongo_error(exc: Exception, prefix: str) -> str:
+    """pymongo 예외를 사람이 읽고 **행동할 수 있는** 한 문장으로 바꿉니다."""
+    text = str(exc)
+    for needles, hint in _ERROR_HINTS:
+        if any(needle in text for needle in needles):
+            short = text.split(",")[0][:_ERROR_TEXT_LIMIT]
+            return f"{prefix}: {hint}\n    (원문: {short})"
+    return f"{prefix}: {text[:_ERROR_TEXT_LIMIT]}"
 
 
 def db_name() -> str:
@@ -100,7 +229,7 @@ def _db():
                 appname="athena-signal",
             )
         except Exception as exc:      # 잘못된 URI 형식 등
-            raise AccountsUnavailable(f"MongoDB 연결 설정이 잘못됐습니다: {exc}") from exc
+            raise AccountsUnavailable(explain_mongo_error(exc, "MongoDB 연결 설정이 잘못됐습니다")) from exc
 
     database = _client[db_name()]
     _ensure_indexes(database)
@@ -133,7 +262,8 @@ def _ensure_indexes(database):
     except Exception as exc:
         # 인덱스를 못 만들어도(권한 제한 등) 읽기·쓰기는 됩니다. 연결 자체가
         # 죽은 경우라면 바로 뒤의 실제 쿼리에서 어차피 드러납니다.
-        raise AccountsUnavailable(f"MongoDB 에 접속할 수 없습니다: {exc}") from exc
+        raise AccountsUnavailable(
+            explain_mongo_error(exc, "MongoDB 에 접속할 수 없습니다")) from exc
     _indexes_ready = True
 
 
@@ -200,7 +330,11 @@ def find_by_google_sub(sub: str) -> dict | None:
 def upsert_google_account(profile: dict) -> dict:
     """구글 프로필로 계정을 찾거나 만듭니다.
 
-    profile 은 data_sources.google_oauth.fetch_identity() 가 돌려준 dict 입니다.
+    profile 은 data_sources.google_oauth.fetch_identity() 또는
+    data_sources.firebase_auth.verify_id_token() 이 돌려준 dict 입니다. 두 흐름이
+    같은 함수를 쓰는 이유는 `sub` 가 양쪽 모두 **구글 계정의 sub** 이기 때문입니다
+    (Firebase 는 firebase.identities["google.com"] 에서 꺼냅니다). 덕분에 예전
+    OAuth 로 만든 계정이 Firebase 로 바꾼 뒤에도 그대로 이어집니다.
     반환값: {"user": {...}, "created": bool}
 
     이메일이 아니라 google_sub 로 찾습니다. 구글에서 이메일을 바꿀 수 있는데,
@@ -221,6 +355,11 @@ def upsert_google_account(profile: dict) -> dict:
         "picture": profile.get("picture", ""),
         "locale": profile.get("locale", ""),
     }
+
+    # Firebase 로 들어온 경우에만 붙습니다. 계정을 찾는 키는 아니고(위 docstring),
+    # 나중에 Firebase 콘솔의 사용자와 대조할 때 쓰는 참고값입니다.
+    if profile.get("firebase_uid"):
+        fresh["firebase_uid"] = profile["firebase_uid"]
 
     existing = database.accounts.find_one({"provider": "google", "google_sub": sub})
     if existing:
@@ -416,13 +555,112 @@ def list_accounts(limit: int = 100) -> list[dict]:
         return []
 
 
+# 사용자 한 명의 데이터가 흩어져 있는 자리. 전부 정수 user_id 를 FK 로 씁니다 (2장).
+_USER_TABLES = (
+    ("예측", "predictions"),
+    ("관심종목", "watchlist"),
+    ("모의보유", "paper_holdings"),
+    ("모의거래", "paper_trades"),
+    ("자동매매주문", "at_orders"),
+    ("세션", "sessions"),
+)
+
+
+def mongo_overview() -> dict:
+    """Mongo 쪽에 무엇이 몇 건 들어 있는지. 못 쓰는 상태면 {"ok": False}."""
+    try:
+        database = _db()
+        counts = {name: database[name].count_documents({})
+                  for name in ("accounts", "sessions", "handoffs", "oauth_state")}
+        counter = database.counters.find_one({"_id": "user_id"}) or {}
+        return {
+            "ok": True,
+            "db": db_name(),
+            "counts": counts,
+            # 다음 사람이 받게 될 번호 — 카운터가 실제로 도는지 확인용
+            "next_user_id": USER_ID_OFFSET + int(counter.get("seq", 0)) + 1,
+            "accounts": list_accounts(),
+        }
+    except AccountsUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:                                       # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def sqlite_overview() -> list[dict]:
+    """SQLite 쪽 사용자별 데이터 건수 — "내 기록이 어디 있나" 에 답하는 표.
+
+    Mongo 가 죽어 있어도 이건 나옵니다. 앱 데이터는 Mongo 와 무관하게
+    `athena.db` 에 있다는 사실 자체가 2장 설계의 요점입니다.
+    """
+    local_users.init()
+    rows = []
+    with local_users._conn() as conn:
+        for user in conn.execute(
+                "SELECT id, username, display_name, password_hash, created_at "
+                "FROM users ORDER BY id").fetchall():
+            # 비밀번호 해시 자리에 표식만 있는 계정은 두 종류입니다. 구글 계정과,
+            # 계정 개념이 생기기 전의 기록을 담아둔 `__local__`. 둘을 같은 줄로
+            # 묶으면 "구글로 로그인한 적 없는데 구글 계정이 있다" 로 읽힙니다.
+            if user["username"] == local_users.LEGACY_USER:
+                origin = "이전기록"
+            elif local_users._is_password_hash(user["password_hash"]):
+                origin = "로컬"
+            else:
+                origin = "구글"
+
+            entry = {
+                "id": user["id"],
+                "username": user["username"],
+                "display_name": user["display_name"],
+                "origin": origin,
+                "external": origin == "구글",
+                "created_at": user["created_at"],
+                "counts": {},
+                "cash": None,
+            }
+            for label, table in _USER_TABLES:
+                try:
+                    entry["counts"][label] = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE user_id = ?",
+                        (user["id"],)).fetchone()[0]
+                except Exception:                                  # noqa: BLE001
+                    entry["counts"][label] = 0      # 오래된 DB 에 없는 테이블
+            try:
+                found = conn.execute("SELECT cash FROM paper_account WHERE user_id = ?",
+                                     (user["id"],)).fetchone()
+                if found:
+                    entry["cash"] = float(found["cash"])
+            except Exception:                                      # noqa: BLE001
+                pass
+            rows.append(entry)
+    return rows
+
+
 if __name__ == "__main__":
-    # python -m storage.accounts  — 설정이 실제로 되는지 확인 (setup_google.bat 안내)
+    # python -m storage.accounts  — 설정이 실제로 되는지 확인 ([8] 구글 로그인 안내)
     import sys
 
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    from data_sources import google_oauth
+    import unicodedata
+
+    from data_sources import firebase_auth, google_oauth
+
+    def _cells(text: str) -> int:
+        """터미널에서 차지하는 칸 수 — 한글·한자는 두 칸입니다.
+
+        len() 으로 맞추면 한글이 섞인 표가 통째로 어긋납니다.
+        """
+        return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+    def _pad(text: str, columns: int) -> str:
+        return text + " " * max(0, columns - _cells(text))
+
+    def _cut(text: str, columns: int) -> str:
+        while _cells(text) > columns:
+            text = text[:-1]
+        return text
 
     print("=" * 62)
     print("  아테나 시그널 — 계정 저장소 상태")
@@ -440,25 +678,86 @@ if __name__ == "__main__":
     mongo = status()
     if not mongo["configured"]:
         print(f"\n  [미설정] {mongo['reason']}")
+
+    # ---- Mongo 쪽: 신원 -----------------------------------------------------
+    print("\n" + "-" * 62)
+    print("  MongoDB — 신원 (누구인가)")
+    print("-" * 62)
+
+    overview = mongo_overview() if mongo["configured"] else {
+        "ok": False, "error": mongo["reason"]}
+
+    if not overview["ok"]:
+        print(f"\n  연결 안 됨 — {overview['error']}")
+        print("\n  ※ 여기가 비어 있어도 아래 SQLite 의 앱 데이터는 멀쩡합니다.")
     else:
-        result = ping()
-        if result["ok"]:
-            found = list_accounts()
-            print(f"\n  [OK ] MongoDB 연결됨 — 등록된 구글 계정 {len(found)}개")
-            for row in found:
-                print(f"        user_id={row.get('user_id')}  {row.get('email', '')}"
-                      f"  ({row.get('display_name', '')})")
+        labels = {"accounts": "구글 계정", "sessions": "로그인 세션",
+                  "handoffs": "인계 코드", "oauth_state": "OAuth 임시상태"}
+        print()
+        for key, label in labels.items():
+            print(f"  {_pad(label, 16)}{overview['counts'][key]:>5d}건")
+        print(f"  {_pad('다음 user_id', 16)}{overview['next_user_id']:>5d}")
+
+        if overview["accounts"]:
+            print("\n  등록된 구글 계정")
+            for row in overview["accounts"]:
+                print(f"    user_id={row.get('user_id')}  {row.get('email', '')}"
+                      f"  ({row.get('display_name', '')})"
+                      f"  로그인 {row.get('login_count', 0)}회")
         else:
-            print(f"\n  [실패] {result['error']}")
+            print("\n  아직 구글 계정으로 로그인한 사람이 없습니다.")
+
+    # ---- SQLite 쪽: 앱 데이터 ----------------------------------------------
+    print("\n" + "-" * 62)
+    print("  SQLite (athena.db) — 앱 데이터 (무엇을 했는가)")
+    print("-" * 62)
+
+    people = sqlite_overview()
+    if not people:
+        print("\n  계정이 없습니다.")
+    else:
+        header = ["user_id", "계정", "출처"] + [label for label, _ in _USER_TABLES]
+        widths = [9, 20, 10] + [_cells(label) + 2 for label, _ in _USER_TABLES]
+        print()
+        print("  " + "".join(_pad(h, w) for h, w in zip(header, widths)))
+        for person in people:
+            cells = [
+                str(person["id"]),
+                _cut(person["display_name"] or person["username"], 18),
+                person["origin"],
+            ] + [str(person["counts"][label]) for label, _ in _USER_TABLES]
+            print("  " + "".join(_pad(c, w) for c, w in zip(cells, widths)))
+
+        print("\n  모의투자 잔고")
+        for person in people:
+            if person["cash"] is not None:
+                print(f"    user_id={person['id']:<8d} {person['cash']:>15,.0f}원")
+
+    print("\n  ※ user_id 가 두 저장소를 잇는 유일한 끈입니다 (ACCOUNTS.md 2-2).")
+    print("    Mongo 를 통째로 지워도 예측·모의투자 기록은 athena.db 에 남습니다.")
+
+    # ---- 로그인 경로 --------------------------------------------------------
+    # Firebase 가 기본이고 OAuth 는 폴백입니다 (ACCOUNTS.md 0장). 둘 중 **하나만**
+    # 되면 로그인은 켜지므로, 예전처럼 OAuth 만 보고 "꺼짐" 이라고 하면 안 됩니다.
+    print("\n" + "-" * 62)
+    print("  로그인 경로")
+    print("-" * 62)
+
+    firebase = firebase_auth.status()
+    if firebase["configured"]:
+        print(f"\n  [OK ] Firebase — projectId = {firebase['projectId']}")
+        print(f"        authDomain = {firebase['authDomain']}")
+    else:
+        print(f"\n  [미설정] Firebase — {firebase['reason']}")
 
     google = google_oauth.status()
     if google["configured"]:
-        print(f"\n  [OK ] 구글 클라이언트 설정됨")
-        print(f"        redirect_uri = {google['redirect_uri']}")
-        print(f"        ↑ 이 값이 구글 콘솔의 '승인된 리디렉션 URI' 와 같아야 합니다")
+        print(f"\n  [OK ] 구버전 OAuth (폴백) — redirect_uri = {google['redirect_uri']}")
     else:
-        print(f"\n  [미설정] {google['reason']}")
+        print(f"\n  [미설정] 구버전 OAuth (폴백) — {google['reason']}")
 
-    ready = mongo["configured"] and google["configured"]
-    print(f"\n  구글 로그인: {'사용 가능' if ready else '꺼짐 (아이디/비번 로그인은 정상)'}")
-    print("  설정: setup_google.bat 실행 — 자세한 내용은 ACCOUNTS.md\n")
+    ready = mongo["configured"] and (firebase["configured"] or google["configured"])
+    used = "Firebase" if firebase["configured"] else "구버전 OAuth"
+    print(f"\n  구글 로그인: "
+          f"{f'사용 가능 ({used})' if ready else '꺼짐 (아이디/비번 로그인은 정상)'}")
+    print("  설정: 아테나.bat → [8] 구글 로그인 — 자세한 내용은 ACCOUNTS.md\n")

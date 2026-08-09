@@ -2,7 +2,7 @@
  * /api/* → 파이썬 백엔드(8000) 프록시
  *
  * 원래는 next.config.mjs 의 rewrite 로 넘겼습니다. rewrite 는 오류 처리를
- * 끼워 넣을 수 없어서, 백엔드를 재시작(업데이트.bat)하는 동안
+ * 끼워 넣을 수 없어서, 백엔드를 재시작([3] 업데이트)하는 동안
  *
  *   Failed to proxy http://127.0.0.1:8000/... Error: read ECONNRESET
  *

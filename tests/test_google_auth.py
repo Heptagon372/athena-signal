@@ -294,6 +294,17 @@ class FakeCollection:
         pass
 
 
+# 검사용 user_id 대역.
+#
+# 이게 왜 필요한가: 가짜 카운터를 0 에서 시작하면 첫 계정이 user_id=100001 을 받는데,
+# 그건 **진짜 첫 구글 계정이 받는 번호와 똑같습니다.** 그 상태로 아래 정리 단계가
+# `DELETE FROM users WHERE id = 100001` 을 돌면 남의 계정을 지웁니다. 실제로 한 번
+# 그렇게 지웠습니다(모의계좌·세션까지). 검사는 진짜 데이터가 절대 닿을 수 없는
+# 번호대에서만 놀아야 합니다. (tests/test_firebase_auth.py 도 같은 대역을 씁니다.)
+TEST_USER_SEQ = 900_000_000
+TEST_ID_FLOOR = accounts.USER_ID_OFFSET + TEST_USER_SEQ
+
+
 class FakeDB:
     def __init__(self):
         self.oauth_state = FakeCollection()
@@ -301,6 +312,7 @@ class FakeDB:
         self.sessions = FakeCollection()
         self.accounts = FakeCollection()
         self.counters = FakeCollection()
+        self.counters.insert_one({"_id": "user_id", "seq": TEST_USER_SEQ})
 
 
 fake = FakeDB()
@@ -400,6 +412,9 @@ try:
     check("google_sub 로 저장된다", account_doc["google_sub"] == PROFILE["sub"])
     check("user_id 가 오프셋 위에서 발급된다", account_doc["user_id"] > accounts.USER_ID_OFFSET,
           f"user_id={account_doc['user_id']}")
+    check("검사가 진짜 계정 번호대를 건드리지 않는다",
+          account_doc["user_id"] >= TEST_ID_FLOOR,
+          "겹치면 아래 정리 단계가 진짜 사용자의 행을 지웁니다")
     check("SQLite 에도 같은 id 의 행이 생겼다 (FK 대상)",
           users.find_by_username(f"google:{PROFILE['sub']}")["id"] == account_doc["user_id"])
 
@@ -450,10 +465,17 @@ try:
 finally:
     accounts._db = _real_db
     google_oauth.fetch_identity = _real_fetch
-    # 검사가 SQLite 에 만든 그림자 행·모의계좌 정리
+    # 검사가 SQLite 에 만든 그림자 행·모의계좌 정리.
+    # id 를 그대로 믿고 지우면, 검사용 번호가 진짜 계정과 겹쳤을 때 남의 계정을
+    # 지웁니다. 검사 대역 밖은 무슨 일이 있어도 건드리지 않습니다.
     with users._conn() as conn:
         for uid in created_ids:
+            if uid < TEST_ID_FLOOR:
+                check(f"정리 대상 user_id={uid} 가 검사 대역 안", False,
+                      "진짜 계정일 수 있어 지우지 않았습니다")
+                continue
             conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
             conn.execute("DELETE FROM paper_account WHERE user_id = ?", (uid,))
 
 # ---------------------------------------------------------------------------

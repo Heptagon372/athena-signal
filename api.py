@@ -47,11 +47,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import INITIAL_WEIGHTS, INTRADAY_BARS, PREDICTION_HORIZONS
-from data_sources import (community_crawler, credentials, fx, google_oauth, kis_client,
+from data_sources import (community_crawler, credentials, firebase_auth, fx,
+                          google_oauth, kis_client,
                           kis_realtime,
                           kis_trading,
                           market_clock, news_crawler, oceansave_crawler, scrap_store,
-                          screener, symbol_registry, toss_api)
+                          screener, symbol_registry, toss_api, universe)
 from data_sources import price_provider
 from data_sources.price_provider import get_provider
 from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
@@ -59,7 +60,7 @@ from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
                     scalping, scoring, strategy)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
-from storage import accounts, db, derivatives, paper, users
+from storage import accounts, db, derivatives, paper, user_credentials, users
 
 # 모의투자 평가용 시세 캐시 (종목당 30초)
 _price_cache: dict[str, tuple[float, float | None]] = {}
@@ -125,7 +126,19 @@ def current_user(request: Request) -> dict | None:
     token = _bearer_token(request)
     if not token:
         return None
-    return accounts.user_from_token(token) or users.user_from_token(token)
+    user = accounts.user_from_token(token) or users.user_from_token(token)
+
+    # 이 요청 동안 credentials.get() 이 이 사용자의 저장 키를 먼저 보게 합니다.
+    # 동기 엔드포인트는 요청마다 복사된 컨텍스트의 스레드풀에서 돌기 때문에,
+    # 여기서 장착한 오버레이는 요청이 끝나면 컨텍스트째 사라집니다 — 다음
+    # 요청으로 새지 않습니다 (credentials.attach_user docstring 참고).
+    if user:
+        try:
+            credentials.attach_user(user_credentials.overlay_for(user["id"]))
+        except Exception:                                          # noqa: BLE001
+            # 키 조회 실패가 요청 자체를 죽이면 안 됩니다 — 서버 키로 동작합니다
+            pass
+    return user
 
 
 def require_user(request: Request) -> dict:
@@ -199,7 +212,141 @@ def auth_change_password(req: PasswordChange, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# 구글 로그인 (OAuth 2.0 Authorization Code + PKCE)
+# 사용자별 API 키 (웹 → 설정)
+# ---------------------------------------------------------------------------
+# 키는 MongoDB 에 **암호화**되어 계정 단위로 저장되고, 로그인한 요청·자동매매
+# 회전에서 서버 키 위에 겹쳐 적용됩니다. 설계 근거는 storage/user_credentials.py
+# 모듈 docstring 에 있습니다.
+
+@app.get("/api/keys")
+def user_keys_get(request: Request):
+    """설정 화면 자료 — 마스킹된 상태만 내려갑니다. 값 전체는 절대 안 나갑니다."""
+    user = require_user(request)
+    try:
+        return user_credentials.overview(user["id"])
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+
+class UserKeys(BaseModel):
+    values: dict
+
+
+@app.put("/api/keys")
+def user_keys_save(req: UserKeys, request: Request):
+    """키 저장. 빈 값은 그 키 삭제로 취급합니다 (입력창 비우고 저장 = 삭제)."""
+    user = require_user(request)
+    try:
+        result = user_credentials.save_keys(user["id"], req.values)
+    except user_credentials.EncryptionUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+    if result["rejected"]:
+        # 허용 목록 밖 (서버 설정 키·오타). 어떤 키가 왜 거부됐는지 알려줍니다.
+        return JSONResponse(status_code=400, content={
+            **result,
+            "error": ("저장할 수 없는 키입니다: " + ", ".join(result["rejected"])
+                      + " — 계정에는 토스·KIS·레딧·네이버·KRX·공공데이터 키만 저장됩니다."),
+        })
+    return {**result, **user_credentials.overview(user["id"])}
+
+
+@app.delete("/api/keys/{provider}")
+def user_keys_delete(provider: str, request: Request):
+    """한 서비스의 키 전부 삭제."""
+    user = require_user(request)
+    try:
+        result = user_credentials.delete_provider(user["id"], provider)
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    if not result["ok"]:
+        return JSONResponse(status_code=404, content=result)
+    return {**result, **user_credentials.overview(user["id"])}
+
+
+# ---------------------------------------------------------------------------
+# 구글 로그인 (Firebase Authentication) — 기본 경로
+# ---------------------------------------------------------------------------
+# 브라우저가 Firebase SDK 로 계정 선택 창을 띄우고, 고른 계정의 ID 토큰을 여기로
+# 보냅니다. 서버가 할 일은 두 가지뿐입니다 — 토큰을 검증하고, 세션을 만드는 것.
+#
+# 아래 OAuth 흐름과 달리 리디렉션이 없습니다. 그래서
+#   · 구글 콘솔에 리디렉션 URI 를 등록할 필요가 없고 (설정 실패의 최대 원인이었음)
+#   · state·PKCE·nonce·핸드오프 코드가 모두 필요 없습니다. 세션 토큰이 URL 을
+#     타지 않고 POST 응답 본문으로만 오가기 때문입니다 (아이디/비번 로그인과 동일).
+#
+# 검증 방식과 그 근거는 data_sources/firebase_auth.py 모듈 docstring 에 있습니다.
+
+def _firebase_status() -> dict:
+    """Firebase 로그인을 지금 쓸 수 있는지 — 프로젝트 설정과 Mongo 둘 다 필요합니다."""
+    fb = firebase_auth.status()
+    if not fb["configured"]:
+        return fb
+    mongo = accounts.status()
+    if not mongo["configured"]:
+        return {"configured": False, "reason": mongo["reason"]}
+    return fb
+
+
+@app.get("/api/auth/providers")
+def auth_providers():
+    """로그인 화면이 어떤 버튼을 그릴지 판단하는 근거.
+
+    설정이 없으면 버튼을 아예 그리지 않습니다 — 눌러도 안 되는 버튼을 보여주는
+    것보다 없는 게 낫습니다. 아이디/비번 로그인은 이 값과 무관하게 동작합니다.
+
+    firebase 쪽에는 프론트가 initializeApp() 에 넣을 공개 설정이 함께 옵니다.
+    사용자가 api_keys.json 한 곳만 채우면 되도록(그리고 Next 를 다시 빌드하지
+    않아도 되도록) 서버가 내려줍니다.
+    """
+    return {"firebase": _firebase_status(), "google": _google_status()}
+
+
+class FirebaseSession(BaseModel):
+    id_token: str
+
+
+@app.post("/api/auth/firebase/session")
+def auth_firebase_session(req: FirebaseSession, request: Request):
+    """Firebase ID 토큰 → 우리 세션 토큰.
+
+    실패를 401 로 돌려주는 이유: 프론트의 api.js 는 401 을 Unauthorized 로
+    구분해 다루고, 그 외 상태코드는 error 문자열을 그대로 띄웁니다. 어느 쪽이든
+    사용자에게는 사유가 그대로 보입니다.
+    """
+    try:
+        profile = firebase_auth.verify_id_token(req.id_token)
+        result = accounts.upsert_google_account(profile)
+    except firebase_auth.FirebaseAuthError as exc:
+        # 우리 쪽 설정·네트워크 문제는 503 입니다. 401 로 내려보내면 사용자에게는
+        # "로그인이 거부됐다"로 보여서, 실제로는 서버를 고쳐야 하는 상황에 계정을
+        # 의심하며 계속 다시 눌러보게 됩니다.
+        ours = ("not_configured", "network", "certs_failed", "api_key_restricted",
+                "verify_failed")
+        return JSONResponse(status_code=503 if exc.code in ours else 401,
+                            content={"error": str(exc), "code": exc.code})
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503,
+                            content={"error": str(exc), "code": "mongo_unavailable"})
+
+    user = result["user"]
+    # 기존 로그인 경로와 같게 — 계정마다 모의투자 계좌를 자동 개설합니다
+    paper.ensure_account(user["id"])
+
+    try:
+        token = accounts.create_session(
+            user["id"], user_agent=request.headers.get("user-agent", ""))
+    except accounts.AccountsUnavailable as exc:
+        return JSONResponse(status_code=503,
+                            content={"error": str(exc), "code": "mongo_unavailable"})
+
+    return {"token": token, "user": user, "created": result["created"]}
+
+
+# ---------------------------------------------------------------------------
+# 구글 로그인 (OAuth 2.0 Authorization Code + PKCE) — Firebase 미설정 시 폴백
 # ---------------------------------------------------------------------------
 # 흐름 전체와 각 선택의 근거는 ACCOUNTS.md 3장에 있습니다. 코드를 읽을 때 걸리는
 # 두 가지만 여기 옮겨 둡니다.
@@ -733,7 +880,7 @@ def service_status():
         "total_count": len(creds),
         "active_labels": active,
         "hint": ("공식 API 사용 중: " + ", ".join(active) if active
-                 else "setup_api.bat 을 실행하면 공식 API를 사용합니다 "
+                 else "아테나.bat → [7] API 키 에서 키를 넣으면 공식 API를 사용합니다 "
                       "(미설정 시에도 공개 경로로 정상 동작)"),
         # 하위호환
         "kis_enabled": kis_client.is_configured(),
@@ -1748,7 +1895,7 @@ def _account_identity(mode: str) -> dict:
 # 서버가 옛 코드면 스스로 "재시작하세요"를 띄우게 합니다.
 # 콘솔이 쓰는 엔드포인트를 추가/변경할 때마다 1씩 올리세요 (autotrade.html 의
 # REQUIRED_API 와 짝).
-CONSOLE_API_VERSION = 7
+CONSOLE_API_VERSION = 8
 
 
 # 포지션·계좌 블록 캐시 — 스냅샷의 유일하게 비싼 부분입니다 (시세·잔고 실호출).
@@ -1868,6 +2015,16 @@ def _autotrade_snapshot(user_id: int, include_positions: bool = True) -> dict:
 
     # 초단타는 자기 매매 대상을 따로 들고 있습니다 — 위 universe 와 섞지 않습니다
     payload["scalp_universe"] = autotrade.scalp_universe(cfg)
+
+    # 탐색 범위 — 화면이 "지금 어디에서 찾고 있는지"를 그대로 말할 수 있게
+    # 정규화된 시장 목록과 범위 설명을 같이 내려보냅니다.
+    tracked = universe.normalize_segments(cfg.get("auto_universe_markets"))
+    payload["search_scope"] = {
+        "segments": tracked,
+        "segment_labels": [universe.segment_label(s) for s in tracked],
+        "universe": cfg.get("auto_universe_pool") or "",
+        "universe_detail": universe.describe(cfg.get("auto_universe_pool") or ""),
+    }
 
     if include_positions:
         payload.update(_positions_block(user_id, mode, cfg))
@@ -2110,9 +2267,38 @@ def autotrade_recommend_saved(request: Request):
 
 
 class ScreenerRequest(BaseModel):
-    markets: list[str] | None = None       # ["KR"] | ["US"] | 둘 다
+    # 세부시장 코드 — KOSPI / KOSDAQ / NASDAQ (예전 값 "KR" · "US" 도 받습니다)
+    markets: list[str] | None = None
+    # 탐색 범위 (KOSPI200 / KR_SEMI / …). None = 저장된 설정을 따름,
+    # "" = 이번만 시장 전체.
+    universe: str | None = None
     limit: int = 30
     refresh: bool = False                  # 캐시 무시하고 다시 훑기
+
+
+def _clock_market(segments: list[str]) -> str:
+    """세부시장 목록 → 장 시간 판정용 시장. 국내가 하나라도 있으면 국내 기준."""
+    return "KOSPI" if "KR" in universe.regions_of(segments) else "US"
+
+
+@app.get("/api/autotrade/universes")
+def autotrade_universes(markets: str = ""):
+    """탐색 범위 카탈로그 — 화면의 [지수·ETF] · [섹터] 선택지.
+
+    `markets` 를 콤마로 주면(KOSPI,NASDAQ) 그 시장과 겹치는 범위만 돌려줍니다.
+    코스피만 켜 놓고 '나스닥100'을 고를 수 있으면 결과가 0건으로 나오고,
+    사용자는 그 이유를 알 수 없습니다.
+    """
+    segments = [s for s in (markets or "").split(",") if s.strip()]
+    catalog = universe.list_universes(segments or None)
+    return {
+        "segments": [{"key": key, "label": universe.SEGMENTS[key]["label"],
+                      "region": universe.SEGMENTS[key]["region"]}
+                     for key in universe.PRIMARY_SEGMENTS],
+        "universes": catalog,
+        "groups": [{"key": "index", "label": "지수·ETF"},
+                   {"key": "sector", "label": "섹터"}],
+    }
 
 
 @app.post("/api/autotrade/screener")
@@ -2124,7 +2310,10 @@ def autotrade_screener(req: ScreenerRequest, request: Request):
     user = require_user(request)
     cfg = at_store.get_config(user["id"])
     scalp = scalping.clamp_config(cfg.get("scalp") or {})
-    markets = req.markets or scalp.get("markets") or ["KR"]
+    markets = universe.normalize_segments(req.markets or scalp.get("markets"))
+    # 요청에 범위가 없으면(None) 저장된 설정을 씁니다 — 자동 갱신 루프와 같은
+    # 범위를 보게 하기 위해서입니다. 빈 문자열은 "이번만 전체" 라는 뜻입니다.
+    pool = scalp.get("universe_pool", "") if req.universe is None else req.universe
 
     try:
         brk = broker.get_broker(user["id"], cfg.get("mode", "paper"), cfg)
@@ -2142,14 +2331,15 @@ def autotrade_screener(req: ScreenerRequest, request: Request):
         limit=max(10, min(req.limit * 2, 80)),
         use_cache=not req.refresh,
         rank_basis=scalp.get("rank_basis", "vol_increase"),
-        enrich=True)
+        enrich=True,
+        universe=pool)
 
     ranked = scalping.recommend(scan.candidates, account.get("available_cash") or 0,
                                 account.get("total_value") or 0, scalp)
 
     # 장이 닫혀 있으면 거래대금이 0이라 전부 '부적합'으로 나옵니다.
     # 그걸 설명 없이 보여주면 "쓸 종목이 하나도 없다"고 오해합니다.
-    session = market_clock.status_for("KOSPI" if "KR" in markets else "US")
+    session = market_clock.status_for(_clock_market(scan.segments or markets))
     notes = list(scan.errors)
     if not session.get("is_regular"):
         notes.append(f"지금은 {session.get('label', '장 마감')}입니다 — 거래대금이 0으로 집계돼 "
@@ -2161,6 +2351,8 @@ def autotrade_screener(req: ScreenerRequest, request: Request):
         "errors": notes,
         "session": session.get("label", ""),
         "markets": markets,
+        "universe": scan.universe,
+        "universe_detail": universe.describe(scan.universe),
         "account": {"available_cash": account.get("available_cash"),
                     "total_value": account.get("total_value")},
         "scalp": {k: v for k, v in scalp.items() if not k.startswith("_")},
@@ -2657,7 +2849,7 @@ def _frontend_down_page() -> str:
 </style></head><body><div class="b">
  <h1>분석 엔진은 켜져 있는데, 웹 화면이 꺼져 있습니다</h1>
  <p class="m">여기(8000번)는 분석·API 서버입니다. 실제 화면은 3000번에서 그려집니다.</p>
- <p class="m"><code>start.bat</code> 을 실행하면 둘 다 같이 켜집니다.<br>
+ <p class="m"><code>아테나.bat</code> 의 <code>[1] 시작</code> 을 고르면 둘 다 같이 켜집니다.<br>
     이미 실행 중이라면 <b>'Athena Signal - 웹'</b> 창이 닫히지 않았는지 확인해 주세요.</p>
  <p class="m">직접 켜려면 <code>cd frontend</code> 후 <code>npm run dev</code></p>
  <p class="m">켠 다음 <a href="/">이 페이지를 새로고침</a>하면 자동으로 넘어갑니다.</p>

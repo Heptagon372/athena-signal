@@ -15,7 +15,7 @@ https://openapi.tossinvest.com — OpenAPI 3.0 스펙 기준으로 구현했습�
     https://developers.tossinvest.com 에서 앱 등록 후 client_id / client_secret 발급
         set TOSS_CLIENT_ID=...
         set TOSS_CLIENT_SECRET=...
-    또는 setup_api.bat 실행
+    또는 아테나.bat → [7] API 키
 
 키가 없으면 이 모듈은 조용히 비활성 상태로 남고, 기존 공개 경로가 그대로 동작합니다.
 
@@ -281,7 +281,7 @@ def self_check():
     if not is_configured():
         print("\n[미설정] TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 이 없습니다.")
         print("\n  발급: https://developers.tossinvest.com")
-        print("  설정: setup_api.bat 실행, 또는")
+        print("  설정: 아테나.bat → [7] API 키, 또는")
         print("        set TOSS_CLIENT_ID=...")
         print("        set TOSS_CLIENT_SECRET=...")
         print("\n  ※ 설정하지 않아도 기존 공개 경로로 정상 동작합니다.\n")

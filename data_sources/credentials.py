@@ -5,7 +5,7 @@ API 자격증명 통합 관리
 
 읽는 순서
     1) 환경변수
-    2) 프로젝트 폴더의 `api_keys.json` (setup_api.bat 이 만듭니다)
+    2) 프로젝트 폴더의 `api_keys.json` (아테나.bat → [7] API 키 가 만듭니다)
 
 `api_keys.json` 은 사용자 PC에만 존재하며 서버 밖으로 나가지 않습니다.
 실수로 공유되지 않도록 .gitignore 에 넣어두세요.
@@ -19,6 +19,8 @@ API 자격증명 통합 관리
     datago  공공데이터포털         https://www.data.go.kr
 """
 
+import contextlib
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,70 @@ from pathlib import Path
 from config import BASE_DIR
 
 KEY_FILE = BASE_DIR / "api_keys.json"
+
+# ---------------------------------------------------------------------------
+# 사용자 오버레이
+# ---------------------------------------------------------------------------
+# 로그인한 사용자가 자기 계정에 저장해 둔 키(storage/user_credentials.py)를
+# 요청·자동매매 회전 동안만 서버 키 **위에** 겹쳐 씁니다. get() 호출부 48곳을
+# 고치지 않기 위한 장치입니다 — 호출부는 지금까지처럼 get() 만 부릅니다.
+#
+# ContextVar 인 이유
+#     전역 dict 로 하면 동시 요청끼리 키가 섞입니다 (A 의 요청이 B 의 KIS 키로
+#     주문을 내는 사고). ContextVar 는 요청(스레드풀 실행 컨텍스트)마다 복사본을
+#     갖기 때문에, 요청이 끝나면 그 컨텍스트째 버려집니다 — 리셋을 잊어도
+#     다음 요청으로 새지 않습니다. 자동매매 루프처럼 오래 사는 스레드에서는
+#     use_user() 컨텍스트 매니저가 명시적으로 되돌립니다.
+#
+# 여기서도 화이트리스트를 다시 검사하는 이유
+#     저장 쪽(user_credentials.save_keys)이 이미 거르지만, 옛 코드로 저장된
+#     문서나 다른 경로로 심어진 값이 있을 수 있습니다. 사용자 값이 MONGODB_URI
+#     같은 서버 설정을 갈아끼우는 일은 **읽는 쪽에서도** 막아야 합니다.
+_user_overlay: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "athena_user_credentials", default=None)
+
+
+def _overlay_allowed(name: str) -> bool:
+    # storage.user_credentials 를 import 하면 순환(storage → credentials → storage)
+    # 이라, 허용 목록을 여기서 직접 계산합니다. 기준은 같습니다: 서버 부트스트랩
+    # (mongo/firebase/google/공개 오리진)을 뺀 제공자 필드 + KIS 거래 설정.
+    if name in ("KIS_ACCOUNT", "KIS_DERIV_ACCOUNT", "KIS_MOCK", "KIS_LIVE_TRADING"):
+        return True
+    for provider in ("toss", "kis", "reddit", "naver", "krx", "datago"):
+        if name in PROVIDERS[provider]["fields"]:
+            return True
+    return False
+
+
+@contextlib.contextmanager
+def use_user(values: dict | None):
+    """이 블록 안에서 get()/get_bool()/get_json() 이 사용자 키를 먼저 봅니다."""
+    token = _user_overlay.set(dict(values) if values else None)
+    try:
+        yield
+    finally:
+        _user_overlay.reset(token)
+
+
+def attach_user(values: dict | None):
+    """현재 컨텍스트에 오버레이를 장착합니다 (요청 처리용 — 리셋 없음).
+
+    FastAPI 의 동기 엔드포인트는 요청마다 **복사된 컨텍스트**의 스레드풀에서
+    돌기 때문에, 여기서 set 한 값은 요청이 끝나면 컨텍스트째 사라집니다.
+    오래 사는 스레드(자동매매 루프 등)에서는 이걸 쓰면 안 되고 use_user() 를
+    써야 합니다 — 리셋이 없어 다음 회전까지 남기 때문입니다.
+    """
+    _user_overlay.set(dict(values) if values else None)
+
+
+def _from_overlay(name: str) -> str | None:
+    """오버레이에 값이 있으면 그 값 (화이트리스트 통과 시). 없으면 None."""
+    overlay = _user_overlay.get()
+    if not overlay or name not in overlay:
+        return None
+    if not _overlay_allowed(name):
+        return None
+    return str(overlay[name] or "").strip()
 
 # 각 API가 필요로 하는 항목과 발급처
 PROVIDERS = {
@@ -65,12 +131,19 @@ PROVIDERS = {
         "portal": "https://www.data.go.kr (금융위원회_주식시세정보 활용신청)",
         "gives": "금융위 주식시세 (KRX 일별 시세 공식 경로)",
     },
+    "firebase": {
+        "label": "구글 로그인 (Firebase)",
+        "fields": ["FIREBASE_PROJECT_ID", "FIREBASE_API_KEY"],
+        "portal": "https://console.firebase.google.com (Authentication → Google 사용 설정 → "
+                  "프로젝트 설정 → 내 앱 → 웹 앱 추가 후 firebaseConfig 확인)",
+        "gives": "구글 계정 클릭 한 번으로 로그인 (시크릿·리디렉션 URI 등록 불필요)",
+    },
     "google": {
-        "label": "구글 로그인 (OAuth)",
+        "label": "구글 로그인 (OAuth · 구버전)",
         "fields": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
         "portal": "https://console.cloud.google.com (사용자 인증 정보 → OAuth 클라이언트 ID, "
                   "리디렉션 URI: http://localhost:8000/api/auth/google/callback)",
-        "gives": "구글 계정으로 로그인 (아이디/비번 없이 바로 시작)",
+        "gives": "Firebase 를 쓰지 않을 때의 예전 로그인 경로 (폴백)",
     },
     "mongo": {
         "label": "MongoDB 계정 저장소",
@@ -87,7 +160,7 @@ _user_env_cache: dict | None = None
 def _user_env() -> dict:
     """Windows 사용자 환경변수 원본 (HKCU\\Environment).
 
-    setup_kis.bat 은 setx 로 키를 저장하는데, setx 는 **그 뒤에 새로 열리는**
+    예전 setup_kis.bat 은 setx 로 키를 저장했는데, setx 는 **그 뒤에 새로 열리는**
     프로세스에만 반영됩니다. 그래서 이미 떠 있던 창(에디터 터미널·이전 콘솔)에서
     서버를 재시작하면 키가 하나도 없는 서버가 조용히 뜨고, 화면에는 "KIS 미설정"
     으로만 보입니다 — 계좌 정보가 통째로 0원이 되는 가장 흔한 원인입니다.
@@ -127,12 +200,19 @@ def _from_file() -> dict:
 
 
 def get(name: str, default: str = "") -> str:
-    """환경변수 → api_keys.json → Windows 사용자 환경변수 순으로 조회.
+    """사용자 오버레이 → 환경변수 → api_keys.json → Windows 사용자 환경변수.
 
-    api_keys.json 에 항목이 있으면 (빈 값이더라도) 거기서 끝냅니다. 파일에
-    적어 둔 '꺼짐'을 레지스트리의 옛 값이 되살리면 안 되기 때문입니다 —
-    실거래 스위치가 그렇게 켜지는 일은 없어야 합니다.
+    오버레이에 항목이 있으면 (빈 값이더라도) 거기서 끝냅니다. 빈 값으로도 끝내는
+    이유: 사용자 컨텍스트에서 "이 값 없음"을 서버 값이 되살리면 안 되는 키가
+    있습니다 — 구글 계정의 KIS_LIVE_TRADING 이 서버의 '켜짐'을 물려받으면
+    남의 실거래 스위치가 켜집니다. (엔진이 안전 기본값을 명시적으로 채웁니다.)
+
+    api_keys.json 도 같은 이유로 항목이 있으면 (빈 값이더라도) 거기서 끝냅니다.
+    파일에 적어 둔 '꺼짐'을 레지스트리의 옛 값이 되살리면 안 됩니다.
     """
+    from_user = _from_overlay(name)
+    if from_user is not None:
+        return from_user
     value = os.environ.get(name)
     if value:
         return value.strip()
@@ -148,12 +228,14 @@ def get_json(name: str, default=None):
     자동매매의 계약 명세·tr_id 재정의처럼 "코드 수정 없이 바꿔야 하는 표"를
     설정으로 빼기 위한 통로입니다 (config as data).
     """
-    raw = os.environ.get(name)
+    raw = _from_overlay(name)
+    if not raw:
+        raw = os.environ.get(name)
     if not raw:
         value = _from_file().get(name)
         if value is not None:
             return value
-        raw = _user_env().get(name)      # get() 과 같은 순서 (환경 → 파일 → 저장된 환경)
+        raw = _user_env().get(name)      # get() 과 같은 순서 (오버레이 → 환경 → 파일 → 저장된 환경)
     if raw:
         try:
             return json.loads(raw)
@@ -167,6 +249,12 @@ def get_bool(name: str, default: bool = False) -> bool:
 
     실거래 스위치처럼 **애매하면 꺼진 것으로 취급해야 하는** 설정에 씁니다.
     """
+    from_user = _from_overlay(name)
+    if from_user is not None:
+        # 오버레이가 빈 값이어도 여기서 끝냅니다(거짓). 아래 파일 폴백으로
+        # 흘려보내면, 사용자 컨텍스트의 '꺼짐'을 서버 파일의 '켜짐'이
+        # 되살립니다 — 실거래 스위치에서 절대 있어선 안 되는 일입니다.
+        return from_user.strip().lower() in ("1", "true", "yes", "on", "y")
     raw = get(name, "")
     if not raw:
         file_value = _from_file().get(name)
@@ -225,7 +313,7 @@ def print_status():
     configured = sum(1 for i in st.values() if i["configured"])
     print(f"\n  설정됨 {configured}/{len(st)}")
     print(f"\n  키 파일: {KEY_FILE}")
-    print("  설정 방법: setup_api.bat 실행 또는 환경변수 지정")
+    print("  설정 방법: 아테나.bat → [7] API 키, 또는 환경변수 지정")
     print("  ※ 키를 하나도 넣지 않아도 기존 공개 경로로 정상 동작합니다.\n")
 
 

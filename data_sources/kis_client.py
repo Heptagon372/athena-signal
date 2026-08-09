@@ -48,13 +48,24 @@ REAL_BASE = "https://openapi.koreainvestment.com:9443"
 MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
 
 _token_lock = threading.Lock()
-_token: str | None = None
-_token_expires_at: float = 0.0
+# 앱키별 토큰 캐시 — {캐시키: (토큰, 만료시각)}.
+#
+# 예전엔 프로세스에 토큰이 하나였습니다. 사용자별 API 키가 생기면서 한 프로세스가
+# 여러 앱키로 KIS 를 부르게 됐는데(계정마다 자기 키), 토큰을 하나만 들고 있으면
+# 사용자가 바뀔 때마다 재발급하다 1분 제한(EGW00133)에 걸려 **모두의 계좌가
+# 번갈아 안 읽히는** 상태가 됩니다. 그래서 앱키(해시)별로 따로 캐시합니다.
+_tokens: dict[str, tuple[str, float]] = {}
 _token_error: str = ""
 
 # 발급받은 토큰을 프로세스 밖에도 남겨 둡니다 (.cache 는 .gitignore 대상).
 # 토큰은 계좌 조회 권한 그 자체이므로 이 파일은 공유하면 안 됩니다.
-TOKEN_FILE = CACHE_DIR / "kis_token.json"
+# 파일도 앱키별로 나눕니다 — 하나로 두면 사용자가 바뀔 때마다 서로 덮어써서
+# 재시작 후 이어쓰기가 한 사람 것만 남습니다.
+TOKEN_FILE = CACHE_DIR / "kis_token.json"          # 옛 단일 파일 (읽기 폴백용)
+
+
+def _token_file(cache_key: str):
+    return CACHE_DIR / f"kis_token_{cache_key}.json"
 
 
 def app_key() -> str:
@@ -142,24 +153,26 @@ def _token_cache_key() -> str:
     return hashlib.sha256(f"{app_key()}|{_base_url()}".encode()).hexdigest()[:16]
 
 
-def _load_saved_token() -> tuple[str, float]:
-    try:
-        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return "", 0.0
-    if data.get("key") != _token_cache_key():
-        return "", 0.0
-    try:
-        return str(data.get("token") or ""), float(data.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        return "", 0.0
+def _load_saved_token(cache_key: str) -> tuple[str, float]:
+    for path in (_token_file(cache_key), TOKEN_FILE):     # 새 경로 → 옛 파일 순
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if data.get("key") != cache_key:
+            continue
+        try:
+            return str(data.get("token") or ""), float(data.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            continue
+    return "", 0.0
 
 
-def _save_token(token: str, expires_at: float):
+def _save_token(cache_key: str, token: str, expires_at: float):
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        TOKEN_FILE.write_text(json.dumps({
-            "key": _token_cache_key(), "token": token, "expires_at": expires_at,
+        _token_file(cache_key).write_text(json.dumps({
+            "key": cache_key, "token": token, "expires_at": expires_at,
         }), encoding="utf-8")
     except OSError:
         pass        # 저장에 실패해도 이번 프로세스 안에서는 정상 동작합니다
@@ -200,20 +213,26 @@ def _get_token() -> str | None:
     받으려다 이 제한에 걸려 **키가 멀쩡한데도 계좌가 통째로 안 읽히는** 상태로
     뜹니다. 그래서 파일에도 남겨 재시작 후 그대로 씁니다.
     """
-    global _token, _token_expires_at, _token_error
+    global _token_error
 
     if not is_configured():
         _token_error = "APP KEY / SECRET 이 설정되지 않았습니다."
         return None
 
-    with _token_lock:
-        if _token and time.time() < _token_expires_at - 300:
-            return _token
+    # 캐시 키를 잠금 밖에서 계산합니다 — app_key() 는 사용자 오버레이를 보므로
+    # 지금 컨텍스트의 사용자에 맞는 키가 나옵니다.
+    cache_key = _token_cache_key()
 
-        saved, saved_expires = _load_saved_token()
+    with _token_lock:
+        cached = _tokens.get(cache_key)
+        if cached and time.time() < cached[1] - 300:
+            return cached[0]
+
+        saved, saved_expires = _load_saved_token(cache_key)
         if saved and time.time() < saved_expires - 300:
-            _token, _token_expires_at, _token_error = saved, saved_expires, ""
-            return _token
+            _tokens[cache_key] = (saved, saved_expires)
+            _token_error = ""
+            return saved
 
         status, body, raw = http_client.post_full(
             _base_url() + "/oauth2/tokenP",
@@ -229,12 +248,13 @@ def _get_token() -> str | None:
             _token_error = _token_failure(status, body, raw)
             return None
 
-        _token = body["access_token"]
+        token = body["access_token"]
         # expires_in 이 없으면 보수적으로 12시간만 신뢰
-        _token_expires_at = time.time() + float(body.get("expires_in") or 43200)
+        expires_at = time.time() + float(body.get("expires_in") or 43200)
+        _tokens[cache_key] = (token, expires_at)
         _token_error = ""
-        _save_token(_token, _token_expires_at)
-        return _token
+        _save_token(cache_key, token, expires_at)
+        return token
 
 
 def _headers(tr_id: str) -> dict | None:

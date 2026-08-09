@@ -271,7 +271,7 @@ def self_check():
         except Exception as e:
             print(f"오류 {type(e).__name__}: {str(e)[:60]}")
 
-    print("\n  키 설정: setup_api.bat 또는 python -m data_sources.credentials\n")
+    print("\n  키 설정: 아테나.bat → [7] API 키, 또는 python -m data_sources.credentials\n")
 
 
 if __name__ == "__main__":

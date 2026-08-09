@@ -11,3 +11,9 @@ websockets
 # 계정 저장소 (구글 로그인). [srv] = Atlas 의 mongodb+srv:// URI 용 dnspython.
 # 설치하지 않아도 앱은 정상 동작하고 구글 로그인만 꺼집니다 (ACCOUNTS.md 2-5).
 pymongo[srv]
+
+# Firebase ID 토큰의 RS256 서명을 이 PC 에서 직접 검증하는 데 씁니다.
+# 없어도 로그인은 됩니다 — 구글의 Identity Toolkit 에 검증을 위임합니다.
+# 다만 웹 API 키에 HTTP 리퍼러 제한을 걸어두면 그 위임 경로가 403 으로 막히므로,
+# 설치해 두는 편이 실패할 구석이 하나 적습니다 (ACCOUNTS.md 0-3).
+cryptography

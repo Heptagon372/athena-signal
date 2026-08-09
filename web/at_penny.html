@@ -38,15 +38,19 @@
 
   <section>
     <h2>규모 <span class="sub">이 전략이 쓸 수 있는 돈은 여기 적은 금액이 전부입니다</span></h2>
-    <div class="row" style="margin-bottom:12px">
+    <div class="row" style="margin-bottom:12px;align-items:center">
       <label class="chk" style="margin:0"><input type="checkbox" id="scalp_enabled"> 초단타 켜기</label>
-      <select id="scalpMarkets" style="width:auto">
-        <option value="KR">한국 주식</option>
-        <option value="US">미국 주식</option>
-        <option value="KR,US">한국 + 미국</option>
-      </select>
+      <span class="muted" style="font-size:12px">시장</span>
+      <span id="segBox" class="row" style="gap:10px;margin:0"></span>
       <span class="note" id="streamInfo"></span>
     </div>
+    <div class="row" style="margin-bottom:12px;align-items:center">
+      <span class="muted" style="font-size:12px">탐색 범위</span>
+      <select id="poolSelect" style="width:auto;min-width:190px"></select>
+      <span class="note" id="poolSelectNote" style="margin:0"></span>
+    </div>
+    <p class="note" style="margin-top:0">범위를 고르면 <b>그 안에서만</b> 찾습니다. 지수·섹터를 고르면
+      후보가 우량주 쪽으로 몰려 저가주가 거의 안 나옵니다 — 그걸 원할 때만 쓰세요.</p>
     <div class="split">
       <div class="field"><label>투자금액 (원)</label><input id="scalp_budget_krw" type="number" step="10000"></div>
       <div class="field"><label>일일 손실 한도 (원)</label><input id="scalp_daily_loss_krw" type="number" step="1000"></div>
@@ -284,8 +288,23 @@ window.PAGE = {
     this.SEL.forEach((k) => { const el = A.$("scalp_" + k); if (el && scalp[k]) el.value = scalp[k]; });
     A.$("scalp_enabled").checked = !!scalp.enabled;
     A.$("scalp_auto_universe").checked = scalp.auto_universe !== false;
-    if (scalp.markets) A.$("scalpMarkets").value = scalp.markets.join(",");
     if (scalp.pinned) A.$("scalp_pinned").value = scalp.pinned.join(", ");
+    // 서버가 저장 시점에 정규화해 둡니다 — 예전 값("KR")도 코스피·코스닥으로 옵니다
+    this.renderScope(scalp.markets || ["KOSPI", "KOSDAQ"], scalp.universe_pool || "");
+  },
+
+  /** 시장 체크박스 + 탐색 범위. 시장을 바꾸면 범위 목록도 따라 바뀝니다. */
+  async renderScope(segments, pool) {
+    const A = AT;
+    await A.renderSegments("segBox", segments, (next) => {
+      this._dirty = true;
+      A.renderUniverse("poolSelect", next, A.$("poolSelect").value);
+    });
+    await A.renderUniverse("poolSelect", segments, pool);
+    A.$("poolSelect").onchange = () => {
+      this._dirty = true;
+      A.renderUniverse("poolSelect", A.readSegments("segBox"), A.$("poolSelect").value);
+    };
   },
 
   renderMeta(warnings, hardLimits, clamped, stream) {
@@ -340,7 +359,10 @@ window.PAGE = {
   },
 
   async save() {
-    const A = AT, patch = {markets: A.$("scalpMarkets").value.split(",")};
+    const A = AT;
+    const markets = A.readSegments("segBox");
+    if (!markets.length) return A.toast("훑을 시장을 하나 이상 골라 주세요.", true);
+    const patch = {markets, universe_pool: A.$("poolSelect").value || ""};
     this.NUM.forEach((k) => { const el = A.$("scalp_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
     this.SEL.forEach((k) => { const el = A.$("scalp_" + k); if (el) patch[k] = el.value; });
     patch.enabled = A.$("scalp_enabled").checked;
@@ -368,18 +390,21 @@ window.PAGE = {
     A.$("scanInfo").textContent = "시장을 훑는 중… (고저가 조회로 몇 초 걸립니다)";
     try {
       const d = await A.call("/autotrade/screener", {method: "POST", body: {
-        markets: A.$("scalpMarkets").value.split(","), limit: 30, refresh: !!refreshCache}});
+        markets: A.readSegments("segBox"), universe: A.$("poolSelect").value || "",
+        limit: 30, refresh: !!refreshCache}});
       this.renderMeta(d.warnings, d.hard_limits, d.clamped, d.stream);
       const rows = d.candidates || [];
       A.$("candEmpty").classList.toggle("hide", rows.length > 0);
+      const where = d.universe_detail?.label ? ` · ${d.universe_detail.label} 안에서` : "";
       A.$("candSub").textContent =
-        `${d.scanned}종목 훑음 · 투자금액 ${A.won(rows[0]?.budget_cap || 0)} 기준 · ${d.sources.join(", ")}`;
+        `${d.scanned}종목 훑음${where} · 투자금액 ${A.won(rows[0]?.budget_cap || 0)} 기준 · ${d.sources.join(", ")}`;
       const pct = (v, digits) => (v == null ? '<span class="muted">—</span>'
         : v.toLocaleString(undefined, {maximumFractionDigits: digits ?? 0}) + "%");
       A.$("candTable").querySelector("tbody").innerHTML = rows.map((c) => {
         const e = c.economics || {};
         return `<tr class="${c.eligible ? "" : "pos-unmanaged"}">
-        <td>${A.esc(c.name)}<div class="muted mono" style="font-size:11px">${c.key} · ${c.market}</div></td>
+        <td>${A.esc(c.name)}<div class="muted mono" style="font-size:11px">${c.key} · ${c.segment || c.market}${
+          c.weight != null ? ` · 비중 ${c.weight}%` : ""}</div></td>
         <td class="num">${A.num(c.price)}</td>
         <td class="num ${A.sign(c.change_rate)}">${A.pct(c.change_rate)}</td>
         <td class="num">${pct(c.vol_increase_pct)}</td>

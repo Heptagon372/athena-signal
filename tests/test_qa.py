@@ -794,7 +794,12 @@ def test_official_apis():
     from data_sources import credentials, toss_api, public_apis, kis_client, market_clock
 
     st = credentials.status()
-    check("apikey", f"6개 공급자 정의 ({', '.join(st)})", len(st) == 6)
+    # 개수를 못 박으면 공급자를 추가할 때마다 여기가 깨집니다 (google → firebase 로
+    # 이미 두 번 깨졌습니다). 필수 공급자가 다 있는지만 봅니다.
+    required = {"toss", "kis", "reddit", "naver", "krx", "datago",
+                "firebase", "mongo"}
+    check("apikey", f"필수 공급자 정의 ({', '.join(sorted(st))})",
+          required <= set(st))
     check("apikey", "키 값 자체는 노출하지 않음",
           all("value" not in v and "secret" not in str(v).lower() or True for v in st.values())
           and all(set(v) == {"label", "configured", "portal", "gives", "missing"}
@@ -1022,7 +1027,7 @@ def test_api():
             body = resp.body.decode("utf-8", "replace")
             check("api", "프론트엔드 꺼짐 → 503 + 안내",
                   resp.status_code == 503 and "npm run dev" in body
-                  and "start.bat" in body, f"HTTP {resp.status_code}")
+                  and "아테나.bat" in body, f"HTTP {resp.status_code}")
         finally:
             _api.FRONTEND_PORT = _saved
     except Exception as e:

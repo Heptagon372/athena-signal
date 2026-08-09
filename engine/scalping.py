@@ -118,7 +118,12 @@ HARD_LIMITS = {
 # 기본 설정 (사용자가 조정 가능 — 단 위 한도 안에서만)
 DEFAULT_SCALP = {
     "enabled": False,
-    "markets": ["KR"],
+    # 훑을 시장 — 코스피 / 코스닥 / 나스닥 (예전 값 "KR" · "US" 도 동작합니다)
+    "markets": ["KOSPI", "KOSDAQ"],
+    # 탐색 범위 — 비우면 시장 전체. 지수·ETF·섹터 키를 넣으면 그 안에서만.
+    # 초단타에서 지수·섹터를 고르면 후보가 우량주 쪽으로 몰려 '동전주'가 사라집니다.
+    # 그게 목적일 때만 켜세요 (기본은 전체).
+    "universe_pool": "",
 
     # --- 규모: 이 두 개가 전부입니다 ---
     "budget_krw": 100_000,           # 이 전략이 쓸 수 있는 총액
@@ -323,6 +328,16 @@ def clamp_config(cfg: dict) -> dict:
         out["entry_order_type"] = "limit_bid"
     if out.get("rank_basis") not in ("vol_increase", "turnover", "value", "volume"):
         out["rank_basis"] = "vol_increase"
+
+    # 시장·탐색 범위 — 저장된 예전 값("KR"/"US")을 세부시장으로 펼쳐 두면
+    # 이 뒤로는 코스피/코스닥/나스닥만 다루면 됩니다.
+    from data_sources import universe as universe_mod
+    out["markets"] = universe_mod.normalize_segments(out.get("markets"))
+    pool = str(out.get("universe_pool") or "").strip().upper()
+    if pool and universe_mod.get(pool) is None:
+        clamped.append(f"알 수 없는 탐색 범위 '{pool}' → 시장 전체")
+        pool = ""
+    out["universe_pool"] = pool
 
     # 수동 지정 종목 — 자동 갱신이 돌아도 빠지지 않습니다.
     # 구독 한도를 통째로 차지하면 자동 발굴이 아무것도 못 담으므로 절반까지만.

@@ -2,7 +2,7 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
-import { api } from "../lib/api";
+import { fetchAuthProviders } from "../lib/firebase";
 import { useAuth } from "../providers";
 
 /** 구글 로고 — 외부 이미지를 불러오지 않도록 인라인 SVG 로 둡니다. */
@@ -20,7 +20,8 @@ function GoogleMark() {
 function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
-  const { user, ready, login, register, loginWithGoogle } = useAuth();
+  const { user, ready, login, register, loginWithGoogle,
+          loginWithGoogleRedirect } = useAuth();
 
   const [mode, setMode] = useState("login");     // login | register
   const [username, setUsername] = useState("");
@@ -30,22 +31,25 @@ function LoginForm() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   // null = 아직 확인 중. 확인 전에는 버튼을 그리지 않아 깜빡임을 막습니다.
-  const [googleReady, setGoogleReady] = useState(null);
+  const [providers, setProviders] = useState(null);
 
   const next = params.get("next") || "/";
+
+  // Firebase 가 설정돼 있으면 그걸 씁니다. 없으면 예전 OAuth 리디렉션으로 폴백하고,
+  // 둘 다 없으면 버튼을 아예 그리지 않습니다 — 눌러도 안 되는 버튼을 보여주는
+  // 것보다 없는 게 낫습니다.
+  const firebase = providers?.firebase?.configured ? providers.firebase : null;
+  const legacyGoogle = !firebase && providers?.google?.configured;
+  const googleReady = !!firebase || legacyGoogle;
 
   // 이미 로그인돼 있으면 돌려보냅니다
   useEffect(() => {
     if (ready && user) router.replace(next);
   }, [ready, user, next, router]);
 
-  // 구글 로그인이 설정돼 있는지 — 안 됐으면 버튼을 아예 그리지 않습니다.
-  // 눌러도 안 되는 버튼을 보여주는 것보다 없는 게 낫습니다.
   useEffect(() => {
     let alive = true;
-    api.get("/auth/google/config", { timeout: 8000 })
-      .then((data) => { if (alive) setGoogleReady(!!data?.configured); })
-      .catch(() => { if (alive) setGoogleReady(false); });
+    fetchAuthProviders().then((data) => { if (alive) setProviders(data); });
     return () => { alive = false; };
   }, []);
 
@@ -53,8 +57,14 @@ function LoginForm() {
     setError("");
     setBusy(true);
     try {
-      await loginWithGoogle(next);
-      // 성공하면 페이지가 구글로 이동하므로 여기 아래는 실행되지 않습니다
+      if (firebase) {
+        // 계정 선택 창에서 끝납니다 — 돌아올 콜백 화면이 없습니다
+        await loginWithGoogle(firebase);
+        router.replace(next);
+        return;
+      }
+      await loginWithGoogleRedirect(next);
+      // 폴백 경로는 페이지가 구글로 이동하므로 여기 아래는 실행되지 않습니다
     } catch (err) {
       setError(err.message || "구글 로그인을 시작할 수 없습니다.");
       setBusy(false);
@@ -98,7 +108,7 @@ function LoginForm() {
           <>
             <button type="button" className="btn-google" onClick={startGoogle} disabled={busy}>
               <GoogleMark />
-              <span>구글로 계속하기</span>
+              <span>{busy ? "구글 계정을 확인하는 중…" : "구글 계정으로 계속하기"}</span>
             </button>
             <div className="auth-or"><span>또는 아이디로</span></div>
           </>

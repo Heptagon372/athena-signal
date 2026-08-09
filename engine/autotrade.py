@@ -33,6 +33,7 @@ from datetime import datetime
 
 import numpy as np
 
+from data_sources import credentials
 from engine import broker as broker_module
 from engine import (feed, fills, holding, instruments, portfolio, protections,
                     risk, strategy, validation)
@@ -121,6 +122,44 @@ def _log_plan_reject(user_id: int, key: str, name: str, reason: str, detail: dic
 # 한 번의 회전
 # ---------------------------------------------------------------------------
 
+def _user_credentials_scope(user_id: int):
+    """이 사용자의 저장 키를 겹친 credentials 컨텍스트.
+
+    자동매매 루프는 오래 사는 스레드 하나에서 모든 사용자를 돌기 때문에,
+    회전마다 그 사용자의 키를 장착하고 **끝나면 반드시 되돌려야** 합니다 —
+    안 되돌리면 다음 사용자의 회전이 앞 사람의 KIS 키로 주문을 냅니다.
+    use_user() 가 컨텍스트 매니저라 예외가 나도 되돌아갑니다.
+
+    키 조회가 실패하면(Mongo 다운 등) 빈 오버레이 대신 **구글 계정은 안전
+    기본값만 있는** 오버레이가 옵니다 (user_credentials.overlay_for 참고).
+    """
+    from storage import user_credentials
+    try:
+        return credentials.use_user(user_credentials.overlay_for(user_id))
+    except Exception:                                              # noqa: BLE001
+        return credentials.use_user(None)
+
+
+def _own_keys_gate(user_id: int, mode: str) -> str:
+    """구글 계정이 KIS 주문 모드를 쓰려면 자기 키가 있어야 합니다.
+
+    반환: 막아야 하면 사유 문자열, 통과면 "".
+
+    서버 키로 폴백시키면 아무 구글 사용자가 자동매매를 켰을 때 **서버 주인의
+    실계좌**로 주문이 나갑니다. 로컬 계정(이 PC 에서 만든 계정)은 지금까지처럼
+    서버 키를 씁니다 — 기존 동작을 깨지 않습니다.
+    """
+    if mode == broker_module.PAPER:
+        return ""                       # 모의투자는 키가 필요 없습니다
+    from storage import accounts, user_credentials
+    if user_id < accounts.USER_ID_OFFSET:
+        return ""                       # 로컬 계정 — 서버 키 사용 (기존 동작)
+    if user_credentials.has_own_kis_keys(user_id):
+        return ""
+    return ("KIS 모의/실전 주문에는 본인 KIS 키가 필요합니다. "
+            "웹 → 설정 → API 키에서 KIS 앱 키·시크릿·계좌번호를 저장해 주세요.")
+
+
 def run_once(user_id: int, force: bool = False) -> dict:
     """자동매매 1회전. force=True 면 enabled 가 꺼져 있어도 판단만 수행합니다.
 
@@ -132,7 +171,8 @@ def run_once(user_id: int, force: bool = False) -> dict:
 
     started = time.time()
     try:
-        return _tick(user_id, force=force, started=started)
+        with _user_credentials_scope(user_id):
+            return _tick(user_id, force=force, started=started)
     except Exception as exc:
         detail = traceback.format_exc(limit=4)
         store.log_event(user_id, "error", f"회전 실패: {type(exc).__name__}: {exc}",
@@ -199,6 +239,11 @@ def run_guard(user_id: int) -> dict:
     if not states:
         return {"ok": True, "skipped": "보유 포지션 없음", "checked": 0}
 
+    # 보호 회전도 주문(청산)을 내므로 같은 게이트를 지납니다
+    blocked = _own_keys_gate(user_id, mode)
+    if blocked:
+        return {"ok": False, "skipped": blocked}
+
     lock = _user_lock(user_id)
     if not lock.acquire(blocking=False):
         return {"ok": False, "skipped": "다른 회전이 실행 중입니다."}
@@ -208,38 +253,39 @@ def run_guard(user_id: int) -> dict:
               "mode": mode, "exits": [], "rejects": [], "errors": [],
               "signals": [], "checked": 0, "asleep": 0}
     try:
-        brk = broker_module.get_broker(user_id, mode, cfg)
-        if not brk.health().get("ready"):
-            return {"ok": False, "skipped": "브로커 준비 안 됨"}
+        with _user_credentials_scope(user_id):
+            brk = broker_module.get_broker(user_id, mode, cfg)
+            if not brk.health().get("ready"):
+                return {"ok": False, "skipped": "브로커 준비 안 됨"}
 
-        cached = _positions_cache.get(user_id)
-        if (cached and cached[1] == mode
-                and time.time() - cached[0] < GUARD_POSITIONS_TTL):
-            positions = cached[2]
-        else:
-            positions = brk.positions()
-            _remember_positions(user_id, mode, positions)
+            cached = _positions_cache.get(user_id)
+            if (cached and cached[1] == mode
+                    and time.time() - cached[0] < GUARD_POSITIONS_TTL):
+                positions = cached[2]
+            else:
+                positions = brk.positions()
+                _remember_positions(user_id, mode, positions)
 
-        # 보호 회전은 청산만 합니다. RiskEngine.check_exit 는 계좌·일자 값을
-        # 보지 않으므로(현재가와 장 상태만 봄) 잔고를 다시 읽지 않습니다.
-        # 계좌가 차단 상태여도 청산은 계속해야 합니다 — 위험을 줄이는 방향입니다.
-        engine_risk = risk.RiskEngine(cfg, {}, positions, {})
+            # 보호 회전은 청산만 합니다. RiskEngine.check_exit 는 계좌·일자 값을
+            # 보지 않으므로(현재가와 장 상태만 봄) 잔고를 다시 읽지 않습니다.
+            # 계좌가 차단 상태여도 청산은 계속해야 합니다 — 위험을 줄이는 방향입니다.
+            engine_risk = risk.RiskEngine(cfg, {}, positions, {})
 
-        for position in positions:
-            if not is_managed(cfg, position.key, states):
-                continue
-            # 장이 닫혀 있으면 시세를 받아봐야 주문을 낼 수 없습니다.
-            # 여기서 걸러야 밤새 무의미한 시세 조회가 쌓이지 않습니다.
-            inst = instruments.try_resolve(position.key)
-            if inst is not None and not feed.market_status(inst).get("is_open"):
-                result["asleep"] += 1
-                continue
-            result["checked"] += 1
-            try:
-                _handle_exit(user_id, cfg, brk, engine_risk, position,
-                             states.get(position.key, {}), result, fast=True)
-            except Exception as exc:
-                result["errors"].append(f"{position.key} 보호 검사 실패: {exc}")
+            for position in positions:
+                if not is_managed(cfg, position.key, states):
+                    continue
+                # 장이 닫혀 있으면 시세를 받아봐야 주문을 낼 수 없습니다.
+                # 여기서 걸러야 밤새 무의미한 시세 조회가 쌓이지 않습니다.
+                inst = instruments.try_resolve(position.key)
+                if inst is not None and not feed.market_status(inst).get("is_open"):
+                    result["asleep"] += 1
+                    continue
+                result["checked"] += 1
+                try:
+                    _handle_exit(user_id, cfg, brk, engine_risk, position,
+                                 states.get(position.key, {}), result, fast=True)
+                except Exception as exc:
+                    result["errors"].append(f"{position.key} 보호 검사 실패: {exc}")
     except Exception as exc:
         detail = traceback.format_exc(limit=4)
         store.log_event(user_id, "error",
@@ -278,6 +324,13 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
     }
 
     # -- 브로커 준비 ------------------------------------------------------
+    blocked = _own_keys_gate(user_id, mode)
+    if blocked:
+        store.set_state(user_id, store.HALTED, blocked)
+        store.log_event(user_id, "halt", blocked, level="error")
+        result.update(ok=False, halted=True, halt_reasons=[blocked])
+        return result
+
     brk = broker_module.get_broker(user_id, cfg["mode"], cfg)
     health = brk.health()
     if not health.get("ready"):
@@ -704,8 +757,10 @@ def _tracking_refresh(user_id: int):
         cfg = store.get_config(user_id)
         if not cfg.get("auto_universe"):
             return
-        brk = broker_module.get_broker(user_id, cfg.get("mode", "paper"), cfg)
-        picked = refresh_recommended_universe(user_id, cfg, brk.account())
+        # 별도 스레드라 요청·회전의 오버레이가 없습니다 — 여기서 직접 장착합니다
+        with _user_credentials_scope(user_id):
+            brk = broker_module.get_broker(user_id, cfg.get("mode", "paper"), cfg)
+            picked = refresh_recommended_universe(user_id, cfg, brk.account())
         # 반환만 하고 저장을 안 하면 추천 목록엔 ★편입이 찍히는데
         # 정작 매매 대상은 그대로인 어긋난 상태가 됩니다
         if picked != list(cfg.get("universe") or []):
@@ -776,20 +831,25 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     3) 같은 날 후보들끼리 표준화한 뒤
     4) 지금 국면에 맞는 비중으로 합산합니다
     """
-    from data_sources import screener
+    from data_sources import screener, universe as universe_mod
     from engine import recommender
 
-    markets = list(cfg.get("auto_universe_markets") or ["KR"])
+    markets = universe_mod.normalize_segments(cfg.get("auto_universe_markets"))
+    pool = str(cfg.get("auto_universe_pool") or "")
     size = int(top_n or cfg.get("auto_universe_size", 5))
 
     # 팩터 계산은 종목마다 일봉을 받아야 해서 비쌉니다.
     # 유동성 상위로 먼저 줄인 뒤(거래량 순위) 그 안에서만 정밀 평가합니다.
-    # 두 시장을 함께 훑을 때는 시장당 한도를 줄여 총 계산량을 비슷하게 유지합니다.
+    # 한도는 **지역 수**로 나눕니다 — 스크리너는 국내 후보와 미국 후보를 따로
+    # 만들지만, 코스피+코스닥은 한 번의 순위 조회로 함께 옵니다. 세부시장 수로
+    # 나누면 코스피·코스닥을 같이 켠 것만으로 후보가 30 → 18 로 줄어듭니다.
+    pools = max(len(universe_mod.regions_of(markets)), 1)
     scan = screener.scan(
         markets=markets,
         kr_price=(1_000, 2_000_000),          # 일반 추천은 가격대를 넓게
         us_price=(3.0, 2_000.0),
-        limit=30 if len(markets) <= 1 else 18)
+        limit=30 if pools <= 1 else 18,
+        universe=pool)
 
     if not scan.candidates:
         store.log_event(
@@ -870,11 +930,11 @@ def refresh_scalp_universe(user_id: int, cfg: dict, account: dict) -> list[str]:
     # 15초 주기에 맞지 않습니다. 추적 중인 종목의 변동폭은 실시간체결
     # 스트림이 고가/저가를 함께 주므로 거기서 채워집니다.
     scan = screener.scan(
-        markets=list(scalp.get("markets") or ["KR"]),
+        markets=scalp.get("markets"),
         kr_price=tuple(scalp["kr_price_range"]),
         us_price=tuple(scalp["us_price_range"]),
         limit=40, rank_basis=scalp.get("rank_basis", "vol_increase"),
-        enrich=False)
+        enrich=False, universe=str(scalp.get("universe_pool") or ""))
     ranked = scalping.recommend(scan.candidates, account.get("available_cash") or 0,
                                 account.get("total_value") or 0, scalp)
 

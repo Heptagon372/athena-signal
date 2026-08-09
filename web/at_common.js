@@ -20,7 +20,7 @@
 (function () {
   const API = "/api";
   // api.py 의 CONSOLE_API_VERSION 과 짝 — 서버가 낮으면 재시작 배너를 띄웁니다
-  const REQUIRED_API = 7;
+  const REQUIRED_API = 8;
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -268,9 +268,68 @@
     await refresh();
   }
 
+  // ------------------------------------------------------------------
+  // 탐색 범위 선택기 — "어느 시장에서 · 어느 범위 안에서 찾을 것인가"
+  // ------------------------------------------------------------------
+  // AI 추적 화면과 페니 화면이 같은 선택지를 써야 합니다. 한쪽에만 코스닥이
+  // 있으면 사용자는 두 화면이 다른 시장을 보고 있다고 오해합니다.
+  let SCOPE = null;                     // 카탈로그 (한 번만 받아 캐시)
+
+  async function scopeCatalog() {
+    if (!SCOPE) SCOPE = await call("/autotrade/universes");
+    return SCOPE;
+  }
+
+  /** 시장 체크박스 3개를 그립니다. containerId 안에 <label> 들을 채웁니다. */
+  async function renderSegments(containerId, selected, onChange) {
+    const box = $(containerId);
+    if (!box) return;
+    const cat = await scopeCatalog();
+    const chosen = new Set(selected && selected.length ? selected : ["KOSPI", "KOSDAQ"]);
+    box.innerHTML = cat.segments.map((s) =>
+      `<label class="chk" style="margin:0"><input type="checkbox" data-seg="${s.key}"
+        ${chosen.has(s.key) ? "checked" : ""}> ${esc(s.label)}</label>`).join("");
+    box.querySelectorAll("[data-seg]").forEach((el) => {
+      el.onchange = () => onChange?.(readSegments(containerId));
+    });
+  }
+
+  function readSegments(containerId) {
+    const box = $(containerId);
+    if (!box) return [];
+    return [...box.querySelectorAll("[data-seg]")]
+      .filter((el) => el.checked).map((el) => el.dataset.seg);
+  }
+
+  /** 탐색 범위 드롭다운. 고른 시장과 겹치는 범위만 남깁니다. */
+  async function renderUniverse(selectId, segments, selected) {
+    const sel = $(selectId);
+    if (!sel) return;
+    const cat = await scopeCatalog();
+    const chosen = new Set(segments && segments.length ? segments
+                                                       : ["KOSPI", "KOSDAQ", "NASDAQ"]);
+    const fits = cat.universes.filter((u) => u.segments.some((s) => chosen.has(s)));
+    const group = (key, label) => {
+      const rows = fits.filter((u) => u.group === key);
+      if (!rows.length) return "";
+      return `<optgroup label="${esc(label)}">` + rows.map((u) =>
+        `<option value="${u.key}" title="${esc(u.note)}">${esc(u.label)}</option>`
+      ).join("") + "</optgroup>";
+    };
+    sel.innerHTML = `<option value="">시장 전체</option>`
+      + group("index", "지수 · ETF") + group("sector", "섹터");
+    // 시장을 바꿔서 선택지에서 사라진 범위는 '전체'로 되돌립니다 —
+    // 남겨두면 화면에는 보이는데 결과가 0건인 상태가 됩니다.
+    sel.value = fits.some((u) => u.key === selected) ? selected : "";
+    const hit = fits.find((u) => u.key === sel.value);
+    const note = $(selectId + "Note");
+    if (note) note.textContent = hit ? hit.note : "";
+    return sel.value;
+  }
+
   window.AT = {call, toast, esc, num, won, pct, sign, owlSVG,
                get SNAP() { return SNAP; }, get TOKEN() { return TOKEN; },
-               refresh, $};
+               refresh, $, scopeCatalog, renderSegments, readSegments, renderUniverse};
 
   document.addEventListener("DOMContentLoaded", () => {
     injectChrome(window.PAGE || {nav: "", title: "", desc: ""});

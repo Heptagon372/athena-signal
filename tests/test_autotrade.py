@@ -2132,7 +2132,7 @@ def test_api():
 
     status, _ = http("/api/status")
     if status == 0:
-        print("  서버가 없어 건너뜁니다 (start.bat 또는 python run_server.py 실행 후 재시도)")
+        print("  서버가 없어 건너뜁니다 (아테나.bat → [1] 시작, 또는 python run_server.py 실행 후 재시도)")
         return
 
     account = {"username": "at_qa_user", "password": "qatest1234"}

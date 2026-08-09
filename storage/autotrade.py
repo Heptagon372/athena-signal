@@ -109,7 +109,12 @@ DEFAULT_CONFIG = {
     "auto_universe": False,
     "auto_universe_size": 5,
     "auto_universe_refresh_min": 30,
-    "auto_universe_markets": ["KR"],
+    # 훑을 시장 — 코스피 / 코스닥 / 나스닥. 예전 값 "KR" · "US" 도 그대로
+    # 동작합니다 (data_sources/universe.py 의 normalize_segments 가 풀어줍니다).
+    "auto_universe_markets": ["KOSPI", "KOSDAQ"],
+    # 탐색 범위 — 비우면 시장 전체. 지수·ETF·섹터 키를 넣으면 그 안에서만 찾습니다
+    # (KOSPI200 · KOSDAQ150 · NASDAQ100 · SP500 · KR_SEMI · US_TECHNOLOGY …)
+    "auto_universe_pool": "",
     "auto_universe_min_score": 0.55,   # 이 점수 미만은 편입하지 않습니다
     "auto_universe_keep_manual": True,  # 손으로 넣은 종목은 유지
     # 사람이 직접 넣은 종목 — AI 갱신에서 지키기 위해 **명시적으로** 기록합니다.
