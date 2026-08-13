@@ -491,3 +491,30 @@ def try_resolve(query: str) -> Instrument | None:
         return None
     except Exception:
         return None
+
+
+def from_us_screener(key: str, name: str = "") -> Instrument:
+    """나스닥 스크리너 표에서 온 미국 티커 → Instrument (Yahoo 재검증 생략).
+
+    표 자체가 거래소의 상장 목록이라 실존 확인이 이미 끝난 셈입니다. 이걸
+    `try_resolve` 로 넘기면 티커마다 Yahoo 검색 API 를 한 번씩 때리는데,
+    순환 평가는 시장 전체(수천 종목)를 다루므로 그 순간 차단당합니다.
+
+    인버스·레버리지 판별은 이름으로 합니다 — Yahoo quoteType 이 없으니
+    `classify_etf` 의 이름 규칙이 유일한 단서입니다.
+    """
+    import time
+
+    raw = str(key or "").strip().upper()
+    hit = _resolved.get(raw)
+    if hit and time.time() - hit[0] < _RESOLVE_TTL:
+        return hit[1]
+
+    from data_sources.symbol_registry import classify_etf
+    is_inverse, leverage = classify_etf(name or raw, "")
+    inst = from_symbol(ResolvedSymbol(
+        key=raw, name=name or raw, market=MARKET_US, yahoo_symbol=raw,
+        currency="USD", verified_by="나스닥 스크리너",
+        is_inverse=is_inverse, leverage=leverage))
+    _resolved[raw] = (time.time(), inst)
+    return inst

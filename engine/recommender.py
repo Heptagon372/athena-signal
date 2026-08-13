@@ -35,6 +35,7 @@ AI가 계속 갱신하도록 하는 것이 목적입니다.
     liquidity      거래대금 — 클수록 좋음(못 빠져나오는 위험 회피)
 """
 
+import json
 import math
 import threading
 import time
@@ -43,6 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from config import CACHE_DIR
 from engine import econophysics, feed, indicators, instruments, quant
 from engine.instruments import ETF, STOCK, Instrument
 
@@ -82,10 +84,226 @@ REGIME_TILT = {
 }
 
 MIN_BARS = 80              # 팩터 계산에 필요한 최소 일봉
+
+# 편입 자격 하한 — 20일 평균 거래대금 (원 / 달러).
+#
+# 시장 **전체**를 순환하면서 거래정지·정리매매·사실상 거래가 없는 종목까지
+# 후보가 됩니다. 예전에는 거래량순위 상위 30만 봤기 때문에 이런 종목이 애초에
+# 들어올 수 없었습니다. 문제는 이들이 점수까지 낮게 나오지는 않는다는 것입니다
+# — 가격이 안 움직이니 변동성이 0에 가까워 위험조정수익이 오히려 좋게 나옵니다.
+#
+# 그래서 점수와 별개로 **편입 자격**을 막습니다(tradable=False). 순위표에는
+# 남겨서 "왜 안 사는지"가 보이게 합니다. 값은 '사는 순간 호가가 밀리는' 수준의
+# 하한이며, _warn 의 경고선(국내 10억)보다 훨씬 낮습니다 — 경고는 사람이 보고
+# 판단할 일이고, 여기서 막는 것은 판단의 여지가 없는 구간입니다.
+MIN_TRADING_VALUE = {"KR": 1e8, "US": 1e5}
 FACTOR_CACHE_TTL = 900.0   # 15분 — 일봉 기반이라 자주 바뀌지 않습니다
+
+# RMT 는 관측일(T)이 자산 수(N)의 2배는 돼야 유효합니다 (_rmt_coupling 이 강제).
+# 120일 수익률로는 N≈60이 한계라, 순환 평가로 후보가 수천이 되면 전부 무효
+# 판정이 납니다. 시장 모드는 어차피 유동성 상위가 정의하므로 상위 50으로만
+# 추정하고 나머지는 중립(1.0)으로 둡니다.
+RMT_MAX_ASSETS = 50
+
+# 수익률(_returns)을 디스크에 남길 종목 수 — **시장별** 거래대금 상위 기준.
+# RMT 가 실제로 쓰는 것은 RMT_MAX_ASSETS 종목뿐이라, 여유 배수만 남깁니다.
+# (넉넉히 잡는 이유: 회전마다 후보 구성이 조금씩 달라서, 상위 50이 매번 같은
+#  종목은 아닙니다. 재시작 직후 첫 회전이 캐시만으로 RMT 를 세울 수 있어야 합니다)
+RETURNS_KEEP_PER_MARKET = RMT_MAX_ASSETS * 4
 
 _factor_cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# 팩터 캐시 디스크 저장 — 순환 평가의 기반
+# ---------------------------------------------------------------------------
+# 메모리 캐시(15분)는 "같은 회전 안에서 두 번 계산하지 않기" 용이고, 디스크
+# 캐시(24시간)는 **순환 평가** 용입니다 — 갱신마다 일부만 새로 계산해도 하루
+# 안에 계산해 둔 종목 전부를 순위에 올릴 수 있고, 서버를 재시작해도 순환이
+# 처음부터 다시 돌지 않습니다. 일봉 기반 팩터는 하루 안에서 크게 변하지
+# 않지만, 수급·화제성처럼 장중에 변하는 값은 그 종목이 다시 계산 창에 들어올
+# 때까지 묵은 값입니다 — 순환 평가가 의도적으로 받아들인 비용입니다.
+
+FACTOR_STALE_TTL = 24 * 3600.0
+_FACTOR_DISK = CACHE_DIR / "factor_cache.json"
+_disk_loaded = False
+
+
+def _load_disk_cache():
+    """디스크 팩터를 메모리로 (프로세스당 1회, 만료분 제외)."""
+    global _disk_loaded
+    with _cache_lock:
+        if _disk_loaded:
+            return
+        _disk_loaded = True
+    try:
+        payload = json.loads(_FACTOR_DISK.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    loaded: dict = {}
+    for key, entry in (payload or {}).items():
+        try:
+            ts = float(entry.get("ts") or 0)
+            if now - ts >= FACTOR_STALE_TTL:
+                continue
+            factors = dict(entry.get("factors") or {})
+            returns = entry.get("returns") or {}
+            if returns.get("val"):
+                # RMT 결합도 계산용 수익률 — 날짜 인덱스까지 복원해야
+                # _rmt_coupling 의 날짜 정렬(inner join)이 동작합니다
+                factors["_returns"] = pd.Series(
+                    [float(v) for v in returns["val"]],
+                    index=pd.to_datetime(returns["idx"]))
+            loaded[key] = (ts, factors)
+        except Exception:
+            continue                     # 항목 하나가 깨져도 나머지는 살립니다
+    with _cache_lock:
+        for key, item in loaded.items():
+            current = _factor_cache.get(key)
+            if current is None or current[0] < item[0]:
+                _factor_cache[key] = item
+
+
+def save_factor_cache():
+    """메모리 팩터를 디스크로. rank() 끝에서 호출됩니다 (갱신당 1회 쓰기)."""
+    now = time.time()
+    with _cache_lock:
+        # 만료 항목은 메모리에서도 걷어내 캐시가 무한히 크지 않게 합니다
+        for key in [k for k, (ts, _) in _factor_cache.items()
+                    if now - ts >= FACTOR_STALE_TTL]:
+            _factor_cache.pop(key, None)
+        items = list(_factor_cache.items())
+
+    # 수익률은 **시장별 거래대금 상위만** 남깁니다.
+    #
+    # RMT 결합도는 어차피 유동성 상위 RMT_MAX_ASSETS 종목으로만 추정하는데,
+    # 저장은 전 종목에 대해 하고 있었습니다. 순환 평가로 캐시가 수천 종목이
+    # 되면 파일의 대부분이 한 번도 읽히지 않는 수익률입니다 (실측: 2,761종목
+    # 14.2MB 중 11.5MB). 한국까지 전 종목을 돌면 그대로 두 배가 되고, 그 파일을
+    # 갱신마다 통째로 쓰고 기동 때마다 통째로 파싱하게 됩니다.
+    # 상위 몇 배수만 남기면 RMT 결과는 그대로면서 파일은 3분의 1이 됩니다.
+    by_market: dict[str, list] = {}
+    for key, (_, factors) in items:
+        if factors.get("_returns") is None:
+            continue
+        # market 은 이번 버전부터 팩터에 담깁니다. 그 전에 계산해 둔 캐시는
+        # 종목코드 모양으로 가릅니다 — 6자리 숫자면 국내입니다. 시장을 섞으면
+        # 원화 거래대금이 달러를 언제나 이겨서, 미국 상위 종목이 통째로 밀립니다.
+        market = str(factors.get("market") or "")
+        if not market:
+            code = key[2:]
+            market = "KR" if len(code) == 6 and code.isdigit() else "US"
+        by_market.setdefault(market, []).append(
+            (float(factors.get("trading_value") or 0.0), key))
+    keep_returns: set = set()
+    for rows in by_market.values():
+        rows.sort(reverse=True)
+        keep_returns.update(key for _, key in rows[:RETURNS_KEEP_PER_MARKET])
+
+    payload = {}
+    for key, (ts, factors) in items:
+        entry = {"ts": ts,
+                 "factors": {k: v for k, v in factors.items()
+                             if v is None or isinstance(v, (bool, int, float, str))}}
+        returns = factors.get("_returns")
+        if returns is not None and len(returns) and key in keep_returns:
+            try:
+                entry["returns"] = {
+                    "idx": [pd.Timestamp(d).strftime("%Y-%m-%d")
+                            for d in returns.index],
+                    "val": [float(v) for v in returns.values]}
+            except Exception:
+                pass                     # 수익률만 빠지고 팩터는 저장됩니다
+        payload[key] = entry
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _FACTOR_DISK.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_FACTOR_DISK)        # 쓰다 죽어도 원본이 깨지지 않게
+    except OSError:
+        pass
+    _save_misses()
+
+
+def cached_factor_keys(max_age: float = None) -> set:
+    """이 나이 안쪽의 팩터가 (디스크 포함) 있는 종목 키 집합.
+
+    순환 평가에서 "이번 갱신에 새로 계산할 필요가 없는 종목"을 고르는
+    기준입니다 — 여기 없는 종목부터 계산 창(window)에 담습니다.
+    """
+    _load_disk_cache()
+    ttl = FACTOR_STALE_TTL if max_age is None else max_age
+    now = time.time()
+    with _cache_lock:
+        return {key[2:] for key, (ts, _) in _factor_cache.items()
+                if key.startswith("f:") and now - ts < ttl}
+
+
+# ---------------------------------------------------------------------------
+# 계산 불가 메모 — 순환이 앞으로 나아가게 하는 장치
+# ---------------------------------------------------------------------------
+# 계산 창은 '팩터 캐시가 없는 종목'부터 채웁니다. 그런데 신규상장이라 일봉이
+# MIN_BARS 미만이거나 제공처가 그 종목만 안 주면 캐시가 **영원히** 생기지
+# 않아서, 매 갱신마다 같은 종목이 창의 같은 자리를 차지합니다. 순환이 거기서
+# 멈추는 것입니다 — 전 종목을 도는 설계에서는 이게 곧 "시장 전체 커버"가
+# 영원히 끝나지 않는다는 뜻입니다. 그래서 실패도 기록합니다.
+#
+# 영구 제외가 아니라 6시간짜리입니다. 상장 이력은 하루에 하루치씩 쌓이고,
+# 제공처 장애는 대개 그 안에 복구됩니다.
+
+FACTOR_MISS_TTL = 6 * 3600.0
+_MISS_DISK = CACHE_DIR / "factor_misses.json"
+_misses: dict[str, float] = {}
+_misses_loaded = False
+
+
+def _load_misses():
+    global _misses_loaded
+    with _cache_lock:
+        if _misses_loaded:
+            return
+        _misses_loaded = True
+    try:
+        payload = json.loads(_MISS_DISK.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    with _cache_lock:
+        for key, ts in (payload or {}).items():
+            try:
+                if now - float(ts) < FACTOR_MISS_TTL:
+                    _misses.setdefault(str(key), float(ts))
+            except (TypeError, ValueError):
+                continue
+
+
+def _note_miss(key: str):
+    """이 종목은 지금 팩터를 만들 수 없다 — 다음 계산 창에서는 건너뜁니다."""
+    with _cache_lock:
+        _misses[str(key)] = time.time()
+
+
+def _save_misses():
+    """만료분을 걷어내고 디스크로. save_factor_cache 와 같이 호출됩니다."""
+    now = time.time()
+    with _cache_lock:
+        for key in [k for k, ts in _misses.items() if now - ts >= FACTOR_MISS_TTL]:
+            _misses.pop(key, None)
+        payload = dict(_misses)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _MISS_DISK.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def uncomputable_keys() -> set:
+    """최근 계산에 실패해 이번 창에서는 건너뛸 종목 (디스크 포함)."""
+    _load_misses()
+    now = time.time()
+    with _cache_lock:
+        return {key for key, ts in _misses.items() if now - ts < FACTOR_MISS_TTL}
 
 
 @dataclass
@@ -125,27 +343,39 @@ class Recommendation:
 # ---------------------------------------------------------------------------
 
 def compute_factors(inst: Instrument, bars: pd.DataFrame = None,
-                    quote: dict = None) -> dict | None:
+                    quote: dict = None, max_age: float = None,
+                    offline: bool = False) -> dict | None:
     """한 종목의 팩터 원값. 데이터가 모자라면 None.
 
     캐시를 쓰는 이유: 유니버스 갱신마다 수십 종목의 일봉을 다시 받으면
     데이터 제공처 한도에 걸립니다. 일봉 기반이라 15분 캐시는 안전합니다.
+
+    `offline=True` 는 순환 평가용 — `max_age`(기본 24시간까지 허용) 안쪽의
+    캐시가 있으면 그걸 주고, 없으면 **네트워크 없이** None 을 돌려줍니다.
+    시장 전체를 순위에 올릴 때 캐시 없는 종목까지 일봉을 받으면 한 번에
+    수천 호출이 나가기 때문입니다.
     """
+    _load_disk_cache()
     cache_key = f"f:{inst.key}"
     now = time.time()
+    ttl = FACTOR_CACHE_TTL if max_age is None else max_age
     with _cache_lock:
         hit = _factor_cache.get(cache_key)
-    if hit and now - hit[0] < FACTOR_CACHE_TTL and bars is None:
+    if hit and now - hit[0] < ttl and bars is None:
         return hit[1]
+    if offline:
+        return None
 
     if bars is None:
         bars = feed.bars(inst, "day", count=280)
     if bars is None or len(bars) < MIN_BARS:
+        _note_miss(inst.key)
         return None
 
     close = bars["close"]
     returns = close.pct_change().dropna()
     if len(returns) < 40:
+        _note_miss(inst.key)
         return None
 
     factors: dict = {}
@@ -278,6 +508,9 @@ def compute_factors(inst: Instrument, bars: pd.DataFrame = None,
 
     factors["price"] = float(close.iloc[-1])
     factors["bars"] = len(bars)
+    # 시장 — 저장 단계에서 "거래대금 상위"를 시장별로 가르는 데 씁니다.
+    # 원화와 달러 거래대금을 한 줄로 세우면 국내 종목이 언제나 이깁니다.
+    factors["market"] = inst.market
     # RMT 결합도 계산용 수익률 (rank() 에서 쓰고 저장 전에 버립니다).
     # **날짜 인덱스를 유지합니다** — 종목마다 거래일이 다를 수 있어, 인덱스를
     # 버리고 길이로만 자르면 서로 다른 날의 수익률이 짝지어집니다.
@@ -285,6 +518,7 @@ def compute_factors(inst: Instrument, bars: pd.DataFrame = None,
 
     with _cache_lock:
         _factor_cache[cache_key] = (now, factors)
+        _misses.pop(inst.key, None)      # 예전에 실패했더라도 이제 됩니다
     return factors
 
 
@@ -507,17 +741,24 @@ def _weights_for(regime: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
-         market_regime: str = "") -> list[Recommendation]:
+         market_regime: str = "", stale_keys: set = None) -> list[Recommendation]:
     """후보 목록 → 순위가 매겨진 추천.
 
     candidates 는 screener.Candidate 또는 종목코드 문자열 목록입니다.
+
+    `stale_keys` 는 순환 평가에서 온 종목들 — 팩터를 새로 계산하지 않고
+    24시간 안쪽 캐시만 씁니다 (캐시가 없으면 조용히 순위에서 빠집니다).
+    이게 없으면 시장 전체를 넘기는 순간 종목 수만큼 일봉 호출이 나갑니다.
     """
     resolved = []
     for candidate in candidates:
         inst, base = _to_instrument(candidate)
         if inst is None:
             continue
-        factors = compute_factors(inst)
+        if stale_keys and inst.key in stale_keys:
+            factors = compute_factors(inst, max_age=FACTOR_STALE_TTL, offline=True)
+        else:
+            factors = compute_factors(inst)
         if not factors:
             continue
         # 캐시된 dict 를 그대로 쓰면 아래에서 _returns 를 지울 때 캐시가 망가집니다
@@ -552,17 +793,27 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     # 얼마나 실려 있는가. 결합도가 높으면 "시장이 오르니까 오르는" 종목이고,
     # 낮으면 독자적인 이유로 움직이는 종목입니다. 분산 효과도 후자가 큽니다.
     couplings = [1.0] * len(resolved)
+    rmt_evaluated: set = set()
     market_diag = {}
     for market_key, indices in buckets.items():
-        sub = _rmt_coupling([resolved[i][2].get("_returns") for i in indices])
-        for j, i in enumerate(indices):
+        # 순환 평가로 후보가 수천이면 T≥2N 조건이 깨져 RMT 가 통째로 무효가
+        # 됩니다 — 유동성 상위 RMT_MAX_ASSETS 종목으로만 시장 모드를 추정하고
+        # 나머지는 중립(1.0)으로 둡니다 (시장 모드는 어차피 대형주가 정의합니다).
+        rmt_idx = indices
+        if len(indices) > RMT_MAX_ASSETS:
+            rmt_idx = sorted(indices,
+                             key=lambda i: resolved[i][2].get("trading_value") or 0.0,
+                             reverse=True)[:RMT_MAX_ASSETS]
+        rmt_evaluated.update(rmt_idx)
+        sub = _rmt_coupling([resolved[i][2].get("_returns") for i in rmt_idx])
+        for j, i in enumerate(rmt_idx):
             couplings[i] = sub[j]
         # 시장 진단 (표시 전용) — 같은 수익률을 재사용하므로 추가 비용이 없습니다.
         # **매매 판단에는 쓰지 않습니다.** 게이트로 쓰면 성과가 나빠진다는 것을
         # 측정했습니다 (AUTOTRADE.md 16장).
         try:
             rets = {resolved[i][0].symbol: resolved[i][2].get("_returns")
-                    for i in indices}
+                    for i in rmt_idx}
             diag = econophysics.market_diagnostics(rets)
             if diag:
                 market_diag[str(market_key)] = diag
@@ -588,7 +839,15 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     z_tail = _bucketed([_shrink_tail(f.get("tail_alpha", 3.0),
                                      f.get("tail_alpha_se", float("inf")))
                         for _, _, f in resolved])
-    z_decouple = _bucketed([-f.get("rmt_coupling", 1.0) for _, _, f in resolved])
+    # 탈동조 z 는 **실제로 RMT 를 계산한 종목끼리만** 매깁니다. 중립(1.0)으로
+    # 채운 수천 종목과 섞어 표준화하면 분산이 0에 붙어서, 계산된 소수의 z 만
+    # ±3 으로 폭주합니다. 후보가 RMT_MAX_ASSETS 이하면 예전과 동일합니다.
+    z_decouple = [0.0] * len(resolved)
+    for indices in buckets.values():
+        idx = [i for i in indices if i in rmt_evaluated]
+        z = _zscore([-resolved[i][2].get("rmt_coupling", 1.0) for i in idx])
+        for j, i in enumerate(idx):
+            z_decouple[i] = z[j]
     columns["econophysics"] = [(a + b) / 2 for a, b in zip(z_tail, z_decouple)]
 
     total_value = float(account.get("total_value") or 0)
@@ -616,6 +875,8 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
             else:
                 price_krw = price
         quantity = int(budget // price_krw) if price_krw > 0 else 0
+        floor = MIN_TRADING_VALUE["US" if inst.market == "US" else "KR"]
+        illiquid = float(factors.get("trading_value") or 0.0) < floor
 
         rec = Recommendation(
             key=inst.key, name=inst.name or base.get("name") or inst.key,
@@ -623,13 +884,20 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
             score=score, factors=factors, z_scores=z,
             regime=factors.get("regime", ""),
             max_quantity=quantity, order_krw=quantity * price_krw,
-            tradable=quantity >= 1,
+            tradable=quantity >= 1 and not illiquid,
         )
         rec.reasons = _explain(z, factors, weights)
         if factors.get("smart_money_hit"):
             rec.reasons.insert(0, "◆ 스마트머니 포착 — CCI 상승 중인데 개인은 팔고 "
                                   "기관·외인이 사고 있습니다")
         rec.warnings = _warn(factors, quantity, market=inst.market)
+        if illiquid:
+            # 편입을 막은 이유는 경고 맨 앞에 둡니다 — 화면이 앞의 두어 줄만
+            # 보여주는데, 정작 '왜 못 사는지'가 뒤로 밀리면 안 됩니다.
+            rec.warnings.insert(0, (
+                f"거래가 사실상 없습니다 (20일 평균 거래대금 "
+                f"{factors.get('trading_value', 0):,.0f}"
+                f"{'달러' if inst.market == 'US' else '원'}) — 편입 대상에서 제외합니다"))
         out.append(rec)
 
     out.sort(key=lambda r: (r.tradable, r.score), reverse=True)
@@ -641,6 +909,10 @@ def rank(candidates: list, cfg: dict, account: dict, top_n: int = 5,
     global _last_market_diagnostics
     with _cache_lock:
         _last_market_diagnostics = market_diag
+
+    # 이번에 새로 계산한 팩터를 디스크에 남깁니다 — 순환 평가가 다음 갱신과
+    # 서버 재시작 후에도 이어서 돌 수 있는 근거입니다.
+    save_factor_cache()
 
     return out[:max(top_n, 1)] if top_n else out
 
@@ -667,10 +939,16 @@ def _to_instrument(candidate):
     key = getattr(candidate, "key", None) or (candidate or {}).get("key")
     if not key:
         return None, {}
-    inst = instruments.try_resolve(key)
+    base = candidate.to_dict() if hasattr(candidate, "to_dict") else dict(candidate)
+    if base.get("market") == "US" and base.get("source"):
+        # 스크리너 표에서 온 미국 티커 — Yahoo 재검증 없이 그대로 씁니다.
+        # try_resolve 는 티커마다 Yahoo 검색을 호출하는데, 순환 평가는 시장
+        # 전체(수천 종목)를 넘기므로 재검증만으로 차단당합니다.
+        inst = instruments.from_us_screener(key, str(base.get("name") or ""))
+    else:
+        inst = instruments.try_resolve(key)
     if inst is None or inst.asset_class not in (STOCK, ETF):
         return None, {}
-    base = candidate.to_dict() if hasattr(candidate, "to_dict") else dict(candidate)
     return inst, base
 
 

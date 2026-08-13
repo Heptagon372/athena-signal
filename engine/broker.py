@@ -19,6 +19,7 @@ fail-closed 원칙
     · 파생 주문인데 KIS 가 설정돼 있지 않으면 거부합니다
 """
 
+import hashlib
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -829,6 +830,30 @@ def get_broker(user_id: int, mode: str = PAPER, cfg: dict = None) -> Broker:
     return PaperBroker(user_id, slippage_bps=(cfg or {}).get("paper_slippage_bps", 5.0))
 
 
+def account_fingerprint(mode: str) -> str:
+    """지금 이 모드가 바라보는 **계좌의 지문**. 계좌를 바꾸면 값이 달라집니다.
+
+    성적 초기화의 판단 근거입니다 (storage/autotrade.sync_account).
+
+    계좌번호 대신 해시를 쓰는 이유
+        이 값은 athena.db 에 평문으로 남습니다. KIS 계좌번호는 일부러 Mongo 에
+        암호화해 두는 값인데(storage/user_credentials.py), 같은 번호가 옆
+        테이블에 평문으로 굴러다니면 그 암호화가 무의미해집니다. 여기서는
+        "같은가 다른가"만 알면 되므로 원본이 필요 없습니다.
+
+    빈 문자열 = **모름** (계좌 미설정이거나 키를 못 읽음). 부르는 쪽은 이때
+    아무 판단도 하지 않습니다 — 키를 잠깐 못 읽은 것과 계좌를 바꾼 것은
+    다릅니다.
+    """
+    if mode == PAPER:
+        return "paper"        # 내부 모의계좌는 이 프로그램 안에 있고 바뀌지 않습니다
+    acc = kis_trading.account()
+    if not acc:
+        return ""
+    digest = hashlib.sha256(f"{mode}:{acc[0]}-{acc[1]}".encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
 def available_modes() -> list[dict]:
     """콘솔에 보여줄 모드 목록 + 각 모드가 지금 쓸 수 있는지."""
     st = kis_trading.status()
@@ -862,5 +887,5 @@ def make_client_order_id(user_id: int, key: str, action: str,
 
 
 __all__ = ["Broker", "PaperBroker", "KISBroker", "OrderResult", "OrderStatus",
-           "Position", "get_broker", "available_modes", "make_client_order_id",
-           "PAPER", "MOCK", "LIVE", "MODE_LABELS"]
+           "Position", "get_broker", "available_modes", "account_fingerprint",
+           "make_client_order_id", "PAPER", "MOCK", "LIVE", "MODE_LABELS"]

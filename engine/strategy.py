@@ -59,6 +59,12 @@ class Signal:
     ensemble: dict | None = None       # 앙상블 진단 (algo_mode 가 off 가 아닐 때만)
     ml: dict | None = None             # ML 오버레이 (ml_mode 가 off 가 아닐 때만)
     ma50: float | None = None          # 50일 이동평균 — 승자 보유 판정(check_exit)용
+    # 과매수·과매도 판정에 쓰는 원값 (engine/split.py 의 분할 매수·매도).
+    # 점수(score)만으로는 "과매도라서 담는다"를 판단할 수 없습니다 — 점수는
+    # 19개 지표를 국면 가중으로 합친 값이라, RSI 가 28이어도 추세 지표가 좋으면
+    # 양수로 나옵니다. 분할은 **그 지표 자체**를 봐야 하므로 따로 실어 나릅니다.
+    rsi: float | None = None           # RSI(14)
+    bb_pct: float | None = None        # 볼린저 %B (0=하단, 1=상단)
     vol_factor: float = 1.0            # 변동성 배수 — 손절·익절 폭 스케일에 사용
     # 점수가 만들어진 순서 — 화면에서 계산 과정을 그대로 보여주기 위한 기록입니다.
     # 화면이 이 과정을 따로 재현하면 반드시 엔진과 어긋납니다(어느 오버레이가
@@ -88,6 +94,8 @@ class Signal:
             "quote_age": self.quote_age, "nnfx": self.nnfx,
             "ensemble": self.ensemble, "ml": self.ml,
             "ma50": round(self.ma50, 4) if self.ma50 else None,
+            "rsi": round(self.rsi, 2) if self.rsi is not None else None,
+            "bb_pct": round(self.bb_pct, 3) if self.bb_pct is not None else None,
             "vol_factor": round(self.vol_factor, 3),
             "stages": self.stages,
             "reasons": self.reasons[:6], "error": self.error,
@@ -162,6 +170,12 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
     daily = indicators.analyze(bars_daily)
     sig.daily_score = float(daily.score)
     sig.bars_used = daily.bars_used
+    # 과매수·과매도 원값 — 이미 계산된 지표에서 꺼내 옵니다 (추가 계산 없음)
+    for item in (daily.indicators or []):
+        if item.key == "rsi":
+            sig.rsi = (item.values or {}).get("rsi")
+        elif item.key == "bollinger":
+            sig.bb_pct = (item.values or {}).get("pct_b")
     sig.regime = (daily.regime or {}).get("label", "")
     sig.stage("daily", "일봉 지표 종합", sig.daily_score,
               f"{daily.bars_used}봉 · 지표 {len(daily.indicators)}개를 국면 가중으로 합산"
@@ -538,7 +552,8 @@ class ExitDecision:
 
 def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
                state: dict, now: datetime = None,
-               protective_only: bool = False) -> ExitDecision:
+               protective_only: bool = False,
+               defer_take_profit: bool = False) -> ExitDecision:
     """보유 포지션을 정리해야 하는가.
 
     확인 순서가 중요합니다 — **손실을 막는 조건을 먼저** 봅니다.
@@ -558,6 +573,15 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
 
         방향은 안전한 쪽입니다 — 익절이 몇십 초 늦는 것은 기회 손실이지만,
         손절이 몇십 초 늦는 것은 손실입니다.
+
+    defer_take_profit
+        **익절만** 넘깁니다 — 목표가 도달과 목표 수익률 달성을 건너뜁니다.
+        분할 매도(engine/split.py)가 켜진 포지션이 쓰는 모드입니다.
+
+        차수별로 나눠 파는 포지션에서 전량 익절이 먼저 걸리면, 1차부터
+        마지막 차수까지 한 번에 정리되어 분할 자체가 무의미해집니다.
+        지키는 조건(손절·트레일링·만기·시간·신호 반전)은 그대로 둡니다 —
+        이건 분할이든 아니든 전량으로 나가야 하는 상황입니다.
     """
     now = now or datetime.now()
     direction = 1 if position.side == LONG else -1
@@ -610,14 +634,16 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
         if peak and price >= float(peak) * 0.97:
             winner_hold = True
 
+    skip_take = winner_hold or protective_only or defer_take_profit
+
     target = state.get("target_price")
-    if target and not winner_hold and not protective_only:
+    if target and not skip_take:
         hit = price >= float(target) if direction > 0 else price <= float(target)
         if hit:
             return ExitDecision(True, f"목표가 도달 ({price:g}, {pnl_pct:+.2f}%)")
 
     take = float(cfg.get("take_profit_pct", 0) or 0)
-    if take > 0 and pnl_pct >= take and not winner_hold and not protective_only:
+    if take > 0 and pnl_pct >= take and not skip_take:
         return ExitDecision(True, f"목표 수익 {take:g}% 달성 ({pnl_pct:+.2f}%)")
 
     # 5) 신호 반전 / 소멸

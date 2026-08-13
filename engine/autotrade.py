@@ -36,10 +36,17 @@ import numpy as np
 from data_sources import credentials
 from engine import broker as broker_module
 from engine import (feed, fills, holding, instruments, portfolio, protections,
-                    risk, strategy, validation)
+                    risk, rotation, split, strategy, validation)
 from engine.broker import make_client_order_id
 from engine.instruments import Instrument
 from storage import autotrade as store
+
+# 포지션의 주인 — 초단타와 일반 자동매매의 경계입니다. 왜 나누는지는 아래
+# "초단타와 일반 자동매매의 경계" 단락에 적어 두었습니다.
+# 이 두 값이 여기(맨 위)에 있어야 하는 이유: split_applies() 가 이 값을 기본
+# 인자로 씁니다. 기본 인자는 def 를 만나는 순간, 즉 임포트 중에 계산되므로
+# 함수보다 뒤에 정의하면 모듈이 통째로 임포트되지 않습니다(NameError).
+OWNER_AUTO, OWNER_SCALP = "auto", "scalp"
 
 # 사용자별 실행 락 — 같은 계좌에 두 회전이 동시에 들어가면 잔고 계산이 깨집니다
 _user_locks: dict[int, threading.Lock] = {}
@@ -340,6 +347,12 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
         result.update(ok=False, halted=True, halt_reasons=[health.get("detail", "")])
         return result
 
+    # 계좌를 바꿨으면 성적을 0원으로 되돌립니다. 정산·집계보다 먼저 해야
+    # 옛 계좌의 체결이 새 계좌의 오늘 손익에 섞이지 않습니다
+    # (storage/autotrade.sync_account).
+    if store.sync_account(user_id, mode, broker_module.account_fingerprint(mode)):
+        result["account_changed"] = True
+
     # -- 0단계: 지난 회전에 낸 주문부터 정리 -------------------------------
     # 이걸 먼저 하지 않으면 "체결됐는지도 모르는 주문"이 남은 채로 새 주문을 냅니다.
     _settle_open_orders(user_id, cfg, brk, result)
@@ -388,8 +401,11 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
         if not is_managed(cfg, position.key, states):
             continue
         try:
+            # 안전장치가 걸린 회전에서는 분할 추가 매수를 하지 않습니다
+            # (신규 진입과 같은 성격입니다). 차수 매도는 그대로 봅니다.
             _handle_exit(user_id, cfg, brk, engine_risk, position,
-                         states.get(position.key, {}), result)
+                         states.get(position.key, {}), result,
+                         allow_add=not halts)
         except Exception as exc:
             result["errors"].append(f"{position.key} 청산 검사 실패: {exc}")
             store.log_event(user_id, "error", f"{position.key} 청산 검사 실패: {exc}",
@@ -646,7 +662,31 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
                        avg_fill_price=fill_price, slippage_bps=slippage,
                        realized_pnl=realized)
 
-    if is_exit:
+    # 이 주문이 **차수 주문**인가 — 접수만 됐던 분할 주문이 뒤늦게 체결되는
+    # 경로입니다. 즉시 체결이면 _handle_split 이 이미 원장을 고쳤고, 그런
+    # 주문은 미결 목록에 없으므로 여기 오지 않습니다(이중 반영 없음).
+    detail = record.get("detail") or {}
+    if not isinstance(detail, dict):
+        detail = {}
+    split_info = detail.get("split") if isinstance(detail.get("split"), dict) else None
+
+    if is_exit and split_info:
+        # 차수 하나만 판 것이므로 **포지션 상태를 지우면 안 됩니다.**
+        # 지우면 남은 차수가 손절선도 원장도 없이 계좌에만 남습니다.
+        if realized is not None:
+            store.record_daily_trade(user_id, mode, float(realized) - booked,
+                                     count=1 if status.status == "filled" else 0)
+        if status.status == "filled":
+            ledger = split.load(state.get("splits"))
+            split.remove_tranche(ledger, int(split_info.get("tranche") or 0),
+                                 status.filled_quantity)
+            if ledger.tranches:
+                _save_ledger(user_id, mode, record["symbol"], ledger)
+            else:
+                # 원장이 비었으면 실제로 전량이 나간 것입니다 (원장과 계좌가
+                # 어긋났던 경우). 그때는 예전 경로와 같이 기억을 지웁니다.
+                store.clear_position_state(user_id, mode, record["symbol"])
+    elif is_exit:
         if realized is not None:
             # 손익은 체결된 만큼 즉시 반영하고(안 하면 한도가 늦게 걸립니다),
             # 매매 건수는 그 매매가 끝났을 때 한 번만 셉니다.
@@ -655,11 +695,19 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
         # 청산이 전량 체결되면 손절·목표 기억을 지웁니다
         if status.status == "filled":
             store.clear_position_state(user_id, mode, record["symbol"])
+    elif split_info:
+        # 추가 차수 매수 체결 — 원장에 차수를 더하고 평단·수량을 다시 씁니다.
+        # 손절선·목표는 건드리지 않습니다: 분할의 손절선은 1차 때 마지막
+        # 차수까지 계산해 박아둔 값이고, 차수를 담았다고 움직이면 안 됩니다.
+        ledger = split.load(state.get("splits"))
+        if ledger.tranches and status.status == "filled":
+            split.add_tranche(ledger, int(split_info.get("tranche") or ledger.next_n()),
+                              status.filled_quantity, float(fill_price or 0))
+            _save_ledger(user_id, mode, record["symbol"], ledger)
     else:
         # 진입 체결 — **실제 체결가 기준으로** 손절·목표를 다시 잡습니다.
         # 주문 낼 때 본 가격으로 손절을 걸어두면, 슬리피지만큼 손절폭이 어긋납니다.
-        detail = record.get("detail") or {}
-        plan = detail.get("plan") if isinstance(detail, dict) else None
+        plan = detail.get("plan")
         entry = float(fill_price or 0)
         stop = target = None
         if plan and entry:
@@ -669,6 +717,25 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
                 target_gap = float(plan.get("target_price") or planned_entry) - planned_entry
                 stop = entry - stop_gap
                 target = entry + target_gap
+
+        # 분할 1차가 뒤늦게 체결된 경우 — 원장을 여기서 만듭니다. 안 만들면
+        # 계좌에는 1차가 들어와 있는데 원장이 없어서, 다음 회전이 그 포지션을
+        # '분할 대상 아님'으로 보고 2차를 영원히 담지 않습니다.
+        splits_json = None
+        sizing_split = ((plan or {}).get("sizing") or {}).get("split") \
+            if isinstance(plan, dict) else None
+        if sizing_split and entry and not (state.get("splits") or "").strip():
+            sp = split.params(cfg)
+            ledger = split.bootstrap(sp, entry, status.filled_quantity,
+                                     sum(float(q) for q in (sizing_split.get("qty") or [])
+                                         ) or status.filled_quantity,
+                                     inst.round_quantity if inst else None)
+            splits_json = ledger.to_json()
+            stop, target = ledger.plan["stop"], 0.0
+
+        # splits 는 **만들었을 때만** 넘깁니다. None 을 그대로 넘기면 이미 있는
+        # 원장을 NULL 로 덮어써서, 담아둔 차수 기록이 통째로 사라집니다.
+        extra = {"splits": splits_json} if splits_json else {}
         store.upsert_position_state(
             user_id, mode, record["symbol"],
             side=record.get("side") or state.get("side") or "long",
@@ -679,8 +746,8 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
             quantity=status.filled_quantity,
             opened_at=state.get("opened_at") or datetime.now().isoformat(),
             # 주문을 낸 전략이 이 포지션의 주인입니다 (청산 규칙이 여기서 갈립니다)
-            strategy=(detail.get("strategy") if isinstance(detail, dict) else None)
-                     or state.get("strategy"))
+            strategy=detail.get("strategy") or state.get("strategy"),
+            **extra)
 
     result["settled"].append({
         "symbol": record["symbol"], "name": record["name"],
@@ -822,13 +889,40 @@ def _maybe_refresh_universe(user_id: int, cfg: dict, account: dict, result: dict
     return cfg
 
 
+def rotate_window(items: list, key_of, budget: int,
+                  cached: set, missed: set) -> tuple[list, list, int]:
+    """순환 평가의 한 회전 — (새로 계산할 것, 캐시로만 올릴 것, 건너뛴 수).
+
+    `items` 는 모집단(시장 전체)이고 `budget` 이 이번 회전에서 새로 계산할
+    수입니다. 이미 팩터가 있는 종목(`cached`)은 계산 없이 순위에만 올리므로,
+    회전을 거듭할수록 순위 대상이 시장 전체로 넓어집니다.
+
+    `missed` 를 창에서 빼는 것이 핵심입니다. 계산이 실패하는 종목(상장 직후라
+    일봉이 모자라거나 제공처가 그 종목만 안 주는 경우)은 **영원히 캐시가 생기지
+    않아서**, 빼지 않으면 매 회전 창의 같은 자리를 차지합니다. 순환이 그
+    지점에서 멈추고 시장 전체 커버는 영원히 끝나지 않습니다.
+    """
+    window, extras, skipped = [], [], 0
+    for item in items:
+        key = key_of(item)
+        if key in cached:
+            extras.append(item)
+        elif key in missed:
+            skipped += 1
+        elif len(window) < budget:
+            window.append(item)
+    return window, extras, skipped
+
+
 def recommend_universe(user_id: int, cfg: dict, account: dict,
                        top_n: int = None) -> list:
     """다중 팩터 추천기로 후보를 뽑고 순위를 매깁니다 (편입은 하지 않음).
 
-    1) 시장에서 거래가 실제로 되는 종목을 받아오고
-    2) 종목마다 6개 팩터를 계산해
-    3) 같은 날 후보들끼리 표준화한 뒤
+    1) 시장 **전체**를 모집단으로 잡고 (국내는 KRX 상장법인목록,
+       미국은 나스닥 스크리너 표 — 둘 다 한 번의 조회로 명단이 옵니다)
+    2) 그중 이번 갱신 몫만 팩터를 새로 계산하고 (순환 평가),
+       하루 안에 계산해 둔 나머지는 캐시 그대로 순위에 올린 뒤
+    3) 같은 시장 후보들끼리 표준화하고
     4) 지금 국면에 맞는 비중으로 합산합니다
     """
     from data_sources import screener, universe as universe_mod
@@ -838,27 +932,102 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     pool = str(cfg.get("auto_universe_pool") or "")
     size = int(top_n or cfg.get("auto_universe_size", 5))
 
-    # 팩터 계산은 종목마다 일봉을 받아야 해서 비쌉니다.
-    # 유동성 상위로 먼저 줄인 뒤(거래량 순위) 그 안에서만 정밀 평가합니다.
-    # 한도는 **지역 수**로 나눕니다 — 스크리너는 국내 후보와 미국 후보를 따로
-    # 만들지만, 코스피+코스닥은 한 번의 순위 조회로 함께 옵니다. 세부시장 수로
-    # 나누면 코스피·코스닥을 같이 켠 것만으로 후보가 30 → 18 로 줄어듭니다.
-    pools = max(len(universe_mod.regions_of(markets)), 1)
+    # 팩터 계산은 종목마다 일봉을 받아야 해서 비쌉니다. 그래서 **순환 평가**:
+    # 갱신마다 scan_limit 개만 새로 계산하고, 하루(FACTOR_STALE_TTL) 안에 계산해
+    # 둔 나머지는 캐시 그대로 순위에 함께 올립니다. 몇 회전이면 시장 전체가
+    # 순위 대상이 됩니다 (3,300종목 ÷ 300개 ≈ 11회전 = 30분 주기로 반나절).
+    #   · 미국 — 표(전 종목)를 회전율 순으로 받아, 팩터가 아직 없는 종목부터
+    #     계산 창(window)에 담습니다. 회전율 상위 = 오늘 움직이는 종목 우선.
+    #   · 한국 — KIS 순위 API 는 상위 30행까지만 줍니다. 그래서 **명단은 순위가
+    #     아니라 KRX 상장법인목록**(코스피 845 · 코스닥 1,787, 로컬 캐시)에서
+    #     받고, 순위 30종목은 오늘 시세가 붙은 채로 매번 새로 평가합니다.
+    # scan_limit 은 **시장별** 창 크기입니다 — 국내는 네이버·KIS, 미국은
+    # 나스닥·야후라 서로 다른 제공처를 쓰므로 한도를 나눠 가질 이유가 없습니다.
+    # 갱신 1회는 30개≈30초 → 300개≈2~4분 (백그라운드 스레드라 손절 검사는
+    # 안 멈춥니다 — _tracking_refresh 참고). 국내는 종목당 일봉 + 수급 2회라
+    # 같은 창 크기라도 미국보다 조금 더 걸립니다.
+    scan_limit = int(cfg.get("auto_universe_scan_limit")
+                     or store.DEFAULT_CONFIG["auto_universe_scan_limit"])
+    scan_limit = min(max(scan_limit, 10), 300)   # 한 번에 300 초과는 일봉 제공처가 차단
     scan = screener.scan(
         markets=markets,
         kr_price=(1_000, 2_000_000),          # 일반 추천은 가격대를 넓게
         us_price=(3.0, 2_000.0),
-        limit=30 if pools <= 1 else 18,
-        universe=pool)
+        limit=30,                             # 한국 몫 — KIS 순위 API 의 최대치
+        us_limit=100_000,                     # 미국은 전 종목 (창은 아래서 자릅니다)
+        universe=pool,
+        # 미국만 회전율 순 — 거래대금 순은 매번 같은 대형주가 상위를 채워서,
+        # 계산 창이 늘 그 안에서만 돌았습니다. 회전율(시총 대비 손바뀜)은
+        # 오늘 실제로 움직이는 종목을 앞세웁니다. 한국은 KIS 평균거래량 순 유지.
+        us_rank_basis="turnover")
 
-    if not scan.candidates:
+    us = [c for c in scan.candidates if c.market == "US"]
+    kr = [c for c in scan.candidates if c.market != "US"]
+
+    # 국내 전 종목 순환 — 탐색 범위를 지정하면 하지 않습니다. "코스피200 안에서
+    # 찾겠다"고 해 놓고 뒤에서 시장 전체를 순위에 올리면 범위가 무의미해집니다.
+    kr_segments = [s for s in markets
+                   if universe_mod.SEGMENTS.get(s, {}).get("region") == "KR"]
+    kr_pool: list[str] = []
+    if kr_segments and not pool and cfg.get("auto_universe_full_market", True):
+        seen = {c.key for c in kr}
+        kr_pool = [row["key"] for row in universe_mod.kr_listed(kr_segments)
+                   if row["key"] not in seen]
+
+    if not scan.candidates and not kr_pool:
         store.log_event(
             user_id, "screen",
             "추천할 후보를 받지 못했습니다 — " + (" / ".join(scan.errors) or "원인 불명"),
             level="warn", detail={"errors": scan.errors})
         return []
+    if not scan.candidates:
+        # 명단만으로도 순위는 매길 수 있지만(캐시 + 순환), 오늘 시세가 붙은
+        # 상위 종목이 통째로 빠진 상태입니다. 조용히 넘어가면 안 됩니다.
+        store.log_event(
+            user_id, "screen",
+            "거래량순위를 받지 못해 상장 명단만으로 순위를 냅니다 — "
+            + (" / ".join(scan.errors) or "원인 불명"),
+            level="warn", detail={"errors": scan.errors})
 
-    return recommender.rank(scan.candidates, cfg, account, top_n=size * 3)
+    cached = recommender.cached_factor_keys()
+    missed = recommender.uncomputable_keys()
+
+    def _rotate(items: list, key_of, budget: int) -> tuple[list, list, int]:
+        return rotate_window(items, key_of, budget, cached, missed)
+
+    # 범위를 지정했으면 "시장 전체를 다 봤다"고 말하면 안 됩니다 — 실제로 다 본
+    # 것은 그 범위뿐이고, 사용자는 시장 전체를 훑었다고 오해합니다.
+    scope = "범위" if pool else "시장"
+
+    def _log_rotation(label: str, total: int, fresh: int, have: int, skipped: int):
+        if total <= 0:
+            return
+        remain = max(total - have - fresh - skipped, 0)
+        store.log_event(
+            user_id, "screen",
+            f"순환 평가 — {label} {total:,}종목 중 팩터 보유 {have:,}종목, "
+            f"이번 갱신에서 {fresh}종목 새로 계산"
+            + (f" (전체까지 약 {(remain + scan_limit - 1) // scan_limit}회전 남음)"
+               if remain else f" — {scope} 전체 커버 완료")
+            + (f" · 계산 불가 {skipped:,}종목은 건너뜀" if skipped else ""),
+            detail={"market": label, "total": total, "cached": have,
+                    "fresh": fresh, "skipped": skipped, "remaining": remain})
+
+    # 미국 — 스크리너 표(회전율 순) 그대로 순환
+    us_window, us_extras, us_skipped = _rotate(us, lambda c: c.key, scan_limit)
+    _log_rotation("미국", len(us), len(us_window), len(us_extras), us_skipped)
+
+    # 한국 — 순위 30종목(오늘 시세 포함)은 늘 새로, 나머지 전 종목은 순환.
+    # 명단은 종목코드 문자열입니다. rank() 가 문자열 후보를 받아 상장 마스터로
+    # 해석하고, 가격은 팩터 계산이 받아온 일봉의 마지막 종가를 씁니다 —
+    # 명단에 시세를 붙이려면 종목마다 조회가 한 번씩 더 나갑니다.
+    kr_window, kr_extras, kr_skipped = _rotate(kr_pool, lambda k: k, scan_limit)
+    _log_rotation("한국", len(kr) + len(kr_pool),
+                  len(kr) + len(kr_window), len(kr_extras), kr_skipped)
+
+    return recommender.rank(kr + kr_window + kr_extras + us_window + us_extras,
+                            cfg, account, top_n=size * 3,
+                            stale_keys={c.key for c in us_extras} | set(kr_extras))
 
 
 def refresh_recommended_universe(user_id: int, cfg: dict, account: dict) -> list[str]:
@@ -1153,12 +1322,16 @@ def _reconcile(user_id: int, cfg: dict, positions: list, result: dict,
 # ---------------------------------------------------------------------------
 
 def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
-                 state: dict, result: dict, fast: bool = False):
+                 state: dict, result: dict, fast: bool = False,
+                 allow_add: bool = False):
     """청산 검사 한 종목.
 
     fast=True 는 고속 보호 회전(run_guard)이 쓰는 경로입니다. 지표·ML 을
     계산하지 않고 **신선한 현재가만** 받아 손절·트레일링·시간 청산을 봅니다.
     익절과 신호 반전은 보지 않습니다 (strategy.check_exit 의 protective_only).
+
+    `allow_add` 는 분할 매매의 **추가 매수**를 허용할지입니다. 안전장치가
+    걸린 회전에서는 False 로 들어옵니다 — 그때도 차수 매도는 그대로 봅니다.
     """
     mode = cfg.get("mode", "paper")
     inst = instruments.try_resolve(position.key)
@@ -1240,9 +1413,35 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
             target_price=state.get("target_price") or econ["target_price"],
             stop_price=state.get("stop_price") or econ["stop_price"])
 
+    # 분할로 잡은 포지션은 **전량 익절을 하지 않습니다** — 차수별 매도가
+    # 그 자리를 대신합니다. 지키는 조건(손절·트레일링·만기·시간·신호 반전)은
+    # 그대로 전량으로 나갑니다.
+    ledger = _split_ledger(state)
+    split_on = bool(ledger.tranches) and split_applies(cfg, inst, owner)
+    if split_on:
+        # 분할 포지션의 손절은 **절대가(stop_price) 하나로만** 봅니다.
+        #
+        # 평단 대비 고정 %(stop_loss_pct)를 함께 두면 그쪽이 먼저 걸립니다 —
+        # 기본값 4% 는 차수 간격 5% 보다 좁아서, 2차를 담을 자리에 닿기 전에
+        # 전량 손절이 나갑니다. 실제로 그렇게 동작했고(실측 -6.00% 에서 청산),
+        # 그러면 분할 매수는 영원히 1차에서 끝납니다.
+        #
+        # 절대가는 1차 진입 때 "마지막 차수까지 담고도 더 빠지면"으로 계산해
+        # 박아둔 값입니다. 그 값이 유실됐으면 원장의 계획에서 되살리고,
+        # 그것마저 없으면 **고정 %를 그대로 둡니다** — 손절을 없애는 것보다
+        # 일찍 걸리는 편이 낫습니다.
+        stop = state.get("stop_price") or (ledger.plan or {}).get("stop")
+        if stop:
+            state = {**state, "stop_price": stop}
+            exit_cfg = {**exit_cfg, "stop_loss_pct": 0.0}
+
     decision = strategy.check_exit(inst, position, sig, exit_cfg, state,
-                                   protective_only=fast)
+                                   protective_only=fast,
+                                   defer_take_profit=split_on)
     if not decision.should_exit:
+        if split_on and not fast:
+            _handle_split(user_id, cfg, brk, engine_risk, inst, position, state,
+                          sig, result, allow_add=allow_add, quote=quote)
         return
 
     gate = engine_risk.check_exit(inst, quote, urgent=(decision.urgency == "urgent"))
@@ -1263,13 +1462,26 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
                                 "dry_run": True, "reason": decision.reason})
         return
 
+    _submit_close(user_id, cfg, brk, inst, position, state,
+                  reason=decision.reason, result=result,
+                  detail={"signal": sig.to_dict()})
+
+
+def _submit_close(user_id: int, cfg: dict, brk, inst: Instrument, position,
+                  state: dict, reason: str, result: dict, detail: dict = None):
+    """청산 주문 제출 + 체결 기록. 낸 주문(또는 중복이면 None)을 돌려줍니다.
+
+    일반 청산(_handle_exit)과 회전 매도(_maybe_rotate)가 같이 씁니다 —
+    실현손익 계산·상태 정리·로그 규약이 두 경로에서 갈라지면 안 됩니다.
+    """
+    mode = cfg.get("mode", "paper")
     coid = make_client_order_id(user_id, inst.key, "close", mode=mode)
     if store.order_exists(coid):
-        return
+        return None
 
-    order = brk.close(inst, note=f"자동청산: {decision.reason}", client_order_id=coid)
-    _record(user_id, cfg, inst, order, reason=decision.reason,
-            side=position.side, detail={"signal": sig.to_dict()})
+    order = brk.close(inst, note=f"자동청산: {reason}", client_order_id=coid)
+    _record(user_id, cfg, inst, order, reason=reason,
+            side=position.side, detail=detail)
 
     if order.ok:
         # 청산 시각을 남깁니다 — 같은 종목 재진입 쿨다운의 기준입니다.
@@ -1298,12 +1510,12 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
         result["exits"].append({
             "symbol": inst.key, "name": inst.name, "quantity": order.quantity,
             "price": order.price, "realized_pnl": realized,
-            "reason": decision.reason, "status": order.status,
+            "reason": reason, "status": order.status,
         })
         pnl = f" (실현 {realized:+,.0f}원)" if realized is not None else ""
         store.log_event(user_id, "exit",
                         f"{inst.name} {order.quantity:g}{_unit(inst)} 청산 — "
-                        f"{decision.reason}{pnl}",
+                        f"{reason}{pnl}",
                         level="trade", symbol=inst.key, name=inst.name,
                         detail=order.to_dict())
     else:
@@ -1311,6 +1523,385 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
         store.log_event(user_id, "error", f"{inst.name} 청산 실패: {order.error}",
                         level="error", symbol=inst.key, name=inst.name,
                         detail=order.to_dict())
+    return order
+
+
+# ---------------------------------------------------------------------------
+# 분할 매수·매도 — engine/split.py 가 판단하고, 여기서 실행합니다
+# ---------------------------------------------------------------------------
+
+def split_applies(cfg: dict, inst: Instrument, owner: str = OWNER_AUTO) -> bool:
+    """이 종목에 분할 매매 규칙을 적용하는가.
+
+    초단타는 제외합니다 — 3틱 안에 끝내는 매매에 "5% 내리면 2차"는 의미가
+    없고, 예산 체계도 따로 있습니다.
+    파생상품도 제외합니다 — 승수·증거금 때문에 차수당 금액이 주식과 전혀 다른
+    의미가 되고, 만기가 있어 '내릴 때까지 담는다'는 전제 자체가 성립하지 않습니다.
+    """
+    if owner == OWNER_SCALP or inst.is_derivative:
+        return False
+    return bool(split.params(cfg)["split_enabled"])
+
+
+def _split_ledger(state: dict) -> split.Ledger:
+    return split.load((state or {}).get("splits"))
+
+
+def _save_ledger(user_id: int, mode: str, key: str, ledger: split.Ledger):
+    """원장 + 그 원장에서 유도되는 값(평단·수량)을 함께 저장합니다.
+
+    평단을 같이 쓰는 이유: 손절 판정(check_exit)은 state['entry_price'] 를
+    봅니다. 차수를 담거나 판 뒤에 평단을 갱신하지 않으면, 1차 가격 기준으로
+    손익률을 재게 되어 손절이 엉뚱한 자리에서 걸립니다.
+
+    원장이 비면 **평단·수량은 건드리지 않습니다.** 원장과 실제 보유가 어긋난
+    상태(밖에서 직접 더 산 경우 등)에서 차수를 다 팔면 여기로 오는데, 그때
+    평단을 NULL 로 덮으면 남은 실제 보유분이 진입가를 잃고 손익 계산이
+    통째로 무너집니다. 분할 관리에서만 빠지고 포지션은 그대로 둡니다.
+    """
+    if not ledger.tranches:
+        store.upsert_position_state(user_id, mode, key, splits="")
+        return
+    store.upsert_position_state(
+        user_id, mode, key, splits=ledger.to_json(),
+        entry_price=ledger.avg_price, quantity=ledger.quantity)
+
+
+def _handle_split(user_id: int, cfg: dict, brk, engine_risk, inst: Instrument,
+                  position, state: dict, sig, result: dict, allow_add: bool,
+                  quote: dict = None):
+    """차수별 매도 → 없으면 차수 추가 매수. 한 회전에 최대 하나만 실행합니다.
+
+    매도를 먼저 보는 이유는 엔진 전체의 원칙과 같습니다 — 파는 판단이 사는
+    판단보다 먼저입니다. 같은 회전에서 팔고 또 사면 수수료만 두 번 냅니다.
+
+    `allow_add` 는 안전장치(일일 손실 한도 등)가 걸렸을 때 False 입니다.
+    추가 매수는 신규 진입과 같은 성격이라 그때는 멈춰야 하지만, **차수 매도는
+    막지 않습니다** — 잠금은 사는 것을 막는 장치이지 파는 것을 막는 장치가
+    아닙니다.
+    """
+    mode = cfg.get("mode", "paper")
+    ledger = _split_ledger(state)
+    if not ledger.tranches:
+        return                      # 분할로 잡은 포지션이 아닙니다
+
+    price = sig.price if getattr(sig, "ok", False) else (position.current_price or 0)
+    if not price:
+        return
+    rsi, bb = getattr(sig, "rsi", None), getattr(sig, "bb_pct", None)
+
+    # -- 1) 차수 매도 -----------------------------------------------------
+    sell = split.plan_sell(cfg, inst, ledger, price, rsi=rsi, bb_pct=bb,
+                           held_quantity=position.quantity)
+    if sell.ok and sell.quantity < position.quantity:
+        _submit_split_sell(user_id, cfg, brk, inst, position, state, ledger,
+                           sell, result)
+        return
+    if sell.ok:
+        # 마지막 차수가 목표에 닿았습니다. 이건 부분 매도가 아니라 청산이므로
+        # 전량 청산 경로로 보냅니다 — 실현손익 기록·상태 정리 규약이 그쪽에만
+        # 있습니다. 이 분기가 없으면 마지막 차수는 익절이 영원히 없습니다
+        # (분할 포지션은 전량 목표가를 비워 두기 때문입니다).
+        if cfg.get("dry_run"):
+            store.log_event(user_id, "exit", f"[모의판단] {inst.name} {sell.reason}",
+                            symbol=inst.key, name=inst.name,
+                            detail={"dry_run": True, "split": sell.to_dict()})
+            result["exits"].append({"symbol": inst.key, "name": inst.name,
+                                    "dry_run": True, "quantity": sell.quantity,
+                                    "split_tranche": sell.tranche,
+                                    "reason": sell.reason})
+            return
+        gate = engine_risk.check_exit(inst, quote, urgent=False)
+        if not gate.approved:
+            result["rejects"].append({"symbol": inst.key, "action": "exit",
+                                      "reasons": gate.rejects})
+            return
+        _submit_close(user_id, cfg, brk, inst, position, state,
+                      reason=sell.reason + " (마지막 차수 — 전량 청산)",
+                      result=result, detail={"split": sell.to_dict()})
+        return
+
+    if not allow_add:
+        return
+
+    # -- 2) 차수 추가 매수 ------------------------------------------------
+    buy = split.plan_buy(cfg, inst, ledger, price, rsi=rsi, bb_pct=bb)
+    if not buy.ok:
+        return
+
+    # 리스크 게이트는 신규 진입과 **똑같이** 통과해야 합니다. 추가 매수는
+    # 노출을 늘리는 행위이고, 분할이라는 이유로 한도를 비켜가면 안 됩니다.
+    plan = strategy.EntryPlan(ok=True, quantity=buy.quantity, price=price,
+                              stop_price=float((ledger.plan or {}).get("stop") or 0),
+                              target_price=0.0,
+                              notional_krw=inst.notional(sig.price_krw or price,
+                                                         buy.quantity),
+                              reason=buy.reason)
+    verdict = engine_risk.check_entry(inst, "buy", buy.quantity, sig, plan, None,
+                                      adding=True)
+    if not verdict.approved:
+        result["rejects"].append({"symbol": inst.key, "action": "split_buy",
+                                  "reasons": verdict.rejects})
+        store.log_event(user_id, "reject",
+                        f"{inst.name} {buy.tranche}차 분할 매수 거부 — "
+                        f"{' / '.join(verdict.rejects)}",
+                        level="warn", symbol=inst.key, name=inst.name,
+                        detail={"split": buy.to_dict(), "verdict": verdict.to_dict()})
+        return
+
+    if cfg.get("dry_run"):
+        store.log_event(user_id, "entry",
+                        f"[모의판단] {inst.name} {buy.reason}",
+                        symbol=inst.key, name=inst.name,
+                        detail={"dry_run": True, "split": buy.to_dict()})
+        result["entries"].append({"symbol": inst.key, "name": inst.name,
+                                  "dry_run": True, "quantity": buy.quantity,
+                                  "split_tranche": buy.tranche})
+        return
+
+    coid = make_client_order_id(user_id, inst.key, f"split{buy.tranche}buy", mode=mode)
+    if store.order_exists(coid):
+        return
+    order = brk.submit(inst, "buy", verdict.quantity, order_type="market",
+                       note=f"분할매수: {buy.reason}", client_order_id=coid)
+    _record(user_id, cfg, inst, order, reason=buy.reason, side=position.side,
+            detail={"split": buy.to_dict(), "signal": sig.to_dict(),
+                    "strategy": OWNER_AUTO})
+
+    if not order.ok:
+        note_broker_reject(user_id, inst.key, order.error or "사유 미상")
+        result["errors"].append(f"{inst.name} {buy.tranche}차 분할 매수 실패: {order.error}")
+        store.log_event(user_id, "error",
+                        f"{inst.name} {buy.tranche}차 분할 매수 실패: {order.error}",
+                        level="error", symbol=inst.key, name=inst.name,
+                        detail=order.to_dict())
+        return
+
+    if order.status == "filled":
+        fill_price = order.avg_fill_price or order.price or price
+        filled = order.filled_quantity or order.quantity
+        split.add_tranche(ledger, buy.tranche, filled, fill_price)
+        _save_ledger(user_id, mode, inst.key, ledger)
+    result["entries"].append({
+        "symbol": inst.key, "name": inst.name, "quantity": order.quantity,
+        "price": order.price, "split_tranche": buy.tranche,
+        "status": order.status})
+    store.log_event(
+        user_id, "entry",
+        f"{inst.name} {buy.tranche}차 분할 매수 {order.quantity:g}{_unit(inst)} "
+        f"@ {order.price:,.2f} "
+        f"{'주문 접수 (체결 대기)' if order.status != 'filled' else '체결'} — "
+        f"{buy.reason} · 평단 {ledger.avg_price:,.2f} "
+        f"({ledger.count}/{len((ledger.plan or {}).get('qty') or [])}차)",
+        level="trade", symbol=inst.key, name=inst.name,
+        detail={"order": order.to_dict(), "split": buy.to_dict()})
+
+
+def _submit_split_sell(user_id: int, cfg: dict, brk, inst: Instrument, position,
+                       state: dict, ledger: split.Ledger, decision, result: dict):
+    """차수 하나만 파는 부분 매도."""
+    mode = cfg.get("mode", "paper")
+
+    if cfg.get("dry_run"):
+        store.log_event(user_id, "exit", f"[모의판단] {inst.name} {decision.reason}",
+                        symbol=inst.key, name=inst.name,
+                        detail={"dry_run": True, "split": decision.to_dict()})
+        result["exits"].append({"symbol": inst.key, "name": inst.name,
+                                "dry_run": True, "quantity": decision.quantity,
+                                "split_tranche": decision.tranche,
+                                "reason": decision.reason})
+        return
+
+    coid = make_client_order_id(user_id, inst.key, f"split{decision.tranche}sell",
+                               mode=mode)
+    if store.order_exists(coid):
+        return
+
+    order = brk.close(inst, quantity=decision.quantity,
+                      note=f"분할매도: {decision.reason}", client_order_id=coid)
+    _record(user_id, cfg, inst, order, reason=decision.reason,
+            side=position.side, detail={"split": decision.to_dict()})
+
+    if not order.ok:
+        result["errors"].append(f"{inst.name} {decision.tranche}차 분할 매도 실패: "
+                                f"{order.error}")
+        store.log_event(user_id, "error",
+                        f"{inst.name} {decision.tranche}차 분할 매도 실패: {order.error}",
+                        level="error", symbol=inst.key, name=inst.name,
+                        detail=order.to_dict())
+        return
+
+    realized = None
+    if order.status == "filled":
+        filled = order.filled_quantity or order.quantity
+        entry = float(decision.detail.get("entry") or 0)
+        realized = order.realized_pnl
+        if realized is None:
+            realized = _exit_realized_krw(inst, position.side, entry,
+                                          order.avg_fill_price or order.price, filled)
+        # 원장에서 그 차수를 빼고 평단·수량을 다시 씁니다. 전량이 아니므로
+        # 포지션 상태는 남습니다 (손절선·고점은 그대로 유지됩니다).
+        split.remove_tranche(ledger, decision.tranche, filled)
+        _save_ledger(user_id, mode, inst.key, ledger)
+        if realized is not None:
+            store.record_daily_trade(user_id, mode, float(realized))
+
+    result["exits"].append({
+        "symbol": inst.key, "name": inst.name, "quantity": order.quantity,
+        "price": order.price, "realized_pnl": realized,
+        "split_tranche": decision.tranche, "reason": decision.reason,
+        "status": order.status})
+    pnl = f" (실현 {realized:+,.0f}원)" if realized is not None else ""
+    store.log_event(
+        user_id, "exit",
+        f"{inst.name} {decision.tranche}차 분할 매도 {order.quantity:g}{_unit(inst)} "
+        f"@ {order.price:,.2f} — {decision.reason}{pnl} · "
+        f"남은 차수 {ledger.count}개",
+        level="trade", symbol=inst.key, name=inst.name,
+        detail={"order": order.to_dict(), "split": decision.to_dict()})
+
+
+# ---------------------------------------------------------------------------
+# 회전(갈아타기) — engine/rotation.py 가 판단하고, 여기서 실행합니다
+# ---------------------------------------------------------------------------
+
+# 회전으로 판 종목의 재진입 금지 (메모리 — 재시작하면 풀립니다. 그 사이의
+# 재매수는 protections 쿨다운이 켜져 있으면 그쪽이 한 번 더 막습니다)
+_rotation_exits: dict[tuple, float] = {}
+
+
+def _rotation_block_left(user_id: int, key: str, cfg: dict) -> float:
+    """회전 매도 후 재진입 금지가 몇 초 남았는가. 0 이면 제한 없음.
+
+    이게 없으면 A 를 팔아 B 를 산 다음 회전에 A 의 신호가 여전히 좋아서
+    A 를 다시 사는 왕복(A→B→A)이 생깁니다 — 수수료만 두 번 냅니다.
+    """
+    at = _rotation_exits.get((user_id, str(key)), 0)
+    if not at:
+        return 0.0
+    wait = rotation.params(cfg)["rotation_reentry_min"] * 60
+    return max(0.0, at + wait - time.time())
+
+
+def _rotations_today(user_id: int) -> int:
+    """오늘 실제로 실행한 회전 횟수 (모의판단 dry_run 은 세지 않습니다)."""
+    today = datetime.now().isoformat()[:10]
+    rows = store.get_events(user_id, limit=50, kinds=["rotate"])
+    return sum(1 for r in rows
+               if str(r.get("created_at") or "").startswith(today)
+               and not (r.get("detail") or {}).get("dry_run"))
+
+
+def _maybe_rotate(user_id: int, cfg: dict, brk, engine_risk, inst: Instrument,
+                  sig, plan, result: dict, reject_reasons: list):
+    """재원 부족으로 거부된 새 후보를 위해 보유 종목 하나를 팔지 검토합니다.
+
+    판다면 이번 회전에서는 **매도까지만** 합니다. 새 후보의 매수는 다음
+    회전에서 평소 경로로 다시 시도합니다 — 매도 체결·결제가 확정되기 전에
+    사면 이중지출이고, 다음 회전에 신호가 죽어 있으면 사지 않는 것이
+    맞습니다 (재검증을 공짜로 얻습니다).
+    """
+    if not cfg.get("rotation_enabled"):
+        return
+    if result.get("rotations"):
+        return          # 한 회전(tick)에 회전은 한 번 — 연쇄 매도를 막습니다
+
+    # 재원 부족이 원인일 때만. 다른 거부(장 상태·점수 미달·비중 상한 등)는
+    # 보유 종목을 판다고 해결되지 않습니다. "주문 수량이 0" 만으로는 부족합니다
+    # — 종목 비중 상한이 자른 것이면 팔아도 총자산이 그대로라 여전히 못 삽니다.
+    # 그래서 **어느 한도가 잘랐는지**까지 봅니다 (주문가능금액·총 노출·슬롯만 해당).
+    text = " / ".join(str(r) for r in reject_reasons)
+    capital_bound = any(s in text for s in (
+        "보유 종목 수 상한", "주문가능금액", "총 노출"))
+    if not capital_bound:
+        return
+
+    mode = cfg.get("mode", "paper")
+    states = store.get_position_states(user_id, mode)
+    held_sigs = {s.get("key"): s for s in result.get("signals") or []
+                 if s.get("held")}
+
+    holdings = []
+    for pos in engine_risk.positions:
+        if pos.key == inst.key:
+            continue
+        state = states.get(pos.key) or {}
+        # 자동매매가 잡은 포지션만 — 사용자가 직접 산 주식과 초단타 포지션은
+        # 회전의 재료가 아닙니다 (초단타는 초 단위 규칙이 따로 돕니다)
+        if not is_managed(cfg, pos.key, states):
+            continue
+        if position_owner(cfg, pos.key, state) != OWNER_AUTO:
+            continue
+        if store.has_open_order(user_id, mode, pos.key):
+            continue
+        inst_v = instruments.try_resolve(pos.key)
+        if inst_v is None:
+            continue
+        held_sig = held_sigs.get(pos.key) or {}
+        holdings.append({
+            "inst": inst_v, "key": pos.key, "name": pos.name or inst_v.name,
+            "side": pos.side, "quantity": pos.quantity,
+            "entry_price": state.get("entry_price") or pos.avg_price,
+            # 이번 회전의 청산 검사가 계산한 신선한 값이 우선, 없으면 잔고 스냅샷
+            "price": held_sig.get("price") or pos.current_price,
+            "target_price": state.get("target_price"),
+            "peak_price": state.get("peak_price"),
+            "score": held_sig.get("score", state.get("signal_score")),
+            "ma50": held_sig.get("ma50"),
+            "opened_at": state.get("opened_at"),
+            "position": pos, "state": state,
+        })
+    if not holdings:
+        return
+
+    decision = rotation.evaluate(
+        cfg,
+        {"inst": inst, "key": inst.key, "name": inst.name, "score": sig.score,
+         "direction": 1 if sig.direction == strategy.LONG else -1,
+         "price": sig.price, "target_price": plan.target_price},
+        holdings, _exit_realized_krw, _rotations_today(user_id))
+
+    if not decision.ok:
+        # 매 회전 반복되는 사유라 30분에 한 번만 남깁니다 (_log_plan_reject 와 동일)
+        if decision.rejects:
+            _log_plan_reject(user_id, f"rotate:{inst.key}", inst.name,
+                             "회전 보류 — " + decision.rejects[-1],
+                             detail=decision.to_dict())
+        return
+
+    victim = decision.victim
+    if cfg.get("dry_run"):
+        store.log_event(user_id, "rotate", f"[모의판단] {decision.reason}",
+                        level="info", symbol=inst.key, name=inst.name,
+                        detail={**decision.detail, "dry_run": True})
+        result.setdefault("rotations", []).append(
+            {"victim": victim["key"], "for": inst.key, "dry_run": True,
+             "reason": decision.reason})
+        return
+
+    # 청산이 나갈 수 있는 상태인지 (장 상태·시세) — 회전은 긴급이 아닙니다
+    quote = feed.quote(victim["inst"])
+    gate = engine_risk.check_exit(victim["inst"], quote, urgent=False)
+    if not gate.approved:
+        _log_plan_reject(user_id, f"rotate:{inst.key}", inst.name,
+                         "회전 보류 — " + " / ".join(gate.rejects),
+                         detail=decision.to_dict())
+        return
+
+    order = _submit_close(user_id, cfg, brk, victim["inst"], victim["position"],
+                          victim["state"], reason=decision.reason, result=result,
+                          detail={"rotation": decision.detail})
+    if order is None or not order.ok:
+        return
+
+    _rotation_exits[(user_id, victim["key"])] = time.time()
+    result.setdefault("rotations", []).append(
+        {"victim": victim["key"], "for": inst.key, "reason": decision.reason,
+         "status": order.status})
+    store.log_event(
+        user_id, "rotate",
+        decision.reason + " — 매도부터 하고, 신규 진입은 다음 회전에서 다시 검증합니다",
+        level="trade", symbol=inst.key, name=inst.name, detail=decision.detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +1973,14 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
                              note=f"증권사 거부 후 대기 ({why})")
         return
 
+    # 회전으로 판 종목은 당분간 다시 사지 않습니다 (A→B→A 왕복 방지)
+    left = _rotation_block_left(user_id, inst.key, cfg)
+    if left > 0:
+        result["rejects"].append({"symbol": inst.key, "action": "entry",
+                                  "reasons": [f"회전 매도 후 재진입 대기 "
+                                              f"({left / 60:.0f}분 남음)"]})
+        return
+
     quote = feed.quote(inst)
 
     # 초단타 목록에서 온 종목만 틱 기반 경로를 탑니다
@@ -1429,7 +2028,51 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
                                   "reasons": [plan.reason]})
         _log_plan_reject(user_id, inst.key, inst.name, plan.reason,
                          detail={"signal": sig.to_dict(), "plan": plan.to_dict()})
+        # 현금이 없어 못 산 것이라면 — 보유 종목을 팔아 재원을 만들지 검토
+        # (초단타는 예산이 따로 있어 회전 대상이 아닙니다)
+        if not scalp:
+            _maybe_rotate(user_id, cfg, brk, engine_risk, inst, sig, plan,
+                          result, [plan.reason])
         return
+
+    # -- 분할 매수 1차 -----------------------------------------------------
+    # 전체 수량을 차수로 쪼개고, 손절선을 **마지막 차수까지 담을 수 있는 선**
+    # 으로 다시 잡습니다. 이걸 안 하면 기본 손절(-4%)이 차수 간격(-5%)보다
+    # 좁아서 2차를 살 기회가 영원히 오지 않습니다.
+    # 숏은 대상이 아닙니다 — '내리면 더 담는다'가 성립하지 않습니다.
+    split_plan = None
+    if (not scalp and sig.direction == strategy.LONG
+            and split_applies(cfg, inst, owner)):
+        # 이미 차수 원장이 있는 종목이면 1차를 다시 잡지 않습니다. 추가 매수는
+        # 계획대로 분할 엔진(_handle_split)이 합니다 — 여기서 또 1차를 만들면
+        # 원장이 통째로 새 계획으로 덮여, 담아둔 차수 기록이 사라집니다.
+        # (추가 진입 허용(allow_pyramiding)을 함께 켠 계정에서만 닿는 길입니다)
+        if inst.key in held and _split_ledger(
+                store.get_position_states(user_id, mode).get(inst.key, {})).tranches:
+            return
+        sp = split.params(cfg)
+        split_plan = split.plan_for(sp, sig.price, plan.quantity,
+                                    inst.round_quantity)
+        first_qty = float(split_plan["qty"][0])
+        if first_qty < plan.quantity:
+            # 1차 수량이 전체보다 클 수는 없습니다(차수 최소 1주 보정 때문에
+            # 같아질 수는 있습니다). 큰 경우엔 계획을 믿지 않고 원래대로 둡니다.
+            plan.quantity = first_qty
+            plan.notional_krw = inst.notional(sig.price_krw, first_qty)
+            plan.margin_krw = inst.margin_required(sig.price_krw, first_qty, "buy")
+            plan.risk_krw = abs(sig.price - split_plan["stop"]) * first_qty
+        plan.stop_price = split_plan["stop"]
+        plan.target_price = 0.0          # 익절은 차수별 분할 매도가 합니다
+        plan.sizing["split"] = {
+            "tranches": sp["split_tranches"], "qty": split_plan["qty"],
+            "drop_pct": split_plan["drop"], "gain_pct": split_plan["gain"],
+            "last_price": round(split_plan["last_price"], 4),
+            "stop": round(split_plan["stop"], 4),
+            "drawdown_pct": round(split.total_drawdown_pct(sp, sig.price), 2),
+        }
+        plan.reason = (f"1/{sp['split_tranches']}차 분할 매수 — " + plan.reason
+                       + f" · 마지막 차수까지 담으면 1차가 대비 "
+                         f"-{split.total_drawdown_pct(sp, sig.price):.1f}% 에서 전량 손절")
 
     side = "buy" if sig.direction == strategy.LONG else "sell"
     verdict = engine_risk.check_entry(inst, side, plan.quantity, sig, plan, quote)
@@ -1460,6 +2103,10 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
                         symbol=inst.key, name=inst.name,
                         detail={"signal": sig.to_dict(), "plan": plan.to_dict(),
                                 "verdict": verdict.to_dict()})
+        # 슬롯·현금·노출 한도가 원인이라면 — 회전으로 자리를 만들지 검토
+        if not scalp:
+            _maybe_rotate(user_id, cfg, brk, engine_risk, inst, sig, plan,
+                          result, list(verdict.rejects))
         return
 
     if cfg.get("dry_run"):
@@ -1503,13 +2150,25 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
         # 체결가를 모르므로, 정산 패스가 실제 체결가로 잡습니다.
         if order.status == "filled":
             entry_price = order.avg_fill_price or order.price or sig.price
+            filled_qty = order.filled_quantity or order.quantity
+            stop_price, ledger_json = plan.stop_price, None
+            if split_plan is not None:
+                # 계획을 **실제 체결가**로 다시 세웁니다. 슬리피지가 있으면
+                # 차수 트리거와 손절선이 계획서와 어긋나는데, 원장에 남는 값이
+                # 실제와 다르면 나중에 왜 그 자리에서 샀는지 설명할 수 없습니다.
+                sp = split.params(cfg)
+                ledger = split.bootstrap(sp, entry_price, filled_qty,
+                                         sum(split_plan["qty"]),
+                                         inst.round_quantity)
+                stop_price = ledger.plan["stop"]
+                ledger_json = ledger.to_json()
             store.upsert_position_state(
                 user_id, mode, inst.key, side=sig.direction,
                 entry_price=entry_price,
-                stop_price=plan.stop_price, target_price=plan.target_price,
-                peak_price=entry_price, quantity=order.filled_quantity or order.quantity,
+                stop_price=stop_price, target_price=plan.target_price,
+                peak_price=entry_price, quantity=filled_qty,
                 signal_score=sig.score, opened_at=datetime.now().isoformat(),
-                note=reason, strategy=owner)
+                note=reason, strategy=owner, splits=ledger_json)
             held.add(inst.key)
 
         result["entries"].append({
@@ -1574,8 +2233,7 @@ def _scalp_enabled(cfg: dict) -> bool:
 # 섞이면 사고가 납니다. 초단타 스크리너가 콘솔의 매매 대상을 밀어내고, 일반
 # 종목이 3틱에 던져지고, 초단타가 산 동전주를 일반 전략이 며칠 들고 있습니다.
 # 그래서 대상 목록도, 포지션의 주인도 따로 둡니다.
-
-OWNER_AUTO, OWNER_SCALP = "auto", "scalp"
+# (주인 값 OWNER_AUTO / OWNER_SCALP 는 임포트 순서 때문에 모듈 맨 위에 있습니다.)
 
 
 def scalp_universe(cfg: dict) -> list[str]:

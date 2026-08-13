@@ -356,6 +356,62 @@ def kr_market_of(code: str, default: str = "KOSPI") -> str:
     return market if market in ("KOSPI", "KOSDAQ") else default
 
 
+# 순환 평가의 모집단 — 코스피·코스닥 **전 종목**.
+# 마스터가 통째로 깨진 채(빈 목록·몇 건) 돌아오면, 화면은 "시장 전체를 훑는다"고
+# 말하는데 실제로는 몇 종목만 보게 됩니다. 최소 건수를 두고 그보다 적으면 빈
+# 목록을 돌려주어, 호출부가 예전 경로(순위 API 상위 30)로만 돌게 합니다.
+KR_MASTER_MIN = 1_000
+
+
+def kr_listed(segments: list[str] = None, skip_spac: bool = True) -> list[dict]:
+    """코스피·코스닥 상장 **전 종목** 명단 (KRX 상장법인목록, 로컬 캐시 3일).
+
+    거래량순위 API 는 상위 30행까지만 줍니다. "지금 거래가 터지는 종목"을 찾는
+    데는 그걸로 충분하지만, **시장 전체를 순환하며 팩터를 계산하려면** 순위와
+    무관한 전체 명단이 필요합니다. 그 명단이 여기 있습니다 — 이미 시장 판정
+    (`kr_market_of`)에 쓰고 있던 마스터라 추가 네트워크 호출이 없습니다.
+
+    시세는 들어 있지 않습니다(명단일 뿐입니다). 팩터 계산이 어차피 일봉을
+    받으므로, 여기서 종목마다 시세를 붙이면 수천 번의 중복 호출이 됩니다.
+
+    제외되는 것
+        ETF·ETN  상장법인목록은 '회사'만 수록해 애초에 없습니다.
+        코넥스    세부시장(SEGMENTS)에 없어 선택 자체가 불가능합니다.
+        스팩      합병 발표 전까지 공모가 근처에서 거의 움직이지 않습니다.
+                  모멘텀·추세·상대강도가 전부 무의미한 종목에 계산 창을
+                  내주면, 그만큼 실제로 움직이는 종목이 늦게 평가됩니다.
+    """
+    chosen = set(normalize_segments(segments) if segments else ["KOSPI", "KOSDAQ"])
+    chosen &= {"KOSPI", "KOSDAQ"}
+    if not chosen:
+        return []
+
+    try:
+        from data_sources import symbol_registry
+        entries = symbol_registry.get_krx_master().get("entries") or []
+    except Exception:
+        return []
+    if len(entries) < KR_MASTER_MIN:
+        return []
+
+    # KIND 응답에는 같은 행이 두 번 오는 경우가 있습니다 (2026-08 실측 42건).
+    # 마스터의 by_code 는 dict 라 이 사실이 가려져 있지만, 명단을 그대로 돌리면
+    # 그 종목이 계산 창을 두 칸 먹고 추천 목록에도 두 번 오릅니다.
+    out, seen = [], set()
+    for entry in entries:
+        code = entry.get("code") or ""
+        market = entry.get("market")
+        if market not in chosen or code in seen:
+            continue
+        name = entry.get("name") or ""
+        if skip_spac and ("스팩" in name or "기업인수목적" in name):
+            continue
+        seen.add(code)
+        out.append({"key": code, "name": name, "market": market,
+                    "segment": market, "sector": entry.get("sector") or ""})
+    return out
+
+
 def etf_components(etf_code: str) -> MemberSet:
     """국내 ETF 한 종목의 구성종목 + 시세 (KIS 공식 API, 1회 호출).
 
@@ -555,13 +611,18 @@ def us_members(universe: Universe = None, exchange: str = "") -> MemberSet:
         if price <= 0:
             continue
         volume = _money(row.get("volume"))
+        cap = _money(row.get("marketCap"))
         result.members.append(Member(
             key=symbol, name=row.get("name") or symbol,
             market="US", segment=segment,
             sector=row.get("sector") or "",
             price=price, change_rate=_num(str(row.get("pctchange") or "").rstrip("%")),
             volume=volume, trading_value=price * volume,
-            market_cap=_money(row.get("marketCap")),
+            market_cap=cap,
+            # 상장주식수 = 시총 ÷ 현재가 (국내 ETF 경로와 같은 역산).
+            # 이게 있어야 회전율(거래량 ÷ 상장주식수)이 전 종목에 공짜로 생기고,
+            # 후보 순위를 거래대금(= 늘 같은 대형주) 말고 회전율로 매길 수 있습니다.
+            listed_shares=(cap / price) if cap > 0 else None,
         ))
 
     if not result.members:

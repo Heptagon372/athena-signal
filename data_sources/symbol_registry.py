@@ -386,7 +386,22 @@ def resolve(query: str) -> ResolvedSymbol:
                    + ("  혹시 아래 종목을 찾으셨나요?" if candidates else ""),
         )
 
-    # --- 3) 영문/숫자 조합 -> 미국 티커 ---
+    # --- 3) 영문 상장명의 한국 종목인가 (HMM · NAVER · S-Oil …) ---
+    # 한글이 없다고 전부 미국 티커는 아닙니다. 상장명이 통째로 영문인 한국
+    # 종목이 꽤 있어서, 미국으로 넘기기 전에 KRX 상장명과 정확히 일치하는지
+    # 먼저 봅니다. 같은 글자가 미국 티커와 겹치면(GS·DB 등) 한국 종목이
+    # 이깁니다 — 이 콘솔의 입력은 국내 종목이 먼저입니다. 미국 쪽을 원하면
+    # 'US:GS' 처럼 앞에 US: 를 붙여 강제할 수 있습니다.
+    us_forced = raw.upper().startswith("US:")
+    if us_forced:
+        raw = raw[3:].strip()
+    else:
+        entry = master["by_name"].get(_normalize(raw))
+        if entry:
+            return _build_korean(entry["code"], entry["name"], entry["market"],
+                                 "KRX 상장법인목록")
+
+    # --- 4) 영문/숫자 조합 -> 미국 티커 ---
     ticker = raw.upper()
     if not re.fullmatch(r"[A-Z0-9.\-]{1,12}", ticker):
         raise SymbolNotFoundError(

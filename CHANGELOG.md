@@ -1,5 +1,16 @@
 ﻿# 변경 이력
 
+## v2.2.2 - 2026-08-14 08:04
+
+수정 18 · 추가 7
+- .claude: .claude/ 추가
+- data_sources: screener.py, symbol_registry.py, universe.py 수정
+- engine: autotrade.py, broker.py 외 4개 수정 · rotation.py, split.py 추가
+- storage: autotrade.py, trial_registry.json 수정
+- tests: test_autotrade.py, test_qa.py, test_universe.py 수정 · test_rotation.py, test_split.py 추가
+- web: at_ai.html, at_common.js, autotrade.html 수정
+- 루트: api.py 수정 · athena.db.bak-20260811, athena.db.bak-20260811-083804 추가
+
 ## v2.2.0 - 2026-08-10 01:14
 
 수정 34 · 추가 13 · 삭제 10
@@ -12,4 +23,5 @@
 - web: at_ai.html, at_common.js 외 2개 수정
 - 루트: api.py, requirements.txt 외 2개 수정 · VERSION, athena.py 외 2개 추가 · build_exe.bat, setup_api.bat 외 8개 삭제
 - 문서: ACCOUNTS.md, AUTOTRADE.md, README.md 수정
+
 

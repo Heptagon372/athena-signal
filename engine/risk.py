@@ -99,7 +99,17 @@ class RiskEngine:
 
     # -- 진입 검증 --------------------------------------------------------
     def check_entry(self, inst: Instrument, side: str, quantity: float,
-                    sig, plan, quote: dict) -> RiskVerdict:
+                    sig, plan, quote: dict, adding: bool = False) -> RiskVerdict:
+        """`adding=True` 는 **계획된 추가 매수**입니다 (분할 매매의 다음 차수).
+
+        추가 매수 금지(allow_pyramiding)만 면제하고, 나머지 한도는 전부 그대로
+        받습니다 — 비중·현금·노출·자산군·장 상태. 분할이라는 이유로 한도를
+        비켜가면 "차수를 나눴을 뿐인데 계좌 전체가 한 종목이 되는" 일이 생깁니다.
+
+        면제하는 이유: 그 금지는 '신호가 또 떴다고 같은 종목을 덧사는 것'을
+        막는 장치입니다. 분할은 살 양을 미리 정해 두고 나눠서 넣는 것이라
+        성격이 반대입니다 — 오히려 한 번에 다 사지 않으려고 나눈 것입니다.
+        """
         verdict = RiskVerdict(quantity=quantity, original_quantity=quantity)
         cfg = self.cfg
 
@@ -153,7 +163,7 @@ class RiskEngine:
             return verdict
 
         # 6) 같은 종목 추가 매수 (기본 금지 — 물타기는 손실을 키웁니다)
-        if inst.key in holding_keys and not cfg.get("allow_pyramiding"):
+        if inst.key in holding_keys and not adding and not cfg.get("allow_pyramiding"):
             verdict.rejects.append("이미 보유 중인 종목입니다 (추가 진입 꺼짐).")
             return verdict
 

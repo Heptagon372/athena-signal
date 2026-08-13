@@ -109,6 +109,20 @@ DEFAULT_CONFIG = {
     "auto_universe": False,
     "auto_universe_size": 5,
     "auto_universe_refresh_min": 30,
+    # 순환 평가 — 갱신 1회에 팩터를 **새로** 계산할 종목 수 (10~300).
+    # 한국·미국 **각각**의 창 크기입니다(서로 다른 제공처를 쓰므로 한도를 나눠
+    # 가질 이유가 없습니다). 전 종목을 돌며 이만큼씩 계산하고, 하루 안에 계산해
+    # 둔 종목은 캐시로 순위에 함께 올립니다 → 몇 회전이면 시장 전체가 순위
+    # 대상이 됩니다. 클수록 한 바퀴가 빨리 돌지만 갱신 1회가 길어집니다
+    # (100개≈1~2분, 백그라운드라 매매는 계속).
+    #   한 바퀴 = 종목수 ÷ 이 값 × 갱신주기.
+    #   국내 2,600종목이면 100개·30분에 13시간, 300개·10분에 1.5시간입니다.
+    "auto_universe_scan_limit": 100,
+    # 코스피·코스닥 **전 종목**(KRX 상장법인목록)을 순환 평가할지.
+    # 끄면 예전처럼 KIS 거래량순위 상위 30종목만 봅니다 — 호출은 훨씬 적지만,
+    # 순위 밖에서 조용히 추세를 만드는 종목은 영원히 후보가 되지 못합니다.
+    # 탐색 범위(auto_universe_pool)를 지정하면 이 설정과 무관하게 그 범위만 봅니다.
+    "auto_universe_full_market": True,
     # 훑을 시장 — 코스피 / 코스닥 / 나스닥. 예전 값 "KR" · "US" 도 그대로
     # 동작합니다 (data_sources/universe.py 의 normalize_segments 가 풀어줍니다).
     "auto_universe_markets": ["KOSPI", "KOSDAQ"],
@@ -145,6 +159,43 @@ DEFAULT_CONFIG = {
     # 손절·트레일링·시간 청산은 그대로 작동합니다. 기본 꺼짐 — 익절 방식을
     # 바꾸는 스위치라 사람이 켜는 것이 맞습니다.
     "hold_winners": False,
+
+    # 회전(갈아타기) — 더 좋은 신호가 떴는데 현금·슬롯이 없을 때, 수수료·거래세를
+    # 전부 빼고도 순이익인 보유 종목을 목표가 전에 팔아 재원을 만듭니다.
+    # 계산법·게이트는 engine/rotation.py 에 있습니다. 기본 꺼짐 — 익절 방식을
+    # 바꾸는 스위치라 사람이 켜는 것이 맞습니다 (hold_winners 와 같은 이유).
+    "rotation_enabled": False,
+    "rotation_cost_edge_multiple": 5.0,  # 새 목표수익 ≥ 왕복비용 × 이 배수
+    "rotation_min_gap_pct": 1.0,         # (새 기대 − 남은 기대) 최소 여유 %p
+    "rotation_score_margin": 0.15,       # 새 점수가 보유 점수보다 높아야 하는 폭
+    "rotation_min_hold_min": 30,         # 산 지 이 시간 안 된 포지션은 안 팝니다
+    "rotation_max_per_day": 2,           # 하루 회전 상한
+    "rotation_reentry_min": 240,         # 회전으로 판 종목의 재진입 금지(분)
+
+    # 분할 매수·분할 매도 (engine/split.py — 매직스플릿 계열 차수별 독립 관리).
+    # 한 종목을 차수로 나눠 사고, 각 차수를 그 차수 매수가 기준으로 따로 팝니다.
+    # 기본 꺼짐 — 켜면 손절 방식까지 바뀝니다(차수를 다 담을 때까지 버티는 선으로
+    # 손절가가 내려갑니다). 종목당 감당하는 손실 폭이 커지므로 position_pct 를
+    # 함께 낮추세요. 자세한 계산은 engine/split.py 머리말에 있습니다.
+    "split_enabled": False,
+    "split_tranches": 5,                 # 최대 차수 (1차 포함, 2~10)
+    "split_buy_drop_pct": 5.0,           # 직전 차수 체결가 대비 이만큼 내리면 다음 차수
+    "split_buy_drop_steps": [],          # 차수별 하락률 직접 지정 (예: [10, 20, 30])
+    "split_sell_gain_pct": 5.0,          # 그 차수 매수가 대비 이만큼 오르면 그 차수만 매도
+    "split_sell_gain_steps": [],         # 차수별 익절률 직접 지정
+    "split_size_mode": "equal",          # equal(균등) | pyramid(뒤 차수를 크게)
+    "split_pyramid_ratio": 1.5,
+    "split_require_oversold": True,      # 추가 매수에 과매도 지표도 요구 (하락률 AND 지표)
+    "split_oversold_rsi": 35.0,
+    "split_oversold_bb": 0.15,
+    "split_overbought_sell": True,       # 과매수면 목표 미달이어도 수익 차수 정리
+    "split_overbought_rsi": 70.0,
+    "split_overbought_bb": 0.90,
+    "split_overbought_min_gain": 1.0,
+    "split_cost_multiple": 2.0,          # 차수 수익 ≥ 왕복비용 × 이 배수
+    "split_min_gap_min": 30,             # 차수 간 최소 시간 간격(분)
+    "split_max_adds_per_day": 3,
+    "split_final_stop_pct": 7.0,         # 마지막 차수 예정가에서 이만큼 더 빠지면 전량 손절
 
     # 주문 집행
     "order_timeout_sec": 180,         # 이 시간 안에 안 체결되면 주문을 취소합니다
@@ -221,6 +272,7 @@ def init():
             updated_at TEXT,
             note TEXT,
             strategy TEXT,                        -- auto | scalp (누가 잡은 포지션인가)
+            splits TEXT,                          -- 분할 차수 원장 (JSON, engine/split.py)
             PRIMARY KEY (user_id, mode, symbol)
         )""")
         conn.execute("""
@@ -298,6 +350,14 @@ def init():
             realized_pnl REAL NOT NULL DEFAULT 0,
             trade_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, mode, trade_date)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS at_account (
+            user_id INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,    -- 계좌 지문(해시). 계좌번호 원본은 담지 않습니다
+            reset_at TEXT NOT NULL,       -- 이 계좌로 성적을 세기 시작한 시각
+            PRIMARY KEY (user_id, mode)
         )""")
         _migrate_scope(conn)
         # 모드 분리로 테이블을 새로 만드는 경우가 있어서, 컬럼 추가는 그 뒤입니다
@@ -406,6 +466,11 @@ def _migrate_position_state(conn):
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(at_position_state)")}
     if "strategy" not in existing:
         conn.execute("ALTER TABLE at_position_state ADD COLUMN strategy TEXT")
+    # 분할 차수 원장 (engine/split.py). 값이 없으면 '분할로 잡은 포지션이 아님'
+    # 이라는 뜻이고, 그런 포지션은 예전과 똑같이 전량으로만 매매됩니다 —
+    # 분할을 켜기 전에 잡아둔 포지션이 갑자기 차수 매매로 넘어가면 안 됩니다.
+    if "splits" not in existing:
+        conn.execute("ALTER TABLE at_position_state ADD COLUMN splits TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +617,8 @@ def upsert_position_state(user_id: int, mode: str, symbol: str, **fields):
     init()
     now = datetime.now().isoformat()
     allowed = ("side", "entry_price", "stop_price", "target_price", "peak_price",
-               "quantity", "signal_score", "opened_at", "note", "strategy")
+               "quantity", "signal_score", "opened_at", "note", "strategy",
+               "splits")
     data = {k: v for k, v in fields.items() if k in allowed}
     with _conn() as conn:
         row = conn.execute(
@@ -1057,15 +1123,123 @@ def get_daily_history(user_id: int, limit: int = 30, mode: str = None) -> list[d
             sql + " ORDER BY trade_date DESC LIMIT ?", params)]
 
 
+# ---------------------------------------------------------------------------
+# 계좌 교체 — 성적 초기화
+# ---------------------------------------------------------------------------
+# 계좌번호를 바꾸면 화면의 '오늘 손익 · 누적 손익'은 **남의 계좌 성적**입니다.
+# 그대로 두면 새 계좌의 첫 매매가 이미 -6,646원에서 시작한 것처럼 보이고,
+# 더 나쁘게는 일일 손실 한도가 그 남은 손실 때문에 곧바로 걸려 매매가 멈춥니다.
+# 그래서 계좌가 바뀐 것을 발견하면 그 자리에서 0원으로 되돌립니다.
+
+def get_account_epoch(user_id: int, mode: str) -> dict | None:
+    """이 계좌를 언제부터 세고 있는지. 기록이 없으면 None."""
+    init()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM at_account WHERE user_id = ? AND mode = ?",
+            (user_id, mode)).fetchone()
+    return dict(row) if row else None
+
+
+def reset_pnl(user_id: int, mode: str, fingerprint: str = None,
+              reason: str = "") -> dict:
+    """이 계좌의 오늘 손익 · 누적 손익을 0원으로 되돌립니다.
+
+    **무엇을 지우고, 무엇을 남기는가**
+        지웁니다   at_daily 의 해당 계좌 줄 전부. 누적 손익은 이 줄들의 합이라
+                   (summary 참고) 지우면 0이 되고, 오늘 줄이 사라졌으므로 다음
+                   회전에서 지금의 평가손익을 기준선으로 새로 잡습니다 —
+                   즉 오늘 손익도 그 시점부터 0에서 시작합니다.
+        남깁니다   at_orders(주문 원장)와 at_events(기록). 실제로 나갔던 주문을
+                   지우면 무슨 일이 있었는지 확인할 길이 없어집니다. 대신
+                   at_account.reset_at 을 남겨서, 주문 수·승률·실현손익 집계가
+                   이 시각 **이후**만 세도록 합니다 (summary 의 since 조건).
+
+    reset_at 을 남기는 이유가 하나 더 있습니다: 누적은 0인데 '└ 실현'만 옛
+    계좌의 숫자가 남아 있으면, 화면 두 줄이 서로 다른 계좌를 가리키게 됩니다.
+    """
+    init()
+    now = datetime.now().isoformat()
+    with _conn() as conn:
+        if fingerprint is None:
+            row = conn.execute(
+                "SELECT fingerprint FROM at_account WHERE user_id = ? AND mode = ?",
+                (user_id, mode)).fetchone()
+            fingerprint = row["fingerprint"] if row else ""
+        cleared = conn.execute(
+            "DELETE FROM at_daily WHERE user_id = ? AND mode = ?",
+            (user_id, mode)).rowcount
+        conn.execute(
+            "INSERT OR REPLACE INTO at_account (user_id, mode, fingerprint, reset_at) "
+            "VALUES (?, ?, ?, ?)", (user_id, mode, fingerprint or "", now))
+
+    log_event(user_id, "reset",
+              f"[{mode}] 오늘 손익·누적 손익을 0원으로 되돌렸습니다"
+              + (f" — {reason}" if reason else ""),
+              level="warn", detail={"mode": mode, "days_cleared": cleared})
+    return {"user_id": user_id, "mode": mode, "reset_at": now,
+            "days_cleared": cleared}
+
+
+def sync_account(user_id: int, mode: str, fingerprint: str) -> bool:
+    """계좌가 바뀌었으면 성적을 0으로 되돌립니다. 되돌렸을 때만 True.
+
+    매 회전 · 매 화면 갱신마다 불립니다. 값싸야 하고(조회 한 번), 무엇보다
+    **틀린 쪽으로 기울면 안 됩니다.** 그래서 두 경우는 아무것도 하지 않습니다.
+
+        지문이 빈 값        계좌 미설정이거나 키를 잠깐 못 읽은 상태입니다.
+                            "계좌가 바뀌었다"가 아니라 "모른다" 입니다. 여기서
+                            지우면 Mongo 가 1분 끊긴 것만으로 성적이 날아갑니다.
+        처음 보는 계좌       지금까지의 기록이 바로 이 계좌 것입니다 (이 기능이
+                            없던 때부터 쓰던 계좌). 기준만 적어 두고 지나갑니다.
+        적힌 지문이 빈 값    손으로 초기화했는데(reset_pnl) 그때 계좌번호를 몰라
+                            비워 둔 경우입니다. 역시 "모른다" 이므로, 지금 지문을
+                            적어만 두고 넘어갑니다 — 여기서 또 지우면 방금 한
+                            초기화가 다음 회전에 한 번 더 일어납니다.
+    """
+    if not fingerprint:
+        return False
+    init()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT fingerprint, reset_at FROM at_account "
+            "WHERE user_id = ? AND mode = ?", (user_id, mode)).fetchone()
+        if row is None or not row["fingerprint"]:
+            # 처음 보는 계좌라면 reset_at 은 빈 값으로 둡니다 — summary 가 예전
+            # 주문까지 그대로 셉니다. 손으로 초기화한 뒤라면 그때 찍힌
+            # reset_at 을 그대로 지킵니다.
+            conn.execute(
+                "INSERT OR REPLACE INTO at_account "
+                "(user_id, mode, fingerprint, reset_at) VALUES (?, ?, ?, ?)",
+                (user_id, mode, fingerprint,
+                 (row["reset_at"] if row else "") or ""))
+            return False
+        if row["fingerprint"] == fingerprint:
+            return False
+
+    reset_pnl(user_id, mode, fingerprint=fingerprint, reason="계좌가 바뀌었습니다")
+    return True
+
+
 def summary(user_id: int, mode: str = None) -> dict:
     """콘솔 상단에 띄울 요약 통계 (계좌별).
 
     가상 자금 성적과 실제 자금 성적을 한 숫자로 섞으면 아무 의미가 없습니다.
+    계좌를 바꾼 뒤라면 **바꾼 시각 이후**만 셉니다 (reset_pnl 참고).
     """
     init()
     scope = " AND broker_mode = ?" if mode else ""
     args = (user_id, mode) if mode else (user_id,)
     with _conn() as conn:
+        since = ""
+        if mode:
+            epoch = conn.execute(
+                "SELECT reset_at FROM at_account WHERE user_id = ? AND mode = ?",
+                (user_id, mode)).fetchone()
+            since = (epoch["reset_at"] if epoch else "") or ""
+        if since:
+            scope += " AND created_at >= ?"
+            args = args + (since,)
         orders = conn.execute(
             "SELECT COUNT(*) c, SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) r "
             f"FROM at_orders WHERE user_id = ?{scope}", args).fetchone()
@@ -1077,10 +1251,13 @@ def summary(user_id: int, mode: str = None) -> dict:
         # 누적 손익 — 날짜별로 확정해 둔 '오늘 손익'을 전부 더합니다.
         # 실현손익(판 것)만 세면, 사서 오르는 중인 종목의 성과가 통째로 빠져
         # 오늘 하루 매매를 시작한 계좌는 영원히 0원으로 보입니다.
+        # at_daily 는 계좌를 바꿀 때 통째로 지우므로(reset_pnl) 시각 조건이
+        # 필요 없습니다 — 남아 있는 줄은 전부 지금 계좌의 것입니다.
         day_scope = " AND mode = ?" if mode else ""
+        day_args = (user_id, mode) if mode else (user_id,)
         cumulative = conn.execute(
             f"SELECT SUM(day_pnl) t FROM at_daily WHERE user_id = ?{day_scope}",
-            args).fetchone()
+            day_args).fetchone()
 
     closed = int(pnl["n"] or 0)
     wins = int(pnl["wins"] or 0)

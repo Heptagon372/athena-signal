@@ -16,6 +16,8 @@
       <button id="btnTrack" class="primary">추적 시작</button>
       <button id="btnRecommend">지금 추천 받기</button>
       <div style="flex:1"></div>
+      <div class="field" style="margin:0;width:110px"><label>회전당 계산 수</label>
+        <input id="cfg_auto_universe_scan_limit" type="number" step="10" title="갱신 1회에 팩터를 새로 계산할 종목 수 (10~300) — 한국·미국 각각. 전 종목을 순환하며 이만큼씩 계산하고, 하루 안에 계산해 둔 종목은 캐시로 순위에 함께 올립니다. 한 바퀴 = 종목수 ÷ 이 값 × 갱신주기 (국내 2,600종목이면 100개·30분에 13시간, 300개·10분에 1.5시간)"></div>
       <div class="field" style="margin:0;width:110px"><label>추적 종목 수</label>
         <input id="cfg_auto_universe_size" type="number" step="1"></div>
       <div class="field" style="margin:0;width:110px"><label>갱신 주기(분)</label>
@@ -28,6 +30,8 @@
       <span class="muted" style="font-size:12px">추적 시장</span>
       <span id="segBox" class="row" style="gap:10px;margin:0"></span>
       <span style="flex:1"></span>
+      <label class="chk" style="margin:0" title="코스피·코스닥 상장 전 종목(KRX 상장법인목록)을 순환 평가합니다. 끄면 KIS 거래량순위 상위 30종목만 봅니다"><input type="checkbox" id="cfg_auto_universe_full_market">
+        국내 전 종목 순환</label>
       <label class="chk" style="margin:0"><input type="checkbox" id="cfg_auto_universe_keep_manual">
         손으로 넣은 종목은 유지</label>
     </div>
@@ -41,8 +45,12 @@
       다중 팩터(모멘텀 · 상대강도(IBD식) · 트렌드템플릿(미너비니) · U/D 거래량비(오닐) ·
       추세품질 · 위험조정 · 스마트머니 · 경제물리학 · 화제성)를 국면 가중으로 합산하며,
       표준화는 <b>같은 시장 후보끼리만</b> 합니다 — 한국·미국을 함께 추적해도 점수가 왜곡되지 않습니다.
-      <br>탐색 범위를 고르면 <b>그 안에서만</b> 찾습니다. 코스피200·KRX100 은 지수 전체를 훑고,
-      코스닥150·섹터는 그 지수를 추종하는 ETF 의 구성종목(비중 상위)에서 찾습니다.
+      <br>모집단은 <b>시장 전체</b>입니다 — 국내는 KRX 상장법인목록(코스피·코스닥 전 종목),
+      미국은 나스닥 스크리너 표. 한 번에 다 계산하지 않고 갱신마다 [회전당 계산 수]만큼씩
+      <b>순환</b>하며, 하루 안에 계산해 둔 종목은 캐시로 순위에 함께 올립니다.
+      <br>탐색 범위를 고르면 <b>그 안에서만</b> 찾습니다(전 종목 순환은 하지 않습니다).
+      코스피200·KRX100 은 지수 전체를 훑고, 코스닥150·섹터는 그 지수를 추종하는
+      ETF 의 구성종목(비중 상위)에서 찾습니다.
     </div>
   </section>
 
@@ -88,8 +96,9 @@ window.PAGE = {
     A.$("btnSaveAuto").onclick = () => this.saveAuto();
     A.$("btnAddUni").onclick = () => this.addUniverse();
     A.$("uniInput").onkeydown = (e) => { if (e.key === "Enter") this.addUniverse(); };
-    ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score",
-     "auto_universe_keep_manual"].forEach((k) => {
+    ["auto_universe_scan_limit", "auto_universe_size", "auto_universe_refresh_min",
+     "auto_universe_min_score", "auto_universe_keep_manual",
+     "auto_universe_full_market"].forEach((k) => {
       const el = A.$("cfg_" + k); if (el) el.onchange = () => { this._dirty = true; };
     });
     A.$("poolSelect").onchange = () => {
@@ -126,9 +135,11 @@ window.PAGE = {
     }
 
     if (!this._dirty) {
-      ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
+      ["auto_universe_scan_limit", "auto_universe_size", "auto_universe_refresh_min",
+       "auto_universe_min_score"]
         .forEach((k) => { const el = A.$("cfg_" + k); if (el) el.value = cfg[k] ?? ""; });
       A.$("cfg_auto_universe_keep_manual").checked = !!cfg.auto_universe_keep_manual;
+      A.$("cfg_auto_universe_full_market").checked = cfg.auto_universe_full_market !== false;
       // 서버가 정규화한 값을 씁니다 — 예전 설정("KR")도 코스피·코스닥으로 풀려서 옵니다
       const scope = snap.search_scope || {};
       this.renderScope(scope.segments || ["KOSPI", "KOSDAQ"], scope.universe || "");
@@ -247,9 +258,11 @@ window.PAGE = {
 
   async saveAuto() {
     const A = AT, patch = {};
-    ["auto_universe_size", "auto_universe_refresh_min", "auto_universe_min_score"]
+    ["auto_universe_scan_limit", "auto_universe_size", "auto_universe_refresh_min",
+     "auto_universe_min_score"]
       .forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
     patch.auto_universe_keep_manual = A.$("cfg_auto_universe_keep_manual").checked;
+    patch.auto_universe_full_market = A.$("cfg_auto_universe_full_market").checked;
     let markets = A.readSegments("segBox");
     if (!markets.length) {
       // 시장을 하나도 안 고르면 훑을 데가 없습니다. 조용히 코스피로 되돌립니다.

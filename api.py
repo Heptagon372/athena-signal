@@ -57,7 +57,7 @@ from data_sources import price_provider
 from data_sources.price_provider import get_provider
 from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
                     instruments, mlsignal, protections, recommender, risk,
-                    scalping, scoring, strategy)
+                    scalping, scoring, split, strategy)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
 from storage import accounts, db, derivatives, paper, user_credentials, users
@@ -1895,7 +1895,7 @@ def _account_identity(mode: str) -> dict:
 # 서버가 옛 코드면 스스로 "재시작하세요"를 띄우게 합니다.
 # 콘솔이 쓰는 엔드포인트를 추가/변경할 때마다 1씩 올리세요 (autotrade.html 의
 # REQUIRED_API 와 짝).
-CONSOLE_API_VERSION = 8
+CONSOLE_API_VERSION = 9
 
 
 # 포지션·계좌 블록 캐시 — 스냅샷의 유일하게 비싼 부분입니다 (시세·잔고 실호출).
@@ -1939,6 +1939,10 @@ def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> di
     block: dict = {}
     try:
         brk = broker.get_broker(user_id, mode, cfg)
+        # 계좌를 바꿨으면 여기서 성적을 0원으로 되돌립니다. 아래 touch_daily 가
+        # 오늘 줄을 다시 만들기 **전에** 해야, 새 계좌의 첫 줄이 지금의
+        # 평가손익을 기준선으로 깨끗하게 잡습니다.
+        at_store.sync_account(user_id, mode, broker.account_fingerprint(mode))
         brk_positions = brk.positions()
         states = at_store.get_position_states(user_id, mode)
         block["broker_health"] = brk.health()
@@ -1947,6 +1951,13 @@ def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> di
         block["positions"] = [
             {**p.to_dict(), "managed": autotrade.is_managed(cfg, p.key, states)}
             for p in brk_positions]
+        # 분할 차수 원장을 화면이 읽을 수 있는 모양으로 붙입니다. DB 에는 JSON
+        # 문자열로 들어 있어서, 화면이 직접 파싱하면 파싱 규칙이 두 곳에 생깁니다.
+        for row in block["positions"]:
+            ledger = split.load((states.get(row["key"]) or {}).get("splits"))
+            if ledger.tranches:
+                row["split"] = split.describe(
+                    ledger, float(row.get("current_price") or 0))
         # 평가손익·예수금을 반드시 함께 넘깁니다. 예전에는 총자산만 넘겨서,
         # 콘솔이 7초마다 예수금 기록을 NULL 로 덮어썼고 입출금 판별이 통째로
         # 무력화됐습니다. 지금 계산식은 평가손익 기준이라 이 값이 빠지면

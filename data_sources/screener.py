@@ -417,11 +417,16 @@ def _enrich_us(candidate: Candidate) -> int:
 
 
 def _members_to_candidates(found, min_price: float, max_price: float,
-                           universe_key: str, fx_rate: float = 1.0) -> list[Candidate]:
+                           universe_key: str, fx_rate: float = 1.0,
+                           rank_basis: str = "") -> list[Candidate]:
     """유니버스 구성종목(시세 포함) → 후보.
 
     구성종목 응답에는 고가·저가가 없어 변동폭은 `None`(모름) 으로 둡니다.
     0 으로 채우면 '조건 미달' 로 전부 탈락합니다.
+
+    `rank_basis="turnover"` 면 거래대금 대신 **회전율** 순으로 정렬합니다 —
+    거래대금 순은 늘 같은 대형주가 상위를 채우지만, 회전율(시총 대비 손바뀜)은
+    오늘 실제로 움직이는 종목을 올립니다. 그 외 값은 거래대금 순(기존 그대로).
     """
     out = []
     for member in found.members:
@@ -443,7 +448,12 @@ def _members_to_candidates(found, min_price: float, max_price: float,
             listed_shares=member.listed_shares,
             source=found.source or "유니버스 구성종목",
         ).derive())
-    out.sort(key=lambda c: c.trading_value_krw, reverse=True)
+    if rank_basis == "turnover":
+        # 회전율을 모르는 종목(시총이 안 온 행)은 0 취급 — 거래대금 순으로 뒤에 섭니다
+        out.sort(key=lambda c: (c.turnover_pct or 0.0, c.trading_value_krw),
+                 reverse=True)
+    else:
+        out.sort(key=lambda c: c.trading_value_krw, reverse=True)
     return out
 
 
@@ -569,7 +579,8 @@ def _yahoo_chart_quotes(symbols: list[str]) -> list[Candidate]:
 
 def us_candidates(min_price: float, max_price: float, limit: int = 60,
                   errors: list = None, segments: list[str] = None,
-                  universe_key: str = "", enrich: bool = False) -> list[Candidate]:
+                  universe_key: str = "", enrich: bool = False,
+                  rank_basis: str = "") -> list[Candidate]:
     """미국 후보.
 
     거래소(나스닥/뉴욕)나 지수·섹터를 지정하면 **나스닥 스크리너**에서 출발합니다 —
@@ -579,6 +590,10 @@ def us_candidates(min_price: float, max_price: float, limit: int = 60,
 
     표에 없는 것이 하나 있습니다 — **평균거래량**. 거래량 급증(vol_increase)은
     그래서 `enrich=True` 일 때 상위 후보에 한해 Yahoo 로 채웁니다.
+
+    `rank_basis="turnover"` 면 상위 `limit` 개를 거래대금이 아니라 **회전율**
+    순으로 자릅니다 (상장주식수는 시총으로 역산 — 추가 호출 없음). 거래증가율
+    (vol_increase)은 표에 평균거래량이 없어 정렬 기준으로는 지원하지 못합니다.
     """
     errors = errors if errors is not None else []
     segments = [s for s in (segments or ["NASDAQ", "NYSE"])
@@ -590,7 +605,7 @@ def us_candidates(min_price: float, max_price: float, limit: int = 60,
 
     if universe is not None or segments != ["NASDAQ", "NYSE"]:
         found = _nasdaq_candidates(min_price, max_price, limit, errors,
-                                   segments, universe, rate)
+                                   segments, universe, rate, rank_basis)
         if found:
             if enrich:
                 enrich_ranges(found, errors=errors)
@@ -623,9 +638,11 @@ def us_candidates(min_price: float, max_price: float, limit: int = 60,
             high=_num(q.get("regularMarketDayHigh")) or None,
             low=_num(q.get("regularMarketDayLow")) or None,
             # 야후는 평균거래량을 같이 줍니다 — 거래량 급증을 여기서 계산합니다.
-            # 상장주식수는 안 주므로 미국 경로에 회전율은 없습니다(None = 심사 제외).
             avg_volume=_ratio(q.get("averageDailyVolume3Month")
                               or q.get("averageDailyVolume10Day")),
+            # 상장주식수는 시총으로 역산 — 나스닥 경로와 같은 방식입니다.
+            listed_shares=((_num(q.get("marketCap")) / price)
+                           if _num(q.get("marketCap")) > 0 else None),
             source="Yahoo 스크리너",
         ).derive())
 
@@ -641,14 +658,19 @@ def us_candidates(min_price: float, max_price: float, limit: int = 60,
         c.price_krw = c.price * rate
         c.trading_value_krw = c.trading_value * rate
         out.append(c)
-    # 거래대금 큰 순 — 유동성 우선 원칙은 한국 경로와 같습니다
-    out.sort(key=lambda c: c.trading_value_krw, reverse=True)
+    # 기본은 거래대금 큰 순 — 유동성 우선 원칙은 한국 경로와 같습니다
+    if rank_basis == "turnover":
+        out.sort(key=lambda c: (c.turnover_pct or 0.0, c.trading_value_krw),
+                 reverse=True)
+    else:
+        out.sort(key=lambda c: c.trading_value_krw, reverse=True)
     return out[:limit]
 
 
 def _nasdaq_candidates(min_price: float, max_price: float, limit: int,
                        errors: list, segments: list[str],
-                       universe, fx_rate: float) -> list[Candidate]:
+                       universe, fx_rate: float,
+                       rank_basis: str = "") -> list[Candidate]:
     """나스닥 스크리너 표에서 후보 만들기 (지수·섹터·거래소 필터 포함)."""
     if universe is not None and universe.region != "US":
         errors.append(f"'{universe.label}' 는 국내 범위라 미국 시장에서는 찾지 않습니다.")
@@ -659,7 +681,7 @@ def _nasdaq_candidates(min_price: float, max_price: float, limit: int,
         if found.error:
             errors.append(found.error)
         return _members_to_candidates(found, min_price, max_price,
-                                      universe.key, fx_rate)[:limit]
+                                      universe.key, fx_rate, rank_basis)[:limit]
 
     # 범위를 지정하지 않았으면 거래소 전체에서 거래대금 상위로 추립니다.
     members = universe_mod.MemberSet(source="나스닥 스크리너")
@@ -671,7 +693,8 @@ def _nasdaq_candidates(min_price: float, max_price: float, limit: int,
             errors.append(part.error)
     if not members.members:
         return []
-    return _members_to_candidates(members, min_price, max_price, "", fx_rate)[:limit]
+    return _members_to_candidates(members, min_price, max_price, "",
+                                  fx_rate, rank_basis)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +704,8 @@ def _nasdaq_candidates(min_price: float, max_price: float, limit: int,
 def scan(markets: list[str], kr_price: tuple[int, int], us_price: tuple[float, float],
          limit: int = 60, use_cache: bool = True, rank_basis: str = "volume",
          enrich: bool = False, capture_raw: list = None,
-         universe: str = "") -> ScanResult:
+         universe: str = "", us_rank_basis: str = "",
+         us_limit: int = 0) -> ScanResult:
     """고른 시장·범위에서 후보를 모아 하나의 결과로.
 
     `markets` 는 세부시장 코드입니다 (KOSPI / KOSDAQ / NASDAQ).
@@ -698,13 +722,24 @@ def scan(markets: list[str], kr_price: tuple[int, int], us_price: tuple[float, f
     페니 초단타만 `rank_basis="vol_increase"` 나 `"turnover"` 로 타점 기준을
     바꾸고 `enrich=True` 로 고저가를 보강합니다 — 여기 기본값을 초단타 쪽에
     맞추면 일반 추천기의 후보 선정까지 같이 바뀝니다.
+
+    `us_rank_basis` 는 **미국 쪽만** 순위 기준을 따로 줄 때 씁니다 (비우면
+    `rank_basis` 를 따릅니다). 한국은 KIS 가 서버에서 순위를 매기지만 미국은
+    우리가 표를 정렬하므로, 한쪽만 바꾸고 싶을 때 이 인자가 필요합니다 —
+    AI 추천기가 한국은 평균거래량 순을 유지한 채 미국만 회전율 순으로 바꾸는
+    것이 그 경우입니다.
+
+    `us_limit` 은 미국 쪽만 개수 한도를 따로 줄 때 씁니다 (0 = `limit` 그대로).
+    순환 평가는 미국 **전 종목**이 필요하지만 한국 몫(KIS 순위·네이버 폴백)
+    까지 같이 키우면 안 되기 때문입니다.
     """
     segments = universe_mod.normalize_segments(markets)
     universe = str(universe or "").strip().upper()
     picked = universe_mod.get(universe) if universe else None
+    us_basis = us_rank_basis or rank_basis
 
     key = (f"{segments}:{universe}:{kr_price}:{us_price}:"
-           f"{limit}:{rank_basis}:{enrich}")
+           f"{limit}:{us_limit}:{rank_basis}:{us_basis}:{enrich}")
     now = time.time()
     if use_cache:
         with _cache_lock:
@@ -748,9 +783,10 @@ def scan(markets: list[str], kr_price: tuple[int, int], us_price: tuple[float, f
             result.errors.append(f"한국 스캔 실패: {type(exc).__name__}: {exc}")
     if us_segments:
         try:
-            found = us_candidates(us_price[0], us_price[1], limit,
+            found = us_candidates(us_price[0], us_price[1], us_limit or limit,
                                   errors=result.errors, segments=us_segments,
-                                  universe_key=universe, enrich=enrich)
+                                  universe_key=universe, enrich=enrich,
+                                  rank_basis=us_basis)
             if not found:
                 result.errors.append(
                     "미국 스크리너에서 해당 가격대 종목을 받지 못했습니다 "

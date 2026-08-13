@@ -1232,6 +1232,95 @@ def test_account_isolation():
 
 
 # ---------------------------------------------------------------------------
+# 11.5 계좌 교체 — 남의 계좌 성적을 물려받지 않는가
+# ---------------------------------------------------------------------------
+# 계좌번호를 바꿨는데 '오늘 손익 -6,646원'이 남아 있으면, 새 계좌가 이미 손실을
+# 안고 시작한 것처럼 보일 뿐 아니라 일일 손실 한도가 그 손실로 곧바로 걸립니다.
+
+def test_account_switch_reset():
+    section("11.5 계좌 교체 — 성적이 0원에서 다시 시작하는가")
+
+    user = TEST_USER + 6
+    store.init()                       # at_account 가 없는 DB 에서도 아래 정리가 돌게
+    with store._conn() as conn:
+        for table in ("at_orders", "at_daily", "at_account", "at_events"):
+            conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user,))
+
+    old_acc, new_acc = "aaaa1111aaaa1111", "bbbb2222bbbb2222"
+
+    # 옛 계좌에서 이틀치 성적을 쌓습니다
+    store.sync_account(user, "live", old_acc)
+    store.touch_daily(user, "live", 1_000_000, unrealized=0, cash=1_000_000,
+                      trade_date="2026-08-10")
+    store.touch_daily(user, "live", 1_050_000, unrealized=50_000, cash=1_000_000,
+                      trade_date="2026-08-10")
+    store.touch_daily(user, "live", 1_050_000, unrealized=0, cash=1_050_000)
+    store.record_daily_trade(user, "live", realized_pnl=-30_000)
+    store.touch_daily(user, "live", 1_020_000, unrealized=0, cash=1_020_000)
+    store.record_order(user, {
+        "client_order_id": f"{user}:live:TEST:sell:switch", "broker_mode": "live",
+        "symbol": "005930", "action": "sell", "quantity": 1, "price": 70_000,
+        "status": "filled", "realized_pnl": -30_000})
+
+    before = store.summary(user, mode="live")
+    check("교체", "(준비) 옛 계좌에 성적이 쌓여 있음",
+          before["cumulative_pnl"] != 0 and before["orders"] == 1,
+          f"누적 {before['cumulative_pnl']:+,.0f}원 · 주문 {before['orders']}건")
+
+    # 같은 계좌로 다시 확인 — 아무것도 지워지면 안 됩니다
+    check("교체", "계좌가 그대로면 성적을 건드리지 않음",
+          store.sync_account(user, "live", old_acc) is False
+          and store.summary(user, mode="live")["cumulative_pnl"]
+              == before["cumulative_pnl"])
+
+    # 지문을 못 읽은 상태(키 조회 실패)도 초기화 사유가 아닙니다
+    check("교체", "계좌를 못 읽었을 때는 성적을 지우지 않음",
+          store.sync_account(user, "live", "") is False
+          and store.summary(user, mode="live")["cumulative_pnl"]
+              == before["cumulative_pnl"],
+          "Mongo 가 잠깐 끊긴 것과 계좌를 바꾼 것은 다릅니다")
+
+    # 계좌 교체
+    check("교체", "계좌가 바뀌면 초기화가 일어남",
+          store.sync_account(user, "live", new_acc) is True)
+
+    after = store.summary(user, mode="live")
+    check("교체", "누적 손익이 0원", after["cumulative_pnl"] == 0,
+          f"{after['cumulative_pnl']:+,.0f}원")
+    check("교체", "옛 계좌의 주문·실현손익이 집계에서 빠짐",
+          after["orders"] == 0 and after["realized_pnl"] == 0,
+          f"주문 {after['orders']}건 · 실현 {after['realized_pnl']:+,.0f}원")
+    check("교체", "주문 원장 자체는 남아 있음 (확인할 수 있어야 합니다)",
+          len([o for o in store.get_orders(user, limit=10)
+               if o["broker_mode"] == "live"]) == 1)
+
+    # 새 계좌의 첫 회전 — 지금 평가손익이 기준선이 되어 오늘 손익은 0
+    day = store.touch_daily(user, "live", 3_000_000, unrealized=120_000,
+                            cash=2_880_000)
+    check("교체", "새 계좌의 오늘 손익이 0원에서 시작",
+          day["pnl"] == 0,
+          f"평가손익 +120,000원을 물려받아도 오늘 손익 {day['pnl']:+,.0f}원")
+
+    day2 = store.touch_daily(user, "live", 3_020_000, unrealized=140_000,
+                             cash=2_880_000)
+    check("교체", "그 뒤의 변화는 정상적으로 잡힘", day2["pnl"] == 20_000,
+          f"{day2['pnl']:+,.0f}원")
+
+    # 계좌를 바꿔도 다른 모드(내부 모의계좌)는 그대로여야 합니다
+    store.sync_account(user, "paper", "paper")
+    store.touch_daily(user, "paper", 10_000_000, unrealized=0, cash=10_000_000)
+    store.touch_daily(user, "paper", 10_100_000, unrealized=100_000, cash=10_000_000)
+    store.sync_account(user, "live", "cccc3333cccc3333")
+    check("교체", "KIS 계좌를 바꿔도 내부 모의계좌 성적은 그대로",
+          store.summary(user, mode="paper")["cumulative_pnl"] == 100_000,
+          f"{store.summary(user, mode='paper')['cumulative_pnl']:+,.0f}원")
+
+    check("교체", "초기화가 기록으로 남음",
+          any(e["kind"] == "reset" for e in store.get_events(user, limit=20)),
+          "숫자가 갑자기 0이 된 이유를 화면에서 찾을 수 있어야 합니다")
+
+
+# ---------------------------------------------------------------------------
 # 12. 페니주식 초단타 — 안전 한도가 설정으로 뚫리는가
 # ---------------------------------------------------------------------------
 
@@ -2233,6 +2322,7 @@ def main():
     test_order_lifecycle()
     test_reconcile()
     test_account_isolation()
+    test_account_switch_reset()
     test_penny_scalping()
     test_strategy_separation()
     test_scalp_chart()

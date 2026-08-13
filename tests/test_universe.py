@@ -79,6 +79,61 @@ def test_catalog():
     check("키는 대소문자 무관", universe.get("kospi200") is not None)
 
 
+def test_kr_full_market():
+    """국내 전 종목 명단이 순환 평가의 모집단으로 쓸 만한 모양인가.
+
+    이게 비거나 코넥스·스팩이 섞이면, 화면은 "코스피·코스닥 전 종목을 돈다"고
+    말하는데 실제로는 엉뚱한 종목에 계산 창을 내주게 됩니다.
+    """
+    print("\n[국내 전 종목 명단]")
+    rows = universe.kr_listed()
+    check("명단이 충분히 크다", len(rows) >= universe.KR_MASTER_MIN, f"{len(rows)}종목")
+    markets = {r["market"] for r in rows}
+    check("코스피·코스닥만 있다", markets == {"KOSPI", "KOSDAQ"}, str(markets))
+    check("코넥스가 없다", "KONEX" not in markets)
+    check("스팩이 없다", not [r for r in rows if "스팩" in r["name"]])
+    check("종목코드 6자리", all(len(r["key"]) == 6 and r["key"].isdigit() for r in rows))
+    check("코드 중복 없음", len({r["key"] for r in rows}) == len(rows))
+
+    kospi = universe.kr_listed(["KOSPI"])
+    kosdaq = universe.kr_listed(["KOSDAQ"])
+    check("코스피만 고르면 코스피만", {r["market"] for r in kospi} == {"KOSPI"})
+    check("코스닥만 고르면 코스닥만", {r["market"] for r in kosdaq} == {"KOSDAQ"})
+    check("둘을 합치면 전체", len(kospi) + len(kosdaq) == len(rows))
+    check("예전 설정 KR 도 풀린다", len(universe.kr_listed(["KR"])) == len(rows))
+    check("미국만 고르면 빈 목록", universe.kr_listed(["NASDAQ"]) == [])
+
+
+def test_rotation_window():
+    """순환이 실제로 **앞으로 나아가는가** (같은 자리에서 맴돌지 않는가).
+
+    계산 실패 종목을 창에서 빼지 않으면 매 회전 같은 종목이 앞자리를 차지해
+    시장 전체 커버가 영원히 끝나지 않습니다.
+    """
+    print("\n[순환 평가 창]")
+    from engine.autotrade import rotate_window
+
+    pool = [f"{i:06d}" for i in range(10)]
+    ident = lambda k: k
+
+    window, extras, skipped = rotate_window(pool, ident, 3, set(), set())
+    check("첫 회전은 앞에서 3개", window == pool[:3])
+    check("캐시가 없으면 순위에 올릴 것도 없다", extras == [])
+
+    cached = set(window)
+    window2, extras2, _ = rotate_window(pool, ident, 3, cached, set())
+    check("다음 회전은 그 다음 3개", window2 == pool[3:6])
+    check("이미 계산한 것은 캐시로 순위에", extras2 == pool[:3])
+
+    # 앞 두 종목이 영구 실패 — 여기서 멈추면 안 됩니다
+    window3, _, skipped3 = rotate_window(pool, ident, 3, set(), {pool[0], pool[1]})
+    check("실패 종목은 창을 차지하지 않는다", window3 == pool[2:5], str(window3))
+    check("건너뛴 수를 보고한다", skipped3 == 2)
+
+    full, _, _ = rotate_window(pool, ident, 3, set(pool), set())
+    check("전부 계산됐으면 새로 계산할 것이 없다", full == [])
+
+
 def test_scope_mismatch():
     """범위와 시장이 어긋나면 **이유를 말하고** 0건이어야 합니다.
 
@@ -216,6 +271,8 @@ def main():
     test_segment_compat()
     test_catalog()
     test_scalp_config()
+    test_kr_full_market()      # 로컬 캐시(상장법인목록)만 봅니다
+    test_rotation_window()
     if not offline:
         test_scope_mismatch()
         test_kr_universes()

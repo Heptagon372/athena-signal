@@ -20,7 +20,7 @@
 (function () {
   const API = "/api";
   // api.py 의 CONSOLE_API_VERSION 과 짝 — 서버가 낮으면 재시작 배너를 띄웁니다
-  const REQUIRED_API = 8;
+  const REQUIRED_API = 9;
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -57,12 +57,16 @@
     let data = null;
     try { data = await res.json(); } catch {}
     if (res.status === 401) { showLogin(); throw new Error("로그인이 필요합니다."); }
-    if (res.status === 404 && path.startsWith("/autotrade")) {
+    // 404 라고 다 구버전 서버가 아닙니다. 서버가 직접 만든 404 는
+    // {error, message} 를 담아 옵니다 (예: 종목 없음) — 그건 아래의 일반
+    // 오류 처리로 보내고, 라우트 자체가 없는 FastAPI 기본 404
+    // ({"detail":"Not Found"}) 만 재시작 배너를 띄웁니다.
+    if (res.status === 404 && path.startsWith("/autotrade") && !(data && data.error)) {
       showStaleBanner();
       throw new Error("서버가 이전 버전 코드로 실행 중입니다 — 서버를 재시작하세요.");
     }
     if (!res.ok) throw new Error(
-      (data && (data.error || data.detail || data.message)) || `HTTP ${res.status}`);
+      (data && (data.message || data.error || data.detail)) || `HTTP ${res.status}`);
     return data;
   }
 

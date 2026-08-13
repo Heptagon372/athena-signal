@@ -156,6 +156,10 @@
         최소 1주 허용 <span class="muted" style="font-size:11px">— 소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
       <label class="chk"><input type="checkbox" id="cfg_allow_short"> 숏 진입 허용 (파생만)</label>
       <label class="chk"><input type="checkbox" id="cfg_use_news"> 뉴스 감성 반영 (느림)</label>
+      <label class="chk"><input type="checkbox" id="cfg_rotation_enabled">
+        수익 회전(갈아타기) 허용 <span class="muted" style="font-size:11px">—
+        더 좋은 신호가 떴는데 현금·슬롯이 없으면, 수수료 빼고도 이익인 보유 종목을
+        목표가 전에 팔아 재원 확보. 조건은 아래 [회전] 항목들</span></label>
     </section>
 
     <section>
@@ -169,7 +173,7 @@
   </div>
 
   <section>
-    <h2>전략 · 리스크 설정 <span class="sub">저장하면 다음 회전부터 적용됩니다</span></h2>
+    <h2>전략 · 리스크 설정 <span class="sub">바꾸면 바로 저장됩니다 — 다음 회전부터 적용</span></h2>
 
     <div class="field" style="margin-bottom:12px">
       <label>NNFX 규칙 오버레이
@@ -186,6 +190,50 @@
                  title="소프트 결합 가중 (0~1)"></div>
         <span class="note" id="nnfxNote"></span>
       </div>
+    </div>
+
+    <div class="field" style="margin-bottom:12px">
+      <label>분할 매수 · 분할 매도 (차수별 독립 관리)
+        <span class="sub">한 종목을 차수로 나눠 사고, 각 차수를 <b>그 차수 매수가 기준으로 따로</b> 팝니다</span></label>
+      <div class="row" style="flex-wrap:wrap;gap:10px">
+        <label class="chk" style="margin:0"><input type="checkbox" id="cfg_split_enabled">
+          <b>분할 매매 사용</b></label>
+        <label class="chk" style="margin:0"><input type="checkbox" id="cfg_split_require_oversold">
+          과매도일 때만 추가 매수</label>
+        <label class="chk" style="margin:0"><input type="checkbox" id="cfg_split_overbought_sell">
+          과매수면 수익 차수 조기 정리</label>
+        <select id="cfg_split_size_mode" style="width:auto;min-width:190px"
+                title="차수별 매수 수량을 어떻게 나눌지">
+          <option value="equal">차수 수량: 균등</option>
+          <option value="pyramid">차수 수량: 체증 (뒤 차수를 크게)</option>
+        </select>
+      </div>
+      <div class="split" style="margin-top:10px">
+        <div class="field"><label>최대 차수 (2~10)</label><input id="cfg_split_tranches" type="number" step="1"
+          title="1차 포함. 전체 매수 금액을 이만큼 나눠 담습니다"></div>
+        <div class="field"><label>추가 매수 하락률 (%)</label><input id="cfg_split_buy_drop_pct" type="number" step="0.5"
+          title="직전 차수 체결가 대비 이만큼 내리면 다음 차수를 담습니다"></div>
+        <div class="field"><label>차수 익절률 (%)</label><input id="cfg_split_sell_gain_pct" type="number" step="0.5"
+          title="그 차수 매수가 대비 이만큼 오르면 그 차수만 팝니다"></div>
+        <div class="field"><label>과매도 RSI 기준</label><input id="cfg_split_oversold_rsi" type="number" step="1"
+          title="RSI(14)가 이 값 이하면 과매도로 봅니다 (볼린저 하단이어도 인정)"></div>
+        <div class="field"><label>과매수 RSI 기준</label><input id="cfg_split_overbought_rsi" type="number" step="1"></div>
+        <div class="field"><label>차수 간 최소 간격 (분)</label><input id="cfg_split_min_gap_min" type="number" step="10"
+          title="하루 급락에 차수가 한꺼번에 소진되는 것을 막습니다"></div>
+        <div class="field"><label>하루 추가 매수 상한</label><input id="cfg_split_max_adds_per_day" type="number" step="1"></div>
+        <div class="field"><label>마지막 차수 후 손절 (%)</label><input id="cfg_split_final_stop_pct" type="number" step="1"
+          title="마지막 차수 예정가에서 이만큼 더 빠지면 전량 손절합니다"></div>
+        <div class="field"><label>차수 수익 / 왕복비용 최소 배수</label><input id="cfg_split_cost_multiple" type="number" step="0.5"
+          title="수수료·거래세를 빼면 마이너스인 매도를 막습니다"></div>
+        <div class="field"><label>체증 배수 (체증일 때)</label><input id="cfg_split_pyramid_ratio" type="number" step="0.1"></div>
+        <div class="field"><label>차수별 하락률 (직접 지정)</label><input id="cfg_split_buy_drop_steps" type="text"
+          placeholder="비우면 위 값 균등 · 예: 10, 20, 30"
+          title="쉼표로 구분. 차수마다 다른 하락률을 쓸 때만 채우세요"></div>
+        <div class="field"><label>차수별 익절률 (직접 지정)</label><input id="cfg_split_sell_gain_steps" type="text"
+          placeholder="비우면 위 값 균등 · 예: 3, 5, 7"
+          title="쉼표로 구분. 차수마다 다른 익절률을 쓸 때만 채우세요"></div>
+      </div>
+      <div class="note" id="splitNote" style="margin-top:8px"></div>
     </div>
 
     <div class="split">
@@ -209,6 +257,12 @@
       <div class="field"><label>미체결 자동취소 (초)</label><input id="cfg_order_timeout_sec" type="number" step="30"></div>
       <div class="field"><label>모의계좌 슬리피지 (bp)</label><input id="cfg_paper_slippage_bps" type="number" step="1"></div>
       <div class="field"><label>파생 만기 최소 잔여일</label><input id="cfg_deriv_min_days_to_expiry" type="number" step="1"></div>
+      <div class="field"><label>회전: 목표/왕복비용 최소 배수</label><input id="cfg_rotation_cost_edge_multiple" type="number" step="0.5"></div>
+      <div class="field"><label>회전: 기대 우위 최소 (%p)</label><input id="cfg_rotation_min_gap_pct" type="number" step="0.5"></div>
+      <div class="field"><label>회전: 점수 우위 최소</label><input id="cfg_rotation_score_margin" type="number" step="0.05"></div>
+      <div class="field"><label>회전: 최소 보유 (분)</label><input id="cfg_rotation_min_hold_min" type="number" step="5"></div>
+      <div class="field"><label>회전: 하루 최대 횟수</label><input id="cfg_rotation_max_per_day" type="number" step="1"></div>
+      <div class="field"><label>회전: 재진입 금지 (분)</label><input id="cfg_rotation_reentry_min" type="number" step="30"></div>
     </div>
     <div class="row" style="margin-top:8px">
       <button id="btnSave" class="primary">설정 저장</button>
@@ -257,18 +311,70 @@ window.PAGE = {
   init() {
     const A = AT;
     A.$("btnSave").onclick = () => this.saveConfig();
-    A.$("btnReload").onclick = () => { this._dirty = false; this.hint(); A.refresh(); };
+    A.$("btnReload").onclick = () => {
+      clearTimeout(this._saveTimer);            // 대기 중인 자동 저장도 버립니다
+      this._saveTimer = null; this._pending = null;
+      this._dirty = false; this.hint(); A.refresh();
+    };
     A.$("btnDiagnose").onclick = () => this.diagnose();
     A.$("btnSlides").onclick = () => SLIDES.open(0);
     SLIDES.init();
-    [...this.FIELDS, ...this.BOOLS].forEach((k) => {
+    // 자동 저장 — 필드를 바꾸면 바뀐 키만 부분 저장합니다 (버튼은 전체 저장용으로 남김).
+    // input(타이핑 중)은 _dirty 만 세워 폴링 갱신이 입력을 덮지 않게 하고,
+    // change(확정)에서 저장을 예약합니다.
+    this.FIELDS.forEach((k) => {
       const el = A.$("cfg_" + k);
-      if (el) el.onchange = () => { this._dirty = true; this.hint(); };
+      if (!el) return;
+      el.oninput = () => { this._dirty = true; this.hint(); };
+      el.onchange = () => {
+        if (el.value === "") return;             // 빈 값은 저장하지 않습니다
+        this.queueSave({[k]: Number(el.value)});
+        if (k.startsWith("split_")) this.splitNoteFromForm();
+      };
     });
-    A.$("modeSelect").onchange = () => { this._dirty = true; this.hint(); };
-    A.$("usFundingSelect").onchange = () => { this._dirty = true; this.hint(); };
-    A.$("cfg_nnfx_mode").onchange = () => { this._dirty = true; this.hint(); this.nnfxNote(); };
-    A.$("cfg_nnfx_soft_weight").onchange = () => { this._dirty = true; this.hint(); };
+    this.BOOLS.forEach((k) => {
+      const el = A.$("cfg_" + k);
+      if (!el) return;
+      el.onchange = () => {
+        this.queueSave({[k]: el.checked});
+        if (k.startsWith("split_")) this.splitNoteFromForm();
+      };
+    });
+    // 차수별 값은 "10, 20, 30" 처럼 적습니다. 비우면 빈 배열로 저장해
+    // 균등 값으로 되돌아갑니다 (지웠는데 그대로면 왜 안 바뀌는지 알 수 없습니다).
+    this.LISTS.forEach((k) => {
+      const el = A.$("cfg_" + k);
+      if (!el) return;
+      el.oninput = () => { this._dirty = true; this.hint(); };
+      el.onchange = () => this.queueSave({[k]: this.parseList(el.value)});
+    });
+    A.$("cfg_split_size_mode").onchange = () =>
+      this.queueSave({split_size_mode: A.$("cfg_split_size_mode").value});
+    A.$("modeSelect").onchange = () => {
+      const val = A.$("modeSelect").value, before = A.SNAP?.config?.mode;
+      if (val !== before) {
+        const warn = val === "live"
+          ? "실제 자금 계좌로 전환합니다.\n지금부터 모든 숫자와 주문이 실계좌 기준입니다. 계속할까요?"
+          : "계좌를 전환합니다. 계좌마다 포지션·손익이 따로 관리됩니다. 계속할까요?";
+        if (!confirm(warn)) { A.$("modeSelect").value = before; return; }
+      }
+      this.queueSave({mode: val}, true);         // 계좌 전환은 미루지 않습니다
+    };
+    A.$("usFundingSelect").onchange = () =>
+      this.queueSave({us_order_funding: A.$("usFundingSelect").value});
+    A.$("cfg_nnfx_mode").onchange = () => {
+      const val = A.$("cfg_nnfx_mode").value;
+      if (val === "hard" && A.SNAP?.config?.nnfx_mode !== "hard"
+          && !confirm("원본 NNFX(전 슬롯 AND)는 주식에서 통과율이 10%까지 떨어져\n"
+                      + "매매가 거의 멈추고 성과가 음수였습니다.\n\n그래도 켜시겠습니까?")) {
+        A.$("cfg_nnfx_mode").value = A.SNAP?.config?.nnfx_mode || "off";
+        this.nnfxNote(); return;
+      }
+      this.nnfxNote();
+      this.queueSave({nnfx_mode: val});
+    };
+    A.$("cfg_nnfx_soft_weight").onchange = () =>
+      this.queueSave({nnfx_soft_weight: Number(A.$("cfg_nnfx_soft_weight").value) || 0});
     this.pollEvents();
     setInterval(() => this.pollEvents(), 7000);
   },
@@ -279,9 +385,18 @@ window.PAGE = {
            "trailing_stop_pct","max_hold_days","max_order_krw","min_order_krw",
            "daily_loss_limit_pct","max_drawdown_pct","max_gross_exposure_pct",
            "max_quote_age_sec","order_timeout_sec","paper_slippage_bps",
-           "deriv_min_days_to_expiry"],
+           "deriv_min_days_to_expiry",
+           "rotation_cost_edge_multiple","rotation_min_gap_pct","rotation_score_margin",
+           "rotation_min_hold_min","rotation_max_per_day","rotation_reentry_min",
+           "split_tranches","split_buy_drop_pct","split_sell_gain_pct",
+           "split_oversold_rsi","split_overbought_rsi","split_min_gap_min",
+           "split_max_adds_per_day","split_final_stop_pct","split_cost_multiple",
+           "split_pyramid_ratio"],
+  // 쉼표로 적는 차수별 값 — 비우면 위의 균등 값을 씁니다
+  LISTS: ["split_buy_drop_steps","split_sell_gain_steps"],
   BOOLS: ["dry_run","manage_only_universe","regular_session_only","us_extended_hours",
-          "min_one_unit","allow_short","use_news"],
+          "min_one_unit","allow_short","use_news","rotation_enabled",
+          "split_enabled","split_require_oversold","split_overbought_sell"],
   // 모드별 근거 — 켜기 전에 무엇을 감수하는지 화면에서 바로 보이게 합니다
   NNFX_NOTE: {
     off:  "기존 지표 점수만 씁니다.",
@@ -297,7 +412,106 @@ window.PAGE = {
   STATUS: {filled:"체결", partial:"부분체결", pending:"대기", rejected:"거부",
            cancelled:"취소됨", cancel_requested:"취소요청"},
 
-  hint() { AT.$("saveHint").textContent = this._dirty ? "저장하지 않은 변경이 있습니다." : ""; },
+  hint() {
+    AT.$("saveHint").textContent =
+      this._pending || this._saveTimer ? "저장 중…"
+      : this._dirty ? "수정 중 — 칸을 벗어나면 저장됩니다." : "";
+  },
+
+  // "10, 20, 30" → [10, 20, 30]. 숫자가 아니거나 0 이하면 버립니다.
+  parseList(text) {
+    return String(text || "").split(",")
+      .map((v) => Number(v.trim()))
+      .filter((v) => Number.isFinite(v) && v > 0);
+  },
+
+  // 저장을 기다리지 않고 지금 폼에 적힌 값으로 다시 계산합니다 — 값을 바꾸는
+  // 순간 "그래서 얼마나 버티는가"가 보여야 판단할 수 있습니다.
+  splitNoteFromForm() {
+    const A = AT, num = (k, d) => {
+      const el = A.$("cfg_" + k);
+      return el && el.value !== "" ? Number(el.value) : d;
+    };
+    this.splitNote({
+      split_enabled: A.$("cfg_split_enabled")?.checked,
+      split_tranches: num("split_tranches", 5),
+      split_buy_drop_pct: num("split_buy_drop_pct", 5),
+      split_sell_gain_pct: num("split_sell_gain_pct", 5),
+      split_final_stop_pct: num("split_final_stop_pct", 7),
+      split_buy_drop_steps: this.parseList(A.$("cfg_split_buy_drop_steps")?.value),
+      split_sell_gain_steps: this.parseList(A.$("cfg_split_sell_gain_steps")?.value),
+    });
+  },
+
+  // 차수별 값 목록을 engine/split.py 의 _steps 와 같은 규칙으로 맞춥니다
+  // (모자라면 마지막 값으로 채움, 비면 균등 값). 규칙이 갈리면 화면이 보여준
+  // 자리와 실제로 사는 자리가 달라집니다.
+  splitSteps(list, count, fallback) {
+    const out = (list && list.length) ? list.slice(0, count) : [fallback];
+    while (out.length < count) out.push(out[out.length - 1]);
+    return out;
+  },
+
+  // 분할을 켜면 한 종목이 감당하는 손실 폭이 달라집니다. 설정만 보고는
+  // 그 숫자가 안 보이므로(5%×4차 = 20%가 아니라 18.5%), 여기서 계산해 보여줍니다.
+  splitNote(cfg) {
+    const el = AT.$("splitNote"); if (!el) return;
+    if (!cfg.split_enabled) {
+      el.innerHTML = "분할 매매가 꺼져 있습니다 — 종목당 한 번 사고 한 번 팝니다.";
+      return;
+    }
+    const n = Math.max(2, Math.min(cfg.split_tranches ?? 5, 10));
+    const drops = this.splitSteps(cfg.split_buy_drop_steps, n - 1, cfg.split_buy_drop_pct ?? 5);
+    const gains = this.splitSteps(cfg.split_sell_gain_steps, n, cfg.split_sell_gain_pct ?? 5);
+
+    // 차수 가격은 **직전 차수 대비** 하락률을 곱해 누적합니다 (5%씩 4번은 20%가
+    // 아니라 18.5%). 엔진의 plan_for 와 같은 식이어야 화면과 실제가 맞습니다.
+    let level = 1, steps = [];
+    for (let i = 0; i < n; i++) {
+      if (i > 0) level *= (1 - drops[i - 1] / 100);
+      steps.push(`${i + 1}차 ${((level - 1) * 100).toFixed(1)}% (+${gains[i]}%에 매도)`);
+    }
+    const dd = (1 - level * (1 - (cfg.split_final_stop_pct ?? 7) / 100)) * 100;
+    el.innerHTML =
+      `1차 진입가를 기준으로 → <b>${AT.esc(steps.join(" · "))}</b>`
+      + `<br>각 차수는 <b>자기 매수가</b> 대비 오르면 그 차수만 팝니다. `
+      + `마지막 차수까지 다 담고도 더 빠지면 <b>1차가 대비 -${dd.toFixed(1)}%</b> 에서 전량 손절합니다 — `
+      + `한 종목이 이만큼 버틴다는 뜻이므로 [종목당 최대 비중]을 그에 맞게 낮추세요.`
+      + `<br><span class="muted">이미 들고 있는 포지션에는 적용되지 않습니다 — 분할을 켠 뒤 새로 잡는 종목부터 차수로 관리됩니다. `
+      + `분할이 켜지면 [익절 (%)]과 [고정 손절 (%)]은 이 종목들에 적용되지 않습니다(차수별 익절과 위 손절선이 대신합니다).</span>`;
+  },
+
+  // 자동 저장 — 바뀐 키만 모아 0.8초 뒤 한 번에 보냅니다 (스피너 연타 대비).
+  // 부분 저장이라 다른 설정을 건드리지 않고, 서버(save_config)가 병합합니다.
+  queueSave(patch, immediate = false) {
+    this._dirty = true;
+    if (patch.asset_classes && this._pending?.asset_classes)
+      patch.asset_classes = {...this._pending.asset_classes, ...patch.asset_classes};
+    this._pending = Object.assign(this._pending || {}, patch);
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this.flushSave(), immediate ? 0 : 800);
+    this.hint();
+  },
+
+  async flushSave() {
+    const patch = this._pending;
+    this._pending = null; this._saveTimer = null;
+    if (!patch || !Object.keys(patch).length) return;
+    try {
+      const res = await AT.call("/autotrade/config", {method: "POST", body: {config: patch}});
+      // 저장 사이에 다른 칸을 타이핑 중이면 _dirty 를 유지해 폴링이 덮지 않게 합니다
+      const editing = /^cfg_/.test(document.activeElement?.id || "");
+      if (!this._pending && !this._saveTimer && !editing) this._dirty = false;
+      this.hint();
+      if (res.stopped) AT.toast("계좌가 바뀌어 자동매매를 중지했습니다. 확인 후 다시 시작하세요.", true);
+      else AT.toast("저장했습니다 — 다음 회전부터 적용됩니다.");
+      AT.refresh();
+    } catch (e) {
+      // 실패하면 화면 값을 지키기 위해 _dirty 를 유지합니다 (폴링이 되돌리지 않게)
+      this._dirty = true; this.hint();
+      AT.toast("저장 실패: " + e.message, true);
+    }
+  },
 
   onSnapshot(snap) {
     const A = AT, cfg = snap.config || {}, acc = snap.account || {}, day = snap.day || {};
@@ -351,10 +565,15 @@ window.PAGE = {
       // 초단타가 잡은 포지션은 청산 규칙이 다릅니다(틱·초). 같은 표에 섞여
       // 있으면서 표시가 없으면, 왜 이 종목만 3분 만에 팔렸는지 알 수 없습니다.
       const scalp = s.strategy === "scalp";
+      // 분할 포지션은 목표가가 하나가 아닙니다 — 차수마다 다릅니다. 목표 칸에
+      // 대표값 하나를 찍으면 "왜 저 가격에 안 팔았지"가 됩니다. 차수 진행도와
+      // 다음 매수 트리거를 대신 보여줍니다.
+      const sp = p.split;
       return `<tr class="clickable ${off ? "pos-unmanaged" : ""}" data-slide="${i}">
         <td class="muted mono">${i + 1}</td>
         <td>${A.esc(p.name)}${off ? '<span class="tag-unmanaged">관리 안 함</span>' : ""}
             ${scalp ? '<span class="tag-unmanaged">페니 초단타</span>' : ""}
+            ${sp ? `<span class="tag-unmanaged">분할 ${sp.count}/${sp.total}차</span>` : ""}
             <div class="muted mono" style="font-size:11px">${p.key}</div></td>
         <td>${p.asset_label} ${p.side === "short" ? '<span class="down">숏</span>' : ""}</td>
         <td class="num">${A.num(p.quantity, 4)}</td>
@@ -362,7 +581,10 @@ window.PAGE = {
         <td class="num">${A.num(p.current_price)}</td>
         <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}</td>
         <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "—"}</td>
-        <td class="num muted">${s.target_price ? A.num(s.target_price) : "—"}</td>
+        <td class="num muted">${sp
+            ? (sp.tranches.map((t) => A.num(t.target_price)).join(" / ")
+               + (sp.next_trigger ? `<div style="font-size:11px">다음 매수 ${A.num(sp.next_trigger)}</div>` : ""))
+            : (s.target_price ? A.num(s.target_price) : "—")}</td>
         <td><button class="sm danger" data-close="${p.key}">청산</button></td>
       </tr>`;
     }).join("");
@@ -394,6 +616,12 @@ window.PAGE = {
       A.$("cfg_nnfx_mode").value = cfg.nnfx_mode || "off";
       A.$("cfg_nnfx_soft_weight").value = cfg.nnfx_soft_weight ?? 0.3;
       this.nnfxNote();
+      this.LISTS.forEach((k) => {
+        const el = A.$("cfg_" + k);
+        if (el) el.value = (cfg[k] || []).join(", ");
+      });
+      A.$("cfg_split_size_mode").value = cfg.split_size_mode || "equal";
+      this.splitNote(cfg);
       A.$("usFundingSelect").value = cfg.us_order_funding || "fx";
       A.$("modeSelect").innerHTML = (snap.modes || []).map((m) =>
         `<option value="${m.mode}" ${m.available ? "" : "disabled"} ${m.mode === cfg.mode ? "selected" : ""}>`
@@ -402,7 +630,7 @@ window.PAGE = {
         `<label class="chk"><input type="checkbox" data-asset="${key}" ${cfg.asset_classes?.[key] ? "checked" : ""}>
           ${label} <span class="muted" style="font-size:11px">— ${desc}</span></label>`).join("");
       document.querySelectorAll("[data-asset]").forEach((el) =>
-        el.onchange = () => { this._dirty = true; this.hint(); });
+        el.onchange = () => this.queueSave({asset_classes: {[el.dataset.asset]: el.checked}}));
     }
 
     // 한도
@@ -434,6 +662,10 @@ window.PAGE = {
     }
     this.FIELDS.forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
     this.BOOLS.forEach((k) => { const el = A.$("cfg_" + k); if (el) patch[k] = el.checked; });
+    this.LISTS.forEach((k) => {
+      const el = A.$("cfg_" + k); if (el) patch[k] = this.parseList(el.value);
+    });
+    patch.split_size_mode = A.$("cfg_split_size_mode").value;
     patch.nnfx_mode = A.$("cfg_nnfx_mode").value;
     patch.nnfx_soft_weight = Number(A.$("cfg_nnfx_soft_weight").value) || 0;
     // 신호 생성 방식을 바꾸는 스위치라, 실측에서 기각된 모드는 한 번 물어봅니다

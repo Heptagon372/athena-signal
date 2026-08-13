@@ -268,7 +268,11 @@ def test_symbol_resolution():
 
     valid = [("삼성전자", "005930", "KOSPI"), ("005930", "005930", "KOSPI"),
              ("에코프로비엠", "247540", "KOSDAQ"), ("247540.KQ", "247540", "KOSDAQ"),
-             ("AAPL", "AAPL", "US")]
+             ("AAPL", "AAPL", "US"),
+             # 영문 상장명의 한국 종목 — 미국 티커로 넘기기 전에 KRX 를 봅니다
+             ("HMM", "011200", "KOSPI"), ("naver", "035420", "KOSPI"),
+             # US: 접두사는 한국 종목명과 겹쳐도 미국 티커를 강제합니다
+             ("US:AAPL", "AAPL", "US")]
     for query, expect_key, expect_market in valid:
         try:
             s = sr.resolve(query)
