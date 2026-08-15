@@ -490,9 +490,11 @@ def test_operations():
                   feed.entry_allowed_now(inst, {})[0])
 
             fake("AFTER", "애프터마켓")
-            check("ops", "애프터마켓: 확장시간을 켜도 진입 금지",
-                  not feed.entry_allowed_now(inst, {"us_extended_hours": True})[0],
+            check("ops", "애프터마켓: 스위치 꺼짐이면 진입 금지",
+                  not feed.entry_allowed_now(inst, {})[0],
                   "호가가 얇아 스프레드부터 지고 시작합니다")
+            check("ops", "애프터마켓: 확장시간을 켜면 진입 허용 (미국)",
+                  feed.entry_allowed_now(inst, {"us_extended_hours": True})[0])
 
             fake("PRE", "프리마켓")
             check("ops", "프리마켓: 스위치 꺼짐이면 대기",

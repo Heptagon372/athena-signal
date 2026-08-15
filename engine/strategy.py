@@ -26,7 +26,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from engine import ensemble, feed, indicators, mlsignal, nnfx
+from engine import ensemble, feed, indicators, lessons, mlsignal, nnfx
 from engine.instruments import FUTURES, OPTION, Instrument
 
 # 지표 계산에 필요한 최소 봉 개수 — 이보다 적으면 신호를 만들지 않습니다
@@ -264,6 +264,16 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             sig.ma50 = float(bars_daily["close"].iloc[-50:].mean())
         except (KeyError, TypeError, ValueError):
             sig.ma50 = None
+
+    # 손실 학습 감쇠 (engine/lessons.py) — 과거에 돈을 잃었던 컨텍스트(태그)와
+    # 지금 신호의 컨텍스트를 대조해 점수를 깎습니다. 회전(_tick)이 cfg 사본에
+    # 실어준 감쇠표가 있을 때만 동작하므로 백테스트에는 닿지 않고(미래 참조
+    # 없음), soft 모드에서만 실제로 점수를 바꿉니다 (observe 는 기록만).
+    if cfg.get("_lesson_penalties"):
+        adjusted, lesson_note = lessons.apply_to_score(sig.score, sig, cfg)
+        if lesson_note:
+            sig.score = adjusted
+            sig.stage("lessons", "손실 학습", sig.score, lesson_note)
 
     entry = float(cfg.get("entry_score", 0.35))
     allow_short = bool(cfg.get("allow_short")) and inst.shortable

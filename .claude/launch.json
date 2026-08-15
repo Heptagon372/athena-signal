@@ -6,6 +6,18 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "uvicorn", "api:app", "--port", "8000"],
       "port": 8000
+    },
+    {
+      "name": "athena-web-static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "5599", "--directory", "web"],
+      "port": 5599
+    },
+    {
+      "name": "athena-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
+      "port": 3000
     }
   ]
 }

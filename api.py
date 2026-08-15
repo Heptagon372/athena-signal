@@ -56,8 +56,8 @@ from data_sources import (community_crawler, credentials, firebase_auth, fx,
 from data_sources import price_provider
 from data_sources.price_provider import get_provider
 from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
-                    instruments, mlsignal, protections, recommender, risk,
-                    scalping, scoring, split, strategy)
+                    instruments, lessons, mlsignal, protections, recommender,
+                    risk, scalping, scoring, split, strategy)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
 from storage import accounts, db, derivatives, paper, user_credentials, users
@@ -69,12 +69,63 @@ _last_auto_resolve: dict | None = None
 
 app = FastAPI(title="Athena Signal API", version="0.2")
 
+# CORS — 열어 둘 오리진만 명시합니다.
+#
+# 브라우저 요청은 대부분 같은 오리진입니다 (Next 가 /api 를 프록시하고, 공개
+# 배포에서는 nginx 가 한 도메인으로 묶습니다). 실제로 교차 오리진인 것은
+# 크롬 확장(chrome-extension://)과 개발 중 localhost:3000 → :8000 직접 호출
+# 뿐입니다. 예전의 "*" 는 아무 웹사이트의 스크립트가 이 API 를 두드리는 것을
+# 허용했기 때문에, 공개 배포를 앞두고 명시 목록으로 좁혔습니다.
+import security  # noqa: E402  (config 류의 루트 모듈)
+
+_cors_origins = {
+    "http://localhost:3000", "http://127.0.0.1:3000",     # Next 개발 서버
+    "http://localhost:8000", "http://127.0.0.1:8000",     # 구버전 콘솔(/legacy)
+}
+if security.public_origin():
+    _cors_origins.add(security.public_origin())
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=sorted(_cors_origins),
+    # 크롬 확장의 ID 는 설치마다 다를 수 있어 스킴 전체를 허용합니다 (32자 a-p)
+    allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """모든 응답에 붙는 보안 헤더.
+
+    · nosniff / frame DENY / referrer 축소 — 비용 없는 기본기입니다.
+    · 인증·키 경로는 no-store — 세션 토큰이나 마스킹된 키 정보가 브라우저
+      캐시·중간 프록시에 남으면 안 됩니다.
+    · HSTS 는 실제로 https 로 서비스될 때만 — nginx 뒤(X-Forwarded-Proto)에서
+      판단합니다. http 응답의 HSTS 는 브라우저가 무시하지만, 조건 없이 붙이면
+      "왜 붙어 있지"라는 질문만 만듭니다.
+    """
+    response = await call_next(request)
+    headers = response.headers
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("X-Frame-Options", "DENY")
+    headers.setdefault("Referrer-Policy", "same-origin")
+    path = request.url.path
+    if path.startswith("/api/auth") or path.startswith("/api/keys"):
+        headers["Cache-Control"] = "no-store"
+    if security.behind_proxy() and \
+            request.headers.get("x-forwarded-proto", "") == "https":
+        headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
+
+
+def _too_many(retry_after: int) -> JSONResponse:
+    """429 — 레이트 리밋 초과. Retry-After 로 기다릴 시간을 알려줍니다."""
+    return JSONResponse(
+        status_code=429,
+        content={"error": f"시도가 너무 잦습니다. {retry_after}초 후 다시 시도해 주세요."},
+        headers={"Retry-After": str(retry_after)})
 
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -161,7 +212,11 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/api/auth/register")
-def auth_register(req: RegisterRequest):
+def auth_register(req: RegisterRequest, request: Request):
+    # 가입 남발 방지 — 계정을 무한히 만들어 DB 를 불리는 경로를 막습니다
+    retry = security.throttle(f"register:{security.client_ip(request)}", 10, 3600)
+    if retry:
+        return _too_many(retry)
     result = users.register(req.username, req.password, req.display_name)
     if not result["ok"]:
         return JSONResponse(status_code=400, content=result)
@@ -172,9 +227,21 @@ def auth_register(req: RegisterRequest):
 
 
 @app.post("/api/auth/login")
-def auth_login(req: LoginRequest):
+def auth_login(req: LoginRequest, request: Request):
+    # 무차별 대입 방어 — IP 당 시도 횟수와 계정당 **실패** 횟수를 따로 셉니다.
+    # IP 만 세면 봇넷(여러 IP)에 뚫리고, 계정만 세면 남의 아이디를 잠그는
+    # 괴롭힘이 되기 때문에 둘을 같이 둡니다.
+    retry = security.throttle(f"login:{security.client_ip(request)}", 10, 300)
+    if retry:
+        return _too_many(retry)
+    fail_key = f"login-fail:{(req.username or '').strip().lower()}"
+    retry = security.over_limit(fail_key, 15, 900)
+    if retry:
+        return _too_many(retry)
+
     result = users.login(req.username, req.password)
     if not result["ok"]:
+        security.record(fail_key)
         return JSONResponse(status_code=401, content=result)
     paper.ensure_account(result["user"]["id"])
     return result
@@ -205,6 +272,11 @@ class PasswordChange(BaseModel):
 @app.post("/api/auth/password")
 def auth_change_password(req: PasswordChange, request: Request):
     user = require_user(request)
+    # 로그인된 세션이라도 현재 비밀번호를 무한히 찍어볼 수는 없어야 합니다
+    # (토큰만 훔친 공격자가 비밀번호까지 알아내 계정을 완전히 뺏는 경로)
+    retry = security.throttle(f"pwchange:{user['id']}", 5, 900)
+    if retry:
+        return _too_many(retry)
     result = users.change_password(user["id"], req.current_password, req.new_password)
     if not result["ok"]:
         return JSONResponse(status_code=400, content=result)
@@ -236,6 +308,11 @@ class UserKeys(BaseModel):
 def user_keys_save(req: UserKeys, request: Request):
     """키 저장. 빈 값은 그 키 삭제로 취급합니다 (입력창 비우고 저장 = 삭제)."""
     user = require_user(request)
+    # 정상 사용은 분당 몇 번이면 충분합니다 — 훔친 토큰으로 암호화 저장소를
+    # 두드리며 상태를 탐색하는 것을 늦춥니다
+    retry = security.throttle(f"keys:{user['id']}", 30, 600)
+    if retry:
+        return _too_many(retry)
     try:
         result = user_credentials.save_keys(user["id"], req.values)
     except user_credentials.EncryptionUnavailable as exc:
@@ -316,6 +393,10 @@ def auth_firebase_session(req: FirebaseSession, request: Request):
     구분해 다루고, 그 외 상태코드는 error 문자열을 그대로 띄웁니다. 어느 쪽이든
     사용자에게는 사유가 그대로 보입니다.
     """
+    # 토큰 위조 시도(서명 검증)는 CPU 를 쓰는 작업이라 횟수를 제한합니다
+    retry = security.throttle(f"fb-session:{security.client_ip(request)}", 20, 300)
+    if retry:
+        return _too_many(retry)
     try:
         profile = firebase_auth.verify_id_token(req.id_token)
         result = accounts.upsert_google_account(profile)
@@ -429,6 +510,11 @@ def auth_google_start(request: Request, next: str = "/", origin: str = ""):
     프록시로 대신 보냅니다. 그래서 Origin·Referer 헤더가 여기까지 오지 않습니다.
     프론트엔드가 window.location.origin 을 직접 실어 보내야 합니다.
     """
+    # 호출마다 Mongo 에 oauth_state 문서가 하나 생깁니다 — 쌓기 공격 방지
+    retry = security.throttle(f"oauth-start:{security.client_ip(request)}", 30, 300)
+    if retry:
+        return _too_many(retry)
+
     state_info = _google_status()
     if not state_info["configured"]:
         return JSONResponse(status_code=503,
@@ -519,12 +605,16 @@ class GoogleExchange(BaseModel):
 
 
 @app.post("/api/auth/google/exchange")
-def auth_google_exchange(req: GoogleExchange):
+def auth_google_exchange(req: GoogleExchange, request: Request):
     """핸드오프 코드를 세션 토큰으로 바꿔줍니다 (1회용).
 
     같은 코드로 두 번 오면 두 번째는 실패합니다 — Mongo 의 find_one_and_delete 로
     원자적으로 소비하기 때문입니다.
     """
+    # 핸드오프 코드는 60초 수명이지만, 그 사이 무작위 추측을 막습니다
+    retry = security.throttle(f"handoff:{security.client_ip(request)}", 20, 300)
+    if retry:
+        return _too_many(retry)
     try:
         token = accounts.consume_handoff(req.handoff)
     except accounts.AccountsUnavailable as exc:
@@ -2047,6 +2137,25 @@ def autotrade_status(request: Request, lite: int = 0):
     """콘솔 상태. lite=1 이면 시세·잔고 조회를 건너뜁니다 (포지션 없는 페이지용)."""
     user = require_user(request)
     return _autotrade_snapshot(user["id"], include_positions=not lite)
+
+
+@app.get("/api/autotrade/lessons")
+def autotrade_lessons(request: Request, limit: int = 50):
+    """손실 학습 원장 — 매매별 복기 결론과, 다음 신호에 적용될 감쇠표.
+
+    lessons 는 닫힌 매매(이긴 것 포함 — 집계 공정성)이고, penalties 가
+    "지금 배워서 적용 중(soft) 또는 적용 예정(observe)"인 태그별 감쇠입니다.
+    """
+    user = require_user(request)
+    cfg = at_store.get_config(user["id"])
+    mode = cfg.get("mode", "paper")
+    return {
+        "ok": True, "mode": mode,
+        "learn_mode": lessons.mode_of(cfg),
+        "penalties": lessons.build_penalties(user["id"], mode, cfg),
+        "lessons": at_store.lessons_closed(user["id"], mode,
+                                           limit=max(1, min(int(limit), 400))),
+    }
 
 
 @app.post("/api/autotrade/config")

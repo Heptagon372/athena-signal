@@ -85,6 +85,8 @@ TR_CANDIDATES = {
     "overseas_buyable_mock": ["VTTS3007R"],
     "overseas_executions_real": ["TTTS3035R"],
     "overseas_executions_mock": ["VTTS3035R"],
+    "overseas_cancel_real": ["TTTT1004U"],
+    "overseas_cancel_mock": ["VTTT1004U"],
     # 시세 (주문 아님)
     "deriv_quote": ["FHMIF10000000"],
     "deriv_chart": ["FHKIF03020100"],
@@ -109,7 +111,22 @@ _balance_lock = threading.Lock()
 BALANCE_TTL = 20.0
 
 
+def _cache_scope() -> str:
+    """잔고 캐시의 계정 구분자 — 사용자 오버레이가 바뀌면 값도 바뀝니다.
+
+    함수 이름만으로 캐시하면 한 프로세스에서 여러 사용자의 엔진·요청이 돌 때
+    TTL 안에 늦게 조회한 쪽이 **앞 사람 계좌의 잔고**를 그대로 받습니다.
+    화면 표시가 섞이는 것으로 끝나지 않고, 주문 수량이 남의 현금으로
+    계산됩니다. 접근토큰을 앱키별로 캐시하는 것(kis_token_<해시>.json)과
+    같은 이유로, 잔고도 계좌별로 캐시해야 합니다.
+    """
+    acc = account()
+    server = "mock" if kis_client.is_mock() else "real"
+    return f"{server}:{acc[0]}-{acc[1]}" if acc else f"{server}:noacct"
+
+
 def _balance_cached(key: str, fetch) -> dict:
+    key = f"{_cache_scope()}|{key}"
     now = time.time()
     with _balance_lock:
         hit = _balance_cache.get(key)
@@ -145,6 +162,7 @@ OVERSEAS_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 OVERSEAS_PRESENT_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 OVERSEAS_BUYABLE_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 OVERSEAS_EXECUTIONS_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+OVERSEAS_CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 
 
 def _tr_list(op: str) -> list[str]:
@@ -1135,6 +1153,40 @@ def place_overseas_order(ticker: str, side: str, quantity: float,
     }
     op = _op("overseas_buy") if side == "buy" else _op("overseas_sell")
     res = _post(op, OVERSEAS_ORDER_PATH, body)
+    if not res.get("ok"):
+        return res
+    out = res.get("output") or {}
+    return {"ok": True, "broker_order_id": out.get("ODNO", ""),
+            "message": res.get("message", ""), "raw": res.get("raw")}
+
+
+def cancel_overseas_order(ticker: str, order_id: str, quantity: float,
+                          exchange: str = "NASD") -> dict:
+    """미국 주식 미체결 주문 취소.
+
+    국내 취소(cancel_stock_order)와 API 가 완전히 다릅니다 — 미국 주문을 국내
+    경로로 보내면 국내 미체결 목록에서 못 찾아 "이미 처리된 주문"으로만 끝나고,
+    그 주문은 걷을 방법 없이 미결제로 남습니다 (실측: DBGI 청산 주문이 이렇게
+    나흘을 pending 으로 버텼습니다).
+    """
+    if not live_enabled():
+        return {"ok": False, "error": "실전 주문이 잠겨 있습니다 (KIS_LIVE_TRADING=1 필요)."}
+    acc = account()
+    if not acc:
+        return {"ok": False, "error": "KIS_ACCOUNT 가 설정되지 않았습니다."}
+    cano, prdt = acc
+    body = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "OVRS_EXCG_CD": exchange,
+        "PDNO": ticker,
+        "ORGN_ODNO": str(order_id),
+        "RVSE_CNCL_DVSN_CD": "02",            # 02 = 취소 (01 은 정정)
+        "ORD_QTY": str(int(quantity)),
+        "OVRS_ORD_UNPR": "0",                 # 취소는 가격이 없습니다
+        "ORD_SVR_DVSN_CD": "0",
+    }
+    res = _post(_op("overseas_cancel"), OVERSEAS_CANCEL_PATH, body)
     if not res.get("ok"):
         return res
     out = res.get("output") or {}

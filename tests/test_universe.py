@@ -202,6 +202,30 @@ def test_kr_universes():
           len(found) == 0 and bool(found.error), found.error)
 
 
+def test_index_member_codes():
+    """범위 순환의 모집단 — 지수 '전체' 명단이 실제로 전체인가.
+
+    코스피200을 골랐는데 명단이 30개뿐이면, 화면은 "범위 전체 커버 완료"라고
+    말하면서 실제로는 30종목만 평가하던 버그로 돌아갑니다.
+    """
+    print("\n[지수 전체 명단]")
+    check("지원하지 않는 범위는 빈 목록", universe.index_member_codes("KR_SEMI") == [])
+    check("모르는 키도 빈 목록", universe.index_member_codes("NOPE") == [])
+
+    k200 = universe.index_member_codes("KOSPI200", ["KOSPI"])
+    check("코스피200 이 190종목 이상", len(k200) >= 190, f"{len(k200)}종목")
+    # 신형 코드('0126Z0' 류)는 알파벳이 섞입니다 — 6자리 영숫자면 정상
+    check("종목코드 6자리 영숫자", all(len(c) == 6 and c.isalnum() for c in k200),
+          str([c for c in k200 if not (len(c) == 6 and c.isalnum())]))
+    check("중복 없음", len(set(k200)) == len(k200))
+    check("삼성전자가 있다", "005930" in k200)
+
+    kq150 = universe.index_member_codes("KOSDAQ150", ["KOSDAQ"])
+    check("코스닥150 이 140종목 이상", len(kq150) >= 140, f"{len(kq150)}종목")
+    check("코스피 시장 선택이면 코스닥150은 비어 있다",
+          universe.index_member_codes("KOSDAQ150", ["KOSPI"]) == [])
+
+
 def test_us_universes():
     print("\n[미국 범위 — 실제 조회]")
     found = universe.members("NASDAQ100", ["NASDAQ"])
@@ -275,6 +299,7 @@ def main():
     test_rotation_window()
     if not offline:
         test_scope_mismatch()
+        test_index_member_codes()
         test_kr_universes()
         test_us_universes()
         test_scan_stays_in_scope()

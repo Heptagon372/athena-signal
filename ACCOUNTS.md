@@ -672,8 +672,9 @@ python tests/test_google_auth.py      # 예전 OAuth 폴백 — 80개 검사
   userinfo 교차 확인으로 둡니다.
 - **리프레시 토큰 보관** — 구글 API 를 대신 호출할 일이 없어 `access_token` 을 저장하지
   않습니다. 로그인 확인용으로 한 번 쓰고 버립니다. 저장 안 하는 게 유출면이 적습니다.
-- **HTTPS·공개 배포** — 현재 전제는 localhost 입니다. 외부에 열려면 도메인·TLS·
-  `Secure`/`HttpOnly` 쿠키·리디렉션 URI 재등록이 별도 작업으로 필요합니다.
+- ~~**HTTPS·공개 배포**~~ — **DEPLOY.md 로 옮겨졌습니다.** 오라클 서버 + nginx/TLS
+  절차, 레이트 리밋(`security.py`), 공개 서버 모드(`ATHENA_PUBLIC_ORIGIN` — 로컬
+  계정도 KIS 주문에 자기 키 필수)가 거기 있습니다.
 - 다른 소셜 로그인, 계정 삭제/이메일 변경 UI, 역할·권한 분리.
 
 ---

@@ -228,13 +228,31 @@ def load_keys(user_id: int) -> dict:
     return out
 
 
+def must_use_own_keys(user_id: int) -> bool:
+    """KIS 주문에 자기 키·자기 계좌를 반드시 써야 하는 계정인가.
+
+    구글 계정(user_id >= USER_ID_OFFSET)은 항상 그렇습니다 — 외부 사용자일 수
+    있습니다. 공개 서버 모드(ATHENA_PUBLIC_ORIGIN 설정)에서는 **로컬 계정도**
+    그렇습니다: 아이디/비번 가입이 누구에게나 열려 있어서, 서버 키 폴백을 두면
+    방금 가입한 외부인의 자동매매가 서버 주인의 계좌로 주문을 냅니다.
+
+    로컬 전용 서버(공개 오리진 미설정)의 로컬 계정만 지금까지처럼 서버 키를
+    씁니다 — 데스크톱 사용자의 기존 동작을 깨지 않습니다.
+    """
+    if user_id >= accounts.USER_ID_OFFSET:
+        return True
+    import security
+    return security.public_mode()
+
+
 def overlay_for(user_id: int) -> dict:
     """credentials.use_user() / attach_user() 에 넣을 오버레이를 조립합니다.
 
-    로컬 계정 (user_id < USER_ID_OFFSET — 이 PC 에서 만든 계정)
+    서버 키를 써도 되는 계정 (must_use_own_keys() 거짓 — 로컬 전용 서버의
+    로컬 계정)
         저장한 키만 겹칩니다. 나머지는 서버 키로 폴백 — 기존 동작 그대로.
 
-    구글 계정 (외부 사용자일 수 있음)
+    자기 키가 필수인 계정 (구글 계정, 공개 서버의 모든 계정)
         거래 설정 세 가지에 **안전 기본값을 명시적으로** 채웁니다. 오버레이에
         없으면 credentials.get() 이 서버 값으로 폴백하는데, 서버가 실전
         (KIS_LIVE_TRADING=1)이면 그 스위치를 사용자가 물려받게 됩니다 —
@@ -245,7 +263,7 @@ def overlay_for(user_id: int) -> dict:
         따로 막습니다.
     """
     values = load_keys(user_id)
-    if user_id >= accounts.USER_ID_OFFSET:
+    if must_use_own_keys(user_id):
         values.setdefault("KIS_MOCK", "1")            # 기본은 모의 서버
         values.setdefault("KIS_LIVE_TRADING", "0")    # 실거래는 명시적으로만
         # 파생 계좌가 서버 것으로 폴백하면 안 됩니다. 빈 값이면 kis_trading 이
@@ -258,9 +276,9 @@ def overlay_for(user_id: int) -> dict:
 def has_own_kis_keys(user_id: int) -> bool:
     """이 계정이 자기 KIS 키·계좌를 저장해 뒀는가 — 실거래 게이트의 근거.
 
-    구글 계정(user_id >= USER_ID_OFFSET)은 이게 참일 때만 KIS 주문을 낼 수
-    있습니다. 서버 키로 폴백시키면 아무 사용자의 자동매매가 서버 주인의
-    실계좌로 주문을 내게 됩니다.
+    must_use_own_keys() 가 참인 계정(구글 계정, 공개 서버의 모든 계정)은 이게
+    참일 때만 KIS 주문을 낼 수 있습니다. 서버 키로 폴백시키면 아무 사용자의
+    자동매매가 서버 주인의 실계좌로 주문을 내게 됩니다.
     """
     keys = load_keys(user_id)
     return bool(keys.get("KIS_APP_KEY") and keys.get("KIS_APP_SECRET")

@@ -17,13 +17,19 @@ export function getToken() {
   }
 }
 
+// https 로 서비스될 때는 Secure — 세션 토큰이 평문 http 로 실려 나가면 안 됩니다
+function cookieFlags() {
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  return `path=/; SameSite=Lax${secure}`;
+}
+
 export function setToken(token) {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(TOKEN_KEY, token);
   } catch {}
   // 미들웨어가 읽을 수 있도록 쿠키에도 (30일)
-  document.cookie = `${TOKEN_KEY}=${token}; path=/; max-age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+  document.cookie = `${TOKEN_KEY}=${token}; max-age=${60 * 60 * 24 * 30}; ${cookieFlags()}`;
 }
 
 export function clearToken() {
@@ -31,7 +37,7 @@ export function clearToken() {
   try {
     window.localStorage.removeItem(TOKEN_KEY);
   } catch {}
-  document.cookie = `${TOKEN_KEY}=; path=/; max-age=0; SameSite=Lax`;
+  document.cookie = `${TOKEN_KEY}=; max-age=0; ${cookieFlags()}`;
 }
 
 /** 종목이 실존하지 않을 때 서버가 돌려주는 404 를 구분하기 위한 에러 */

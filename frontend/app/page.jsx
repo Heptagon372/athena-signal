@@ -232,6 +232,22 @@ export default function AnalysisPage() {
 
   return (
     <>
+      {/* 시네마틱 인트로 */}
+      <section className="section hero-film">
+        <video autoPlay muted loop playsInline preload="metadata" aria-hidden="true" tabIndex={-1}>
+          {/* web/assets 의 원본 한 벌을 씁니다 — /static 은 next.config 와 nginx 가 백엔드로 넘깁니다. */}
+          <source src="/static/assets/hero-owl.mp4" type="video/mp4" />
+        </video>
+        <div className="film-scrim" />
+        <div className="film-copy">
+          <div className="eyebrow">밤에도 눈을 뜬다</div>
+          <div className="film-title">ATHENA <em>SIGNAL</em></div>
+          <p className="film-sub">
+            코스피 · 코스닥 · 미국 &nbsp;|&nbsp; 지표 11종 · 뉴스 감성 · 종목토론방 여론을 하나의 확률로
+          </p>
+        </div>
+      </section>
+
       {/* 검색 */}
       <section className="section search-section">
         <form onSubmit={submit} className="search-form">

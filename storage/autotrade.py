@@ -101,6 +101,16 @@ DEFAULT_CONFIG = {
     "protect_lowprofit_min_trades": 3,
     "protect_lowprofit_stop_min": 120,
 
+    # 손실 학습 (engine/lessons.py) — 청산된 매매를 복기해 손실 원인을 추론하고,
+    # 같은 컨텍스트(태그)의 다음 신호를 감쇠합니다.
+    # off | observe(기록·복기만, 점수 유지) | soft(점수 감쇠까지)
+    "learn_mode": "observe",
+    "learn_half_life_days": 14.0,     # 최근 매매에 더 큰 가중 — 이 일수마다 절반
+    "learn_min_trades": 3,            # 태그당 유효 표본 하한 (우연 몇 번에 반응 금지)
+    "learn_scale_pct": 3.0,           # 태그 평균 손실 -3% 에서 감쇠가 최대에 도달
+    "learn_max_penalty": 0.10,        # 태그 하나가 점수에서 뺄 수 있는 최대치
+    "learn_total_cap": 0.25,          # 감쇠 총합 상한 — 학습이 신호를 통째로 죽이지 않게
+
     # 유니버스에 없는 종목(= 내가 직접 산 주식)까지 자동으로 관리할지.
     # 기본은 False — 자동매매가 기존 보유분을 마음대로 파는 것을 막습니다.
     "manage_only_universe": True,
@@ -351,6 +361,29 @@ def init():
             trade_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, mode, trade_date)
         )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS at_lessons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'paper',
+            symbol TEXT NOT NULL,
+            name TEXT DEFAULT '',
+            side TEXT DEFAULT 'long',
+            status TEXT NOT NULL DEFAULT 'open',  -- open | closed
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            quantity REAL,
+            pnl_pct REAL,                 -- NULL = 손익을 모름 (집계에서 제외)
+            realized_krw REAL,
+            exit_reason TEXT DEFAULT '',
+            cause TEXT DEFAULT '',        -- 손실 원인 추론 결론 (이긴 매매는 빈 값)
+            tags TEXT DEFAULT '[]',       -- 진입 컨텍스트 태그 (JSON 배열)
+            context TEXT                  -- 진입 신호 스냅샷 (JSON)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_at_lessons_user "
+                     "ON at_lessons(user_id, mode, status, id DESC)")
         conn.execute("""
         CREATE TABLE IF NOT EXISTS at_account (
             user_id INTEGER NOT NULL,
@@ -1002,6 +1035,91 @@ def get_recommendations(user_id: int) -> list[dict]:
                     pass
         r["picked"] = bool(r["picked"])
     return rows
+
+
+# ---------------------------------------------------------------------------
+# 손실 학습 원장 (engine/lessons.py 가 씁니다)
+# ---------------------------------------------------------------------------
+
+def lesson_open(user_id: int, mode: str, symbol: str, name: str = "",
+                side: str = "long", entry_price: float = None,
+                quantity: float = None, context: dict = None,
+                tags: list = None) -> int | None:
+    """진입 컨텍스트를 기록합니다. 같은 종목의 열린 교훈이 이미 있으면
+    새로 만들지 않습니다 — 추가 매수·분할 차수는 한 매매의 일부입니다."""
+    init()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM at_lessons WHERE user_id = ? AND mode = ? "
+            "AND symbol = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (user_id, mode, symbol)).fetchone()
+        if row:
+            return int(row["id"])
+        cursor = conn.execute(
+            "INSERT INTO at_lessons (user_id, mode, symbol, name, side, status, "
+            "opened_at, entry_price, quantity, tags, context) "
+            "VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            (user_id, mode, symbol, name or "", side or "long",
+             datetime.now().isoformat(), entry_price, quantity,
+             json.dumps(tags or [], ensure_ascii=False),
+             json.dumps(context or {}, ensure_ascii=False)))
+        return cursor.lastrowid
+
+
+def _lesson_row(row) -> dict:
+    item = dict(row)
+    for key in ("tags", "context"):
+        try:
+            item[key] = json.loads(item.get(key) or ("[]" if key == "tags" else "{}"))
+        except (json.JSONDecodeError, TypeError):
+            item[key] = [] if key == "tags" else {}
+    return item
+
+
+def lesson_find_open(user_id: int, mode: str, symbol: str) -> dict | None:
+    """이 종목의 열린 교훈 — 청산이 손익을 붙일 대상입니다."""
+    init()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM at_lessons WHERE user_id = ? AND mode = ? "
+            "AND symbol = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (user_id, mode, symbol)).fetchone()
+    return _lesson_row(row) if row else None
+
+
+def lesson_close(lesson_id: int, exit_price: float = None,
+                 exit_reason: str = "", realized_krw: float = None,
+                 pnl_pct: float = None, cause: str = ""):
+    init()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE at_lessons SET status = 'closed', closed_at = ?, "
+            "exit_price = ?, exit_reason = ?, realized_krw = ?, "
+            "pnl_pct = ?, cause = ? WHERE id = ?",
+            (datetime.now().isoformat(), exit_price, exit_reason or "",
+             realized_krw, pnl_pct, cause or "", lesson_id))
+
+
+def lessons_closed(user_id: int, mode: str, limit: int = 400) -> list[dict]:
+    """닫힌 교훈들 (최신순) — 태그별 기대수익 집계의 입력입니다."""
+    init()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM at_lessons WHERE user_id = ? AND mode = ? "
+            "AND status = 'closed' ORDER BY id DESC LIMIT ?",
+            (user_id, mode, int(limit))).fetchall()
+    return [_lesson_row(r) for r in rows]
+
+
+def lessons_purge(user_id: int, mode: str = None):
+    """이 사용자의 교훈 기록 삭제 — 테스트 정리와 초기화용."""
+    init()
+    with _conn() as conn:
+        if mode:
+            conn.execute("DELETE FROM at_lessons WHERE user_id = ? AND mode = ?",
+                         (user_id, mode))
+        else:
+            conn.execute("DELETE FROM at_lessons WHERE user_id = ?", (user_id,))
 
 
 def touch_daily(user_id: int, mode: str, total_value: float,

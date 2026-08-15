@@ -804,6 +804,34 @@ def test_order_lifecycle():
           record["status"] == "pending" and record["filled_quantity"] == 0,
           "모르면 그대로 둡니다")
 
+    # --- 조회는 되는데 내역에 없는 채 하루가 지나면 결말 미상으로 닫는다 ---
+    # (실측: 미국 청산 주문이 내역 조회 창 밖으로 밀려나 나흘을 pending 으로
+    #  버티며 매 회전 오류를 찍고, 그 종목의 재동기화 정리까지 막았습니다)
+    day_old = (datetime.now() - timedelta(days=2)).isoformat()
+    lost_id = _new_order(user, "LOST01", broker_order_id="L1", created_at=day_old)
+    brk3 = StubBroker()
+    brk3.status_map["L1"] = broker.OrderStatus(known=False, searched=True,
+                                               detail="주문 내역에서 찾지 못했습니다.")
+    autotrade._settle_open_orders(user, cfg, brk3, result)
+    record = next(o for o in store.get_orders(user, 30) if o["id"] == lost_id)
+    check("체결", "하루 넘게 내역에 없으면 결말 미상(lost)으로 닫힘",
+          record["status"] == "lost" and bool(record["settled_at"]),
+          f"{record['status']} / {record['reason']}")
+    check("체결", "결말 미상 주문은 더 이상 종목을 묶지 않음",
+          not store.has_open_order(user, "mock", "LOST01"))
+
+    # --- 조회 실패(모름)는 오래돼도 결말을 단정하지 않는다 ---
+    fail_id = _new_order(user, "FAIL01", broker_order_id="F1", created_at=day_old)
+    brk4 = StubBroker()
+    brk4.status_map["F1"] = broker.OrderStatus(known=False, searched=False,
+                                               detail="조회 실패")
+    autotrade._settle_open_orders(user, cfg, brk4, result)
+    record = next(o for o in store.get_orders(user, 30) if o["id"] == fail_id)
+    check("체결", "조회 실패는 오래돼도 결말을 단정하지 않음",
+          record["status"] == "pending", record["status"])
+    with store._conn() as conn:
+        conn.execute("DELETE FROM at_orders WHERE id = ?", (fail_id,))
+
     # --- 미체결 타임아웃 → 자동 취소 ---
     old = (datetime.now() - timedelta(seconds=600)).isoformat()
     stale_id = _new_order(user, "OLD01", broker_order_id="B9", created_at=old)

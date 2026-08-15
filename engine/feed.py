@@ -217,15 +217,24 @@ def is_tradable_now(inst: Instrument, regular_only: bool = True) -> tuple[bool, 
     return True, status["label"]
 
 
-# 신규 진입을 허용하는 세션 — **프리마켓과 정규장뿐입니다.**
+# 신규 진입을 허용하는 세션 — 기본은 **프리마켓과 정규장뿐입니다.**
 #
 # 애프터마켓(미국)과 시간외 단일가(한국)를 뺀 이유: 호가가 얇아 스프레드가
 # 벌어지고, 한국 시간외는 10분 단위 단일가라 낸 가격에 체결된다는 보장이
 # 없습니다. 그 구간에 새로 들어가면 시작부터 비용을 지고 갑니다.
+# 예외: 미국 애프터마켓은 us_extended_hours 를 **켠 경우에만** 신규 진입을
+# 허용합니다 — 설정 라벨("미국 프리·애프터마켓 허용")이 약속하는 동작이고,
+# 스프레드 비용을 감수하겠다는 명시적 선택이므로 기본값은 꺼짐입니다.
 # 반대로 **청산은 이 제한을 받지 않습니다** — 못 들어가는 것은 기회 손실이지만
 # 못 나오는 것은 손실입니다 (check_exit 는 그대로 is_tradable_now 를 씁니다).
 ENTRY_SESSIONS = ("REGULAR", "PRE", "PRE_AUCTION")
 _PRE_SESSIONS = ("PRE", "PRE_AUCTION")
+
+
+def _after_entry_allowed(inst: Instrument, cfg: dict, session: str) -> bool:
+    """미국 애프터마켓 신규 진입 — 확장 시간 스위치를 켠 경우에만."""
+    return (session == "AFTER" and inst.market == "US"
+            and bool((cfg or {}).get("us_extended_hours")))
 
 
 def entry_allowed_now(inst: Instrument, cfg: dict) -> tuple[bool, str, str]:
@@ -240,7 +249,7 @@ def entry_allowed_now(inst: Instrument, cfg: dict) -> tuple[bool, str, str]:
     session = status.get("session", "")
     label = status.get("label", "")
 
-    if session not in ENTRY_SESSIONS:
+    if session not in ENTRY_SESSIONS and not _after_entry_allowed(inst, cfg, session):
         return False, f"신규 진입 시간이 아닙니다 ({label})", session
 
     if session in _PRE_SESSIONS and not _pre_market_allowed(inst, cfg):

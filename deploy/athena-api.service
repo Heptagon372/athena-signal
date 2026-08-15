@@ -1,0 +1,37 @@
+# 아테나 시그널 — 백엔드(FastAPI) systemd 유닛
+# 설치: sudo cp deploy/athena-api.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now athena-api
+# 로그: journalctl -u athena-api -f
+
+[Unit]
+Description=Athena Signal API (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=athena
+Group=athena
+WorkingDirectory=/opt/athena-signal
+
+# ATHENA_BEHIND_PROXY=1 — nginx 가 덮어쓴 X-Forwarded-For 를 신뢰합니다
+# (security.py). nginx 없이 이 값을 켜면 레이트 리밋이 우회되니, 켜는 곳은
+# 이 파일 하나여야 합니다.
+Environment=ATHENA_BEHIND_PROXY=1
+Environment=PYTHONUNBUFFERED=1
+
+# 127.0.0.1 에만 묶습니다 — 외부에서는 nginx(443)를 거치지 않고 닿을 수 없습니다
+ExecStart=/opt/athena-signal/.venv/bin/uvicorn api:app \
+    --host 127.0.0.1 --port 8000 --no-server-header
+
+Restart=always
+RestartSec=3
+
+# 뚫려도 번지지 않게 — 프로세스 권한 축소
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

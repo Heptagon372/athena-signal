@@ -43,7 +43,9 @@
   function saveToken(t) {
     TOKEN = t;
     try { localStorage.setItem("athena_token", t); } catch {}
-    document.cookie = `athena_token=${t}; path=/; max-age=${60 * 60 * 24 * 30}; SameSite=Lax`;
+    // https 로 서비스될 때는 Secure — 토큰이 평문 http 로 새지 않게
+    const secure = location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `athena_token=${t}; path=/; max-age=${60 * 60 * 24 * 30}; SameSite=Lax${secure}`;
   }
 
   // ---- 서버 호출 ----

@@ -410,7 +410,7 @@ window.PAGE = {
            ["OPTION","옵션","프리미엄 호가 · KIS 필요"]],
   ACTION: {buy:"매수", sell:"매도", close:"청산", open_long:"롱진입", open_short:"숏진입"},
   STATUS: {filled:"체결", partial:"부분체결", pending:"대기", rejected:"거부",
-           cancelled:"취소됨", cancel_requested:"취소요청"},
+           cancelled:"취소됨", cancel_requested:"취소요청", lost:"결말미상"},
 
   hint() {
     AT.$("saveHint").textContent =
@@ -832,6 +832,9 @@ const SLIDES = {
     const opened = (st.opened_at || pos.opened_at || "").replace("T", " ").slice(0, 16);
     const pnlPct = pos.avg_price && pos.current_price
       ? ((pos.current_price - pos.avg_price) / pos.avg_price * 100 * (pos.side === "short" ? -1 : 1)) : null;
+    // 분할 포지션은 전량 목표가를 0으로 비워 둡니다(익절은 차수별로 따로 돕니다).
+    // state.target_price 만 보면 "—"가 되므로, 차수별 목표가를 대신 보여줍니다.
+    const sp = (d.position || pos || {}).split;
 
     const stats = [
       ["수량", A.num(pos.quantity, 4)],
@@ -840,7 +843,11 @@ const SLIDES = {
       ["평가손익", `<span class="${A.sign(pos.unrealized_pnl)}">${A.won(pos.unrealized_pnl)}`
         + (pnlPct == null ? "" : ` (${A.pct(pnlPct)})`) + "</span>"],
       ["손절선", st.stop_price ? A.num(st.stop_price) : "—"],
-      ["목표가", st.target_price ? A.num(st.target_price) : "—"],
+      [sp ? `목표가 (${sp.count}/${sp.total}차)` : "목표가",
+       sp && sp.tranches?.length
+        ? sp.tranches.map((t) => `${t.n}차 ${t.target_price ? A.num(t.target_price) : "—"}`).join(" · ")
+        : (st.target_price ? A.num(st.target_price) : "—")],
+      ...(sp ? [["다음 매수", sp.next_trigger ? A.num(sp.next_trigger) : "— (차수 소진)"]] : []),
       ["진입 시각", opened || "—"],
     ];
 
@@ -854,7 +861,8 @@ const SLIDES = {
           <span><i class="lg" style="background:var(--down)"></i>▼ 매도 체결</span>
           <span><i class="lg" style="background:var(--gold)"></i>진입가</span>
           <span><i class="lg" style="background:#d24b3a;opacity:.7"></i>손절선</span>
-          <span><i class="lg" style="background:var(--olive)"></i>목표가</span>
+          <span><i class="lg" style="background:var(--olive)"></i>${sp ? "차수별 목표가" : "목표가"}</span>
+          ${sp ? '<span><i class="lg" style="background:#3f7fd0"></i>다음 매수</span>' : ""}
           <span class="muted">MA20 · MA60 · 볼린저밴드 — 최근 90일</span>
         </div>
         <canvas id="slideChart" height="360"></canvas>
@@ -962,11 +970,14 @@ const SLIDES = {
     g.clearRect(0, 0, W, H);
 
     const st = d.state || {}, pos = d.position || {};
+    const sp = pos.split || {};
+    const spTargets = (sp.tranches || []).map((t) => Number(t.target_price)).filter((v) => v > 0);
     const pad = {l: 8, r: 62, t: 8, b: 22};
     const n = closes.length;
 
     // y 범위 — 봉뿐 아니라 손절·목표·진입선도 화면 안에 들어와야 합니다
-    const extra = [st.stop_price, st.target_price, st.entry_price || pos.avg_price]
+    const extra = [st.stop_price, st.target_price, st.entry_price || pos.avg_price,
+                   sp.next_trigger, ...spTargets]
       .filter((v) => v != null && v > 0).map(Number);
     let lo = Math.min(...(ch.low || closes).filter((v) => v != null), ...extra);
     let hi = Math.max(...(ch.high || closes).filter((v) => v != null), ...extra);
@@ -1048,7 +1059,15 @@ const SLIDES = {
     };
     hline(st.entry_price || pos.avg_price, "#c9a227", "진입", [2, 3]);
     hline(st.stop_price, "#d24b3a", "손절");
-    hline(st.target_price, "#74815b", "목표");
+    if (spTargets.length) {
+      // 분할 포지션 — 전량 목표가(0) 대신 차수별 목표선과 다음 매수 트리거를 긋습니다
+      (sp.tranches || []).forEach((t) => {
+        if (Number(t.target_price) > 0) hline(t.target_price, "#74815b", `${t.n}차 목표`);
+      });
+      hline(sp.next_trigger, "#3f7fd0", "다음 매수", [2, 3]);
+    } else {
+      hline(st.target_price, "#74815b", "목표");
+    }
 
     // 매수/매도 체결 마커 — 서버가 체결 기록으로 확인한 지점만 찍습니다
     const fills = (d.fills || []).filter((f) => f.bar_index != null);

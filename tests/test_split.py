@@ -268,6 +268,87 @@ def test_ledger_drift():
     store.clear_position_state(TEST_USER, "paper", key)
 
 
+def test_adopt():
+    """원장 없는 보유 포지션(재동기화 복원 등)이 분할 관리로 편입되는가.
+
+    실계좌에서 재동기화로 복원된 종목은 원장이 없어, 분할을 켜도 매 회전
+    "분할로 잡은 포지션이 아닙니다"로 빠졌습니다. 편입되면 보유 전량이
+    1차가 되고, 손절선이 분할 규칙(마지막 차수 아래)으로 다시 잡혀야 합니다.
+    """
+    print("\n[원장 없는 포지션 편입]")
+    from engine import autotrade
+    from storage import autotrade as store
+    from test_autotrade import TEST_USER
+
+    key = "ADOPT01"
+
+    class Pos:
+        pass
+    pos = Pos()
+    pos.key, pos.name, pos.side = key, "편입테스트", "long"
+    pos.quantity, pos.avg_price = 4.0, 50_000.0
+
+    conf = cfg(split_tranches=5, split_buy_drop_pct=5.0, split_final_stop_pct=7.0)
+    saved_resolve = instruments.try_resolve
+    instruments.try_resolve = lambda q: STOCK
+    try:
+        # 재동기화로 복원된 모양 그대로 — splits 는 NULL
+        store.clear_position_state(TEST_USER, "paper", key)
+        store.upsert_position_state(TEST_USER, "paper", key, side="long",
+                                    entry_price=50_000, quantity=4,
+                                    stop_price=48_000, target_price=55_000)
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        result = {"reconciled": []}
+        autotrade._adopt_split(TEST_USER, conf, "paper", pos, state, result)
+
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        led = split.load(state.get("splits"))
+        check("원장이 생긴다", led.count == 1, f"{led.count}차")
+        check("보유 전량이 1차가 된다",
+              led.count == 1 and led.tranches[0].quantity == 4.0
+              and led.tranches[0].price == 50_000.0,
+              str([t.to_dict() for t in led.tranches]))
+        check("나머지 차수도 같은 크기로 계획된다",
+              led.plan.get("qty") == [4.0] * 5, str(led.plan.get("qty")))
+        check("손절선이 마지막 차수 아래로 내려간다",
+              float(state.get("stop_price") or 0) < 50_000 * 0.95 ** 4,
+              str(state.get("stop_price")))
+        check("전량 목표가는 비운다 (차수별 익절이 대신)",
+              not state.get("target_price"), str(state.get("target_price")))
+        check("편입이 기록된다",
+              any(r.get("action") == "split_adopted" for r in result["reconciled"]),
+              str(result["reconciled"]))
+
+        # 이미 원장이 있으면 다시 편입하지 않습니다 (계획이 덮이면 안 됩니다)
+        before = state.get("splits")
+        autotrade._adopt_split(TEST_USER, conf, "paper", pos, state, result)
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        check("이미 편입된 포지션은 건드리지 않는다", state.get("splits") == before)
+
+        # 빈 문자열("")은 _save_ledger 가 일부러 분할에서 뺀 흔적 — 재편입 금지
+        autotrade._save_ledger(TEST_USER, "paper", key, split.Ledger())
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        autotrade._adopt_split(TEST_USER, conf, "paper", pos, state,
+                               {"reconciled": []})
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        check("일부러 뺀 포지션은 재편입하지 않는다",
+              state.get("splits") == "", repr(state.get("splits")))
+
+        # 분할이 꺼져 있으면 아무것도 하지 않습니다
+        store.clear_position_state(TEST_USER, "paper", key)
+        store.upsert_position_state(TEST_USER, "paper", key, side="long",
+                                    entry_price=50_000, quantity=4)
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        autotrade._adopt_split(TEST_USER, cfg(split_enabled=False), "paper",
+                               pos, state, {"reconciled": []})
+        state = store.get_position_states(TEST_USER, "paper").get(key, {})
+        check("분할이 꺼져 있으면 편입하지 않는다", state.get("splits") is None,
+              repr(state.get("splits")))
+    finally:
+        instruments.try_resolve = saved_resolve
+        store.clear_position_state(TEST_USER, "paper", key)
+
+
 # ---------------------------------------------------------------------------
 # 과매수·과매도 판정
 # ---------------------------------------------------------------------------
@@ -485,6 +566,7 @@ def main():
     test_describe()
     if "--offline" not in sys.argv:
         test_ledger_drift()   # 로컬 DB 만 씁니다
+        test_adopt()          # 로컬 DB 만 씁니다
         test_engine()         # 모의계좌(로컬 DB)만 씁니다 — 네트워크는 없습니다
 
     print("\n" + "=" * 70)

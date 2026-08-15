@@ -131,10 +131,12 @@ class Universe:
 CATALOG: list[Universe] = [
     # --- 국내 지수 ---
     Universe("KOSPI200", "코스피200", "index", "KR", ["KOSPI"],
-             "시가총액·유동성 상위 200종목. KIS 지수 순위로 전체를 훑습니다.",
+             "시가총액·유동성 상위 200종목. 거래량 상위 30은 매 갱신, "
+             "나머지는 순환 계산으로 전 종목을 평가합니다.",
              kis_iscd="2001", etf="069500"),
     Universe("KOSDAQ150", "코스닥150", "index", "KR", ["KOSDAQ"],
-             "코스닥 대표 150종목. KODEX 코스닥150 구성종목(비중 상위)으로 받습니다.",
+             "코스닥 대표 150종목. 비중 상위 30은 매 갱신, "
+             "나머지는 순환 계산으로 전 종목을 평가합니다.",
              etf="229200"),
     Universe("KRX100", "KRX100", "index", "KR", ["KOSPI", "KOSDAQ"],
              "코스피·코스닥 통합 우량 100종목.",
@@ -635,6 +637,62 @@ def us_members(universe: Universe = None, exchange: str = "") -> MemberSet:
 # ---------------------------------------------------------------------------
 # 공용 진입점
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 지수 구성종목 전체 명단 (네이버)
+# ---------------------------------------------------------------------------
+# KIS 는 거래량순위 30행 · ETF 구성종목 30종목이 한계입니다. "코스피200 을
+# 골랐으면 200종목 전부"를 순환 평가에 태우려면 명단이 따로 필요하고, 네이버
+# 모바일 API 가 지수 편입종목을 페이지로 줍니다. 명단(종목코드)만 쓰고 시세는
+# 버립니다 — 순환 평가의 팩터 계산이 어차피 종목마다 일봉을 받습니다.
+NAVER_INDEX_CODES = {"KOSPI200": "KPI200", "KOSDAQ150": "KQI150"}
+NAVER_INDEX_URL = "https://m.stock.naver.com/api/index/{code}/enrollStocks"
+NAVER_INDEX_HEADERS = {"Referer": "https://m.stock.naver.com/",
+                       "Accept": "application/json"}
+NAVER_INDEX_PAGE = 60           # pageSize 는 100 부터 400 응답 (2026-08 확인)
+
+
+def index_member_codes(universe_key: str, segments: list[str] = None) -> list[str]:
+    """지수 **전체** 구성종목의 종목코드 명단. 못 받으면 빈 목록.
+
+    지원하는 범위(코스피200·코스닥150)가 아니면 빈 목록이고, 호출 쪽은 기존
+    경로(순위 API·ETF 구성종목)로만 동작합니다. 네트워크가 죽어 있으면 디스크
+    캐시(3일)로 버팁니다 — 편입 종목은 분기에 한 번 바뀌는 정보입니다.
+    """
+    naver = NAVER_INDEX_CODES.get(str(universe_key or "").strip().upper())
+    if not naver:
+        return []
+
+    def build():
+        codes = []
+        for page in range(1, 11):      # 200종목 = 60행 × 4쪽 — 10쪽이면 넉넉
+            rows = http_client.get_json(
+                NAVER_INDEX_URL.format(code=naver),
+                params={"page": page, "pageSize": NAVER_INDEX_PAGE},
+                headers=NAVER_INDEX_HEADERS)
+            if not isinstance(rows, list) or not rows:
+                break
+            codes += [str(r.get("itemCode") or "").strip() for r in rows
+                      if str(r.get("itemCode") or "").strip()]
+            if len(rows) < NAVER_INDEX_PAGE:
+                break
+        if codes:
+            _disk_save(f"idx_{naver}", codes)
+            return codes
+        return None                    # 실패를 6시간 동안 캐시하지 않습니다
+
+    codes = _cached(f"idx_members:{naver}", MEMBER_TTL, build)
+    if not codes:
+        codes, _ = _disk_load(f"idx_{naver}", 3 * 86400)
+    codes = list(dict.fromkeys(codes or []))
+    if segments:
+        chosen = set(normalize_segments(segments))
+        # 마스터가 모르는 코드는 뺍니다 — 신형 알파벳 코드('0126Z0' 류)는 상장
+        # 마스터에 없어 어차피 팩터 해석이 안 되고, 남기면 "코스피만" 골랐는데
+        # 시장 미상 종목이 섞입니다.
+        codes = [c for c in codes if kr_entry(c).get("market") in chosen]
+    return codes
+
 
 def members(universe_key: str, segments: list[str] = None) -> MemberSet:
     """유니버스 키 → 구성종목. 시장별 경로 선택을 여기서 감춥니다."""

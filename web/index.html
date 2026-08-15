@@ -211,6 +211,46 @@
   .gauge-label{ font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; color:var(--muted); text-transform:uppercase;}
   .hero-gauge-row{ display:flex; gap:18px; justify-content:center; flex-wrap:wrap; }
 
+  /* ---------- 시네마틱 인트로 ---------- */
+  /* 필름 밴드는 라이트 테마에서도 어둡게 유지합니다 — 그래서 색을 토큰이 아닌 고정값으로 씁니다. */
+  .hero-film{
+    position: relative; padding: 0; margin-top: 28px;
+    height: clamp(240px, 34vw, 420px);
+    border: 1px solid var(--hairline); border-radius: var(--radius);
+    overflow: hidden; isolation: isolate;
+    background: linear-gradient(150deg, #1d1811, #100e0a);
+  }
+  .hero-film video{
+    position: absolute; inset: 0; display: block;
+    width: 100%; height: 100%; object-fit: cover;
+  }
+  .film-scrim{
+    position: absolute; inset: 0; pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(16,14,10,0.92) 0%, rgba(16,14,10,0.62) 38%, rgba(16,14,10,0.10) 66%),
+      linear-gradient(0deg, rgba(16,14,10,0.82) 0%, transparent 44%);
+  }
+  .film-copy{
+    position: absolute; z-index: 1;
+    left: clamp(20px, 4%, 48px); right: clamp(20px, 4%, 48px);
+    bottom: clamp(18px, 5%, 42px); max-width: 54ch;
+  }
+  .hero-film .eyebrow{ color:#d8b23f; }
+  .hero-film .eyebrow::before{ background:#d8b23f; }
+  .film-title{
+    font-family:'Fraunces', serif; font-weight:600; color:#f4ebd7;
+    font-size: clamp(28px, 4.6vw, 52px); line-height:1.04; margin:10px 0 8px;
+  }
+  .film-title em{ font-style:italic; color:#d8b23f; }
+  .film-sub{
+    font-family:'IBM Plex Mono', monospace; margin:0;
+    font-size: clamp(11px, 1.2vw, 13px); letter-spacing:0.04em;
+    color: rgba(244,235,215,0.70);
+  }
+  @media (prefers-reduced-motion: reduce){
+    .hero-film video{ display:none; }
+  }
+
   .section-head{ display:flex; align-items:baseline; justify-content:space-between; gap:20px; margin-bottom: 28px;}
   .section-head h2{ font-family:'Fraunces',serif; font-size:26px; font-weight:600; margin:10px 0 0;}
   .section-head p{ color:var(--muted); font-size:13.5px; max-width:58ch; }
@@ -799,6 +839,21 @@
   </section>
 
   <div id="analysis" class="tab-panel active">
+  <!-- 시네마틱 인트로 -->
+  <section class="hero-film">
+    <!-- 경로 두 개: /legacy 로 서빙될 때는 첫 번째가 404 나고 /static 쪽으로 넘어갑니다. -->
+    <video autoplay muted loop playsinline preload="metadata" aria-hidden="true" tabindex="-1">
+      <source src="assets/hero-owl.mp4" type="video/mp4">
+      <source src="/static/assets/hero-owl.mp4" type="video/mp4">
+    </video>
+    <div class="film-scrim"></div>
+    <div class="film-copy">
+      <div class="eyebrow">밤에도 눈을 뜬다</div>
+      <div class="film-title">ATHENA <em>SIGNAL</em></div>
+      <p class="film-sub">코스피 · 코스닥 · 미국 &nbsp;|&nbsp; 지표 11종 · 뉴스 감성 · 종목토론방 여론을 하나의 확률로</p>
+    </div>
+  </section>
+
   <!-- HERO -->
   <section class="hero">
     <div>

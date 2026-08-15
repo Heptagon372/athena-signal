@@ -97,11 +97,16 @@ class OrderStatus:
     remaining: float = 0.0
     avg_fill_price: float | None = None
     detail: str = ""
+    # 조회 자체는 성공했는데 내역에 그 주문이 없는가.
+    # '조회 실패'(모름)와 '내역에 없음'(정말 없음)을 갈라야, 오래 못 찾은 주문을
+    # 결말 미상으로 닫는 판단을 조회 장애 때 잘못 내리지 않습니다.
+    searched: bool = False
 
     def to_dict(self) -> dict:
         return {"known": self.known, "status": self.status,
                 "filled_quantity": self.filled_quantity, "remaining": self.remaining,
-                "avg_fill_price": self.avg_fill_price, "detail": self.detail}
+                "avg_fill_price": self.avg_fill_price, "detail": self.detail,
+                "searched": self.searched}
 
 
 @dataclass
@@ -740,7 +745,15 @@ class KISBroker(Broker):
         if is_deriv:
             res = kis_trading.deriv_executions()
         elif is_us:
-            res = kis_trading.overseas_executions()
+            # 조회 창이 **주문일을 덮어야** 합니다. 기본 3일 창은 며칠 묵은 주문을
+            # 영영 못 찾고, 그 주문은 '확인 불가'로 매 회전 남습니다
+            # (실측: 8/11 DBGI 청산 주문이 8/15에도 pending — 창이 8/12부터였습니다).
+            try:
+                created = datetime.fromisoformat(str(record.get("created_at")))
+                age_days = max((datetime.now() - created).days, 0)
+            except (TypeError, ValueError):
+                age_days = 0
+            res = kis_trading.overseas_executions(days_back=age_days + 3)
         else:
             res = kis_trading.stock_executions()
         if not res.get("ok"):
@@ -749,7 +762,8 @@ class KISBroker(Broker):
         row = next((o for o in res["orders"]
                     if str(o["broker_order_id"]).lstrip("0") == broker_order_id), None)
         if row is None:
-            return OrderStatus(known=False, detail="주문 내역에서 찾지 못했습니다.")
+            return OrderStatus(known=False, searched=True,
+                               detail="주문 내역에서 찾지 못했습니다.")
 
         ordered = float(record.get("quantity") or row["order_qty"] or 0)
         filled = float(row["filled_qty"] or 0)
@@ -775,8 +789,19 @@ class KISBroker(Broker):
         if not broker_order_id:
             return OrderResult(ok=False, error="브로커 주문번호가 없어 취소할 수 없습니다.")
 
+        inst = instruments.try_resolve(record.get("symbol") or "")
         if record.get("asset_class") in (FUTURES, OPTION):
             res = kis_trading.cancel_deriv_order(broker_order_id)
+        elif inst and inst.market == MARKET_US:
+            # 미국 주문은 취소 API 가 따로 있습니다. 국내 경로로 보내면 국내
+            # 미체결 목록에서 못 찾아 "이미 처리된 주문"으로 잘못 끝나고,
+            # 실제 미체결 주문은 걷을 방법 없이 남습니다.
+            quote = feed.quote(inst) or {}
+            remaining = max(float(record.get("quantity") or 0)
+                            - float(record.get("filled_quantity") or 0), 0)
+            res = kis_trading.cancel_overseas_order(
+                inst.key, broker_order_id, quantity=remaining,
+                exchange=kis_trading.overseas_exchange_code(quote.get("exchange")))
         else:
             org_no = ""
             open_orders = kis_trading.stock_open_orders()

@@ -35,8 +35,8 @@ import numpy as np
 
 from data_sources import credentials
 from engine import broker as broker_module
-from engine import (feed, fills, holding, instruments, portfolio, protections,
-                    risk, rotation, split, strategy, validation)
+from engine import (feed, fills, holding, instruments, lessons, portfolio,
+                    protections, risk, rotation, split, strategy, validation)
 from engine.broker import make_client_order_id
 from engine.instruments import Instrument
 from storage import autotrade as store
@@ -148,19 +148,20 @@ def _user_credentials_scope(user_id: int):
 
 
 def _own_keys_gate(user_id: int, mode: str) -> str:
-    """구글 계정이 KIS 주문 모드를 쓰려면 자기 키가 있어야 합니다.
+    """KIS 주문 모드에는 자기 키가 필수인 계정이 있습니다.
 
     반환: 막아야 하면 사유 문자열, 통과면 "".
 
-    서버 키로 폴백시키면 아무 구글 사용자가 자동매매를 켰을 때 **서버 주인의
-    실계좌**로 주문이 나갑니다. 로컬 계정(이 PC 에서 만든 계정)은 지금까지처럼
-    서버 키를 씁니다 — 기존 동작을 깨지 않습니다.
+    서버 키로 폴백시키면 아무 사용자가 자동매매를 켰을 때 **서버 주인의
+    실계좌**로 주문이 나갑니다. 구글 계정은 항상, 공개 서버 모드에서는 로컬
+    계정도 자기 키가 필요합니다 (user_credentials.must_use_own_keys). 로컬
+    전용 서버의 로컬 계정만 지금까지처럼 서버 키를 씁니다.
     """
     if mode == broker_module.PAPER:
         return ""                       # 모의투자는 키가 필요 없습니다
-    from storage import accounts, user_credentials
-    if user_id < accounts.USER_ID_OFFSET:
-        return ""                       # 로컬 계정 — 서버 키 사용 (기존 동작)
+    from storage import user_credentials
+    if not user_credentials.must_use_own_keys(user_id):
+        return ""                       # 로컬 전용 서버의 로컬 계정 (기존 동작)
     if user_credentials.has_own_kis_keys(user_id):
         return ""
     return ("KIS 모의/실전 주문에는 본인 KIS 키가 필요합니다. "
@@ -322,6 +323,10 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
         return {"ok": False, "skipped": "자동매매가 꺼져 있습니다."}
 
     mode = cfg.get("mode", "paper")
+    # 손실 학습 — 이번 회전이 쓸 태그별 감쇠표를 cfg **사본**에 싣습니다.
+    # 신호 계산(strategy.evaluate)이 이 키(_lesson_penalties)를 보고 감쇠합니다.
+    # 저장되는 설정에는 이 키가 없으므로 백테스트로 흘러들지 않습니다.
+    cfg = lessons.inject(user_id, mode, cfg)
     result = {
         "ok": True, "at": datetime.now().isoformat(),
         "mode": cfg["mode"], "dry_run": bool(cfg.get("dry_run")),
@@ -489,6 +494,12 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
 # 0단계: 미결 주문 정산 (접수 → 체결 확인 → 포지션 확정)
 # ---------------------------------------------------------------------------
 
+# 내역 조회는 되는데 그 주문만 없는 상태가 이만큼 계속되면 결말 미상('lost')으로
+# 닫습니다. 하루면 정규장·야간장이 한 번씩 다 지나가므로, 그 안에 못 찾은 주문은
+# 이 조회로는 영영 못 찾습니다.
+_ORDER_LOST_SEC = 86_400.0
+
+
 def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
     """접수만 된 주문을 브로커에 조회해 결말을 짓습니다.
 
@@ -501,6 +512,7 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
         부분 체결   체결된 만큼만 상태에 반영하고 계속 대기
         미체결      order_timeout_sec 초과 시 취소 요청
         조회 실패   **아무것도 하지 않습니다** (모르면 건드리지 않는 것이 안전)
+        내역에 없음 하루 넘게 계속되면 결말 미상('lost')으로 닫습니다 — 아래 참고
     """
     timeout = float(cfg.get("order_timeout_sec", 180) or 0)
 
@@ -516,8 +528,29 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
         store.bump_poll(record["id"])
 
         if not status.known:
+            # '조회 실패'(모름)와 '내역에 없음'(조회는 됐는데 정말 없음)을
+            # 가릅니다. 후자가 하루 넘게 계속되면 이 주문의 결말은 이 API 로는
+            # 알 수 없는 것입니다 — 미결로 계속 들고 있으면 has_open_order 가
+            # 그 종목의 새 주문과 재동기화 정리를 전부 막고, 오류 로그만 매
+            # 회전 쌓입니다 (실측: DBGI 청산 주문 5,700분·poll 133회).
+            # 결말 미상으로 닫고, 실제 보유 수량은 재동기화(_reconcile)가
+            # 계좌 기준으로 맞춥니다. 체결이었다면 포지션이 사라진 것을 보고
+            # 상태를 정리하고, 미체결 소멸이었다면 포지션이 그대로 남습니다.
+            if status.searched and age > _ORDER_LOST_SEC:
+                store.update_order(
+                    record["id"], status="lost",
+                    settled_at=datetime.now().isoformat(),
+                    reason=f"{age / 3600:.0f}시간째 주문 내역에 없음 — 결말 미상으로 종료")
+                store.log_event(
+                    user_id, "error",
+                    f"{record['name'] or record['symbol']} 주문의 결말을 "
+                    f"{age / 3600:.0f}시간째 확인하지 못해 추적을 중단합니다. "
+                    f"체결 여부는 증권사 화면에서 확인하세요 — 실제 보유 수량은 "
+                    f"다음 회전의 재동기화가 계좌 기준으로 맞춥니다.",
+                    level="error", symbol=record["symbol"],
+                    detail={"order": record["client_order_id"], "why": status.detail})
             # 조회가 안 되는 주문이 오래 남아 있으면 사람이 봐야 합니다
-            if timeout and age > timeout * 3:
+            elif timeout and age > timeout * 3:
                 store.log_event(
                     user_id, "error",
                     f"{record['name'] or record['symbol']} 주문 상태를 {age / 60:.0f}분째 "
@@ -686,6 +719,11 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
                 # 원장이 비었으면 실제로 전량이 나간 것입니다 (원장과 계좌가
                 # 어긋났던 경우). 그때는 예전 경로와 같이 기억을 지웁니다.
                 store.clear_position_state(user_id, mode, record["symbol"])
+                lessons.close_lesson(
+                    user_id, mode, record["symbol"],
+                    name=record.get("name") or "",
+                    exit_reason=record.get("reason") or "", exit_price=fill_price,
+                    realized_krw=float(realized) if realized is not None else None)
     elif is_exit:
         if realized is not None:
             # 손익은 체결된 만큼 즉시 반영하고(안 하면 한도가 늦게 걸립니다),
@@ -695,6 +733,11 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
         # 청산이 전량 체결되면 손절·목표 기억을 지웁니다
         if status.status == "filled":
             store.clear_position_state(user_id, mode, record["symbol"])
+            # 손실 학습 — 뒤늦게 체결이 확정된 청산도 같은 규약으로 복기합니다
+            lessons.close_lesson(
+                user_id, mode, record["symbol"], name=record.get("name") or "",
+                exit_reason=record.get("reason") or "", exit_price=fill_price,
+                realized_krw=float(realized) if realized is not None else None)
     elif split_info:
         # 추가 차수 매수 체결 — 원장에 차수를 더하고 평단·수량을 다시 씁니다.
         # 손절선·목표는 건드리지 않습니다: 분할의 손절선은 1차 때 마지막
@@ -748,6 +791,14 @@ def _apply_fill(user_id: int, cfg: dict, record: dict, status, result: dict):
             # 주문을 낸 전략이 이 포지션의 주인입니다 (청산 규칙이 여기서 갈립니다)
             strategy=detail.get("strategy") or state.get("strategy"),
             **extra)
+        # 손실 학습 — 접수만 됐다 뒤늦게 체결된 진입도 컨텍스트를 남깁니다
+        # (즉시 체결은 _handle_entry 가 이미 남겼고, lesson_open 은 같은 종목의
+        #  열린 교훈이 있으면 중복 생성하지 않습니다).
+        sig_snap = detail.get("signal") if isinstance(detail.get("signal"), dict) else {}
+        lessons.open_lesson(user_id, mode, record["symbol"],
+                            record.get("name") or "",
+                            record.get("side") or state.get("side") or "long",
+                            sig_snap, entry, status.filled_quantity)
 
     result["settled"].append({
         "symbol": record["symbol"], "name": record["name"],
@@ -964,15 +1015,19 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     us = [c for c in scan.candidates if c.market == "US"]
     kr = [c for c in scan.candidates if c.market != "US"]
 
-    # 국내 전 종목 순환 — 탐색 범위를 지정하면 하지 않습니다. "코스피200 안에서
-    # 찾겠다"고 해 놓고 뒤에서 시장 전체를 순위에 올리면 범위가 무의미해집니다.
+    # 국내 순환의 모집단 — 범위를 안 골랐으면 시장 전체(KRX 상장법인목록),
+    # 골랐으면 **그 범위의 구성종목 명단**입니다. 순위 API 는 상위 30행까지만
+    # 줘서, 명단 없이는 코스피200을 골라도 30종목만 평가되고 로그는 "범위 전체
+    # 커버 완료"라고 거짓말을 했습니다. 명단이 없는 범위(섹터·KRX100)는 빈
+    # 목록 — 기존대로 순위·ETF 후보만 봅니다.
     kr_segments = [s for s in markets
                    if universe_mod.SEGMENTS.get(s, {}).get("region") == "KR"]
     kr_pool: list[str] = []
-    if kr_segments and not pool and cfg.get("auto_universe_full_market", True):
+    if kr_segments and cfg.get("auto_universe_full_market", True):
         seen = {c.key for c in kr}
-        kr_pool = [row["key"] for row in universe_mod.kr_listed(kr_segments)
-                   if row["key"] not in seen]
+        pool_codes = (universe_mod.index_member_codes(pool, kr_segments) if pool
+                      else [row["key"] for row in universe_mod.kr_listed(kr_segments)])
+        kr_pool = [k for k in pool_codes if k not in seen]
 
     if not scan.candidates and not kr_pool:
         store.log_event(
@@ -1247,6 +1302,7 @@ def _reconcile(user_id: int, cfg: dict, positions: list, result: dict,
                     f"{position.name} 수량을 실계좌 기준으로 맞췄습니다 "
                     f"({recorded:g} → {position.quantity:g})",
                     level="warn", symbol=position.key, name=position.name)
+            _adopt_split(user_id, cfg, mode, position, state, result)
             continue
 
         # 유니버스 밖 종목 = 사용자가 직접 산 주식. 기본 설정에서는 손대지 않습니다.
@@ -1297,6 +1353,9 @@ def _reconcile(user_id: int, cfg: dict, positions: list, result: dict,
             f"(평단 {entry:,.2f}, 손절 {stop:,.2f})",
             level="warn", symbol=position.key, name=position.name,
             detail={"restored": True})
+        # 복원된 포지션은 원장이 없어 분할 매수·매도가 시작되지 않습니다.
+        # 다음 회전을 기다리지 않고 지금 바로 편입합니다.
+        _adopt_split(user_id, cfg, mode, position, {"entry_price": entry}, result)
 
     # (2) 기억은 있는데 포지션이 없다 → 밖에서 정리된 것이므로 기억을 지웁니다
     if partial:
@@ -1309,6 +1368,10 @@ def _reconcile(user_id: int, cfg: dict, positions: list, result: dict,
         if store.has_open_order(user_id, mode, symbol):
             continue          # 아직 체결 대기 중인 주문이면 남겨둡니다
         store.clear_position_state(user_id, mode, symbol)
+        # 손실 학습 — 밖에서 정리된 매매는 손익을 모르므로 pnl 없이 닫습니다.
+        # (pnl 이 없는 교훈은 집계에서 빠집니다 — 모르는 것을 배우지 않습니다)
+        lessons.close_lesson(user_id, mode, symbol,
+                             exit_reason="외부 청산 (계좌 대조로 정리)")
         result["reconciled"].append({"symbol": symbol, "action": "cleared"})
         store.log_event(
             user_id, "reconcile",
@@ -1507,6 +1570,12 @@ def _submit_close(user_id: int, cfg: dict, brk, inst: Instrument, position,
             # 오늘 손익이 조용히 오염됩니다 (정산 패스와 같은 정책입니다).
             if realized is not None:
                 store.record_daily_trade(user_id, mode, float(realized))
+            # 손실 학습 — 매매가 끝났으므로 진입 컨텍스트에 손익을 붙이고,
+            # 손실이면 원인을 추론해 다음 신호의 감쇠 재료로 남깁니다.
+            lessons.close_lesson(
+                user_id, mode, inst.key, name=inst.name, exit_reason=reason,
+                exit_price=order.avg_fill_price or order.price,
+                realized_krw=float(realized) if realized is not None else None)
         result["exits"].append({
             "symbol": inst.key, "name": inst.name, "quantity": order.quantity,
             "price": order.price, "realized_pnl": realized,
@@ -1565,6 +1634,56 @@ def _save_ledger(user_id: int, mode: str, key: str, ledger: split.Ledger):
     store.upsert_position_state(
         user_id, mode, key, splits=ledger.to_json(),
         entry_price=ledger.avg_price, quantity=ledger.quantity)
+
+
+def _adopt_split(user_id: int, cfg: dict, mode: str, position, state: dict,
+                 result: dict):
+    """차수 원장이 없는 보유 포지션을 분할 관리로 편입합니다.
+
+    재동기화로 복원됐거나 분할을 켜기 전에 잡은 포지션은 원장이 없고,
+    원장이 없으면 분할 엔진(_handle_split)이 "분할로 잡은 포지션이 아닙니다"로
+    매 회전 건너뜁니다 — 분할을 켜 둔 계정에서 그 종목들만 조용히 빠집니다.
+    보유 전량을 1차(체결가 = 평단)로 삼고, 손절선도 분할 규칙("마지막 차수까지
+    담고도 더 빠지면")으로 다시 잡습니다. 기존 손절을 그대로 두면 간격이 좁아
+    마지막 차수 자리에 닿기 전에 전량 손절이 나갑니다 (engine/split.py 머리말).
+
+    `splits` 가 NULL 일 때만 편입합니다. 빈 문자열("")은 원장과 실제 보유가
+    어긋나 _save_ledger 가 **일부러** 분할 관리에서 뺀 흔적이므로, 여기서
+    다시 편입하면 사람이 손으로 풀어야 할 상태를 엔진이 덮어버립니다.
+    """
+    if state.get("splits") is not None:
+        return
+    if str(getattr(position, "side", "") or "long") != "long":
+        return          # 숏은 '내리면 더 담는다'가 성립하지 않습니다
+    if not split.enabled(cfg):
+        return          # try_resolve 전에 거릅니다 — 매 회전 도는 경로입니다
+    inst = instruments.try_resolve(position.key)
+    if inst is None or not split_applies(cfg, inst,
+                                         position_owner(cfg, position.key, state)):
+        return
+    entry = float(state.get("entry_price") or position.avg_price or 0)
+    quantity = float(position.quantity or 0)
+    if entry <= 0 or quantity <= 0:
+        return
+
+    sp = split.params(cfg)
+    # 보유 전량이 1차가 되도록 전체 계획 수량을 역산합니다 (균등이면 ×차수)
+    total = quantity / split.size_weights(sp)[0]
+    ledger = split.bootstrap(sp, entry, quantity, total, inst.round_quantity)
+    store.upsert_position_state(
+        user_id, mode, position.key, splits=ledger.to_json(),
+        stop_price=ledger.plan["stop"],
+        target_price=0.0)            # 익절은 차수별 분할 매도가 합니다
+    result["reconciled"].append({
+        "symbol": position.key, "action": "split_adopted",
+        "stop": ledger.plan["stop"]})
+    store.log_event(
+        user_id, "reconcile",
+        f"{position.name} 을(를) 분할 관리로 편입했습니다 — 보유 "
+        f"{quantity:g}{_unit(inst)}를 1/{sp['split_tranches']}차로 "
+        f"(평단 {entry:,.2f}, 손절 {ledger.plan['stop']:,.2f})",
+        symbol=position.key, name=position.name,
+        detail={"split_adopted": True, "plan": ledger.plan})
 
 
 def _handle_split(user_id: int, cfg: dict, brk, engine_risk, inst: Instrument,
@@ -2170,6 +2289,11 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
                 signal_score=sig.score, opened_at=datetime.now().isoformat(),
                 note=reason, strategy=owner, splits=ledger_json)
             held.add(inst.key)
+            # 손실 학습 — 이 매매의 진입 컨텍스트를 기록해 둡니다.
+            # 청산 때 손익과 맞춰 "왜 잃었는지"를 복기하는 재료입니다.
+            lessons.open_lesson(user_id, mode, inst.key, inst.name,
+                                sig.direction, sig.to_dict(),
+                                entry_price, filled_qty)
 
         result["entries"].append({
             "symbol": inst.key, "name": inst.name, "direction": sig.direction,
