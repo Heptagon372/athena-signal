@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>페니 초단타 — 아테나 시그널</title>
+<title>아테나 시그널 페니 초단타</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="/static/at_common.css">
 <style>
   /* 단계 색 — 한국 관행대로 매수는 빨강, 매도는 파랑, 관망은 무채색 */
@@ -11,7 +16,7 @@
   .ph-ready{border-color:var(--up);color:#f0917f}
   .ph-hold{border-color:var(--down);color:#8fb6e8}
   .ph-none{border-color:var(--line);color:var(--muted);opacity:.65}
-  #phaseTable td.note{color:var(--muted);font-size:11.5px}
+  #phaseTable td.note{color:var(--muted);font-size:14.5px}
 </style>
 </head>
 <body>
@@ -40,27 +45,27 @@
     <h2>규모 <span class="sub">이 전략이 쓸 수 있는 돈은 여기 적은 금액이 전부입니다</span></h2>
     <div class="row" style="margin-bottom:12px;align-items:center">
       <label class="chk" style="margin:0"><input type="checkbox" id="scalp_enabled"> 초단타 켜기</label>
-      <span class="muted" style="font-size:12px">시장</span>
+      <span class="muted" style="font-size:15px">시장</span>
       <span id="segBox" class="row" style="gap:10px;margin:0"></span>
       <span class="note" id="streamInfo"></span>
     </div>
     <div class="row" style="margin-bottom:12px;align-items:center">
-      <span class="muted" style="font-size:12px">탐색 범위</span>
+      <span class="muted" style="font-size:15px">탐색 범위</span>
       <select id="poolSelect" style="width:auto;min-width:190px"></select>
       <span class="note" id="poolSelectNote" style="margin:0"></span>
     </div>
-    <p class="note" style="margin-top:0">범위를 고르면 <b>그 안에서만</b> 찾습니다. 지수·섹터를 고르면
-      후보가 우량주 쪽으로 몰려 저가주가 거의 안 나옵니다 — 그걸 원할 때만 쓰세요.</p>
+    <p class="note" style="margin-top:0">범위를 고르면 <b>그 안에서만</b> 찾습니다. 지수, 섹터를 고르면
+      후보가 우량주 쪽으로 몰려 저가주가 거의 안 나옵니다, 그걸 원할 때만 쓰세요.</p>
     <div class="split">
       <div class="field"><label>투자금액 (원)</label><input id="scalp_budget_krw" type="number" step="10000"></div>
       <div class="field"><label>일일 손실 한도 (원)</label><input id="scalp_daily_loss_krw" type="number" step="1000"></div>
     </div>
-    <p class="note">동시 보유·종목당 비중·하루 매매 횟수는 없앴습니다. 투자금액이 곧 상한이고,
+    <p class="note">동시 보유, 종목당 비중, 하루 매매 횟수는 없앴습니다. 투자금액이 곧 상한이고,
       그날을 끊는 것은 손실 금액 하나입니다.</p>
   </section>
 
   <section>
-    <h2>진입과 청산 <span class="sub">% 가 아니라 틱입니다 — 호가창과 1:1 로 맞습니다</span></h2>
+    <h2>진입과 청산 <span class="sub">% 가 아니라 틱입니다. 호가창과 1:1 로 맞습니다</span></h2>
     <div class="split">
       <div class="field"><label>익절 (틱)</label><input id="scalp_take_profit_ticks" type="number" step="1"></div>
       <div class="field"><label>손절 (틱)</label><input id="scalp_stop_loss_ticks" type="number" step="1"></div>
@@ -70,12 +75,12 @@
       <div class="field"><label>진입 점수</label><input id="scalp_entry_score" type="number" step="0.05"></div>
       <div class="field"><label>진입 주문</label>
         <select id="scalp_entry_order_type">
-          <option value="limit_bid">지정가 (매수호가) — 1틱 유리</option>
-          <option value="market">시장가 — 즉시 체결, 1틱 불리</option>
+          <option value="limit_bid">지정가 (매수호가), 1틱 유리</option>
+          <option value="market">시장가, 즉시 체결, 1틱 불리</option>
         </select></div>
     </div>
 
-    <h3 style="margin:16px 0 8px;font-size:14px">이 설정으로 산수가 맞습니까</h3>
+    <h3 style="margin:16px 0 8px;font-size:17.5px">이 설정으로 산수가 맞습니까</h3>
     <div class="row" style="margin-bottom:8px">
       <span class="note">가격을 넣으면 비용을 뺀 실제 손익 구조를 보여줍니다</span>
       <input id="econPrice" type="number" step="10" value="100" style="width:110px">
@@ -86,7 +91,7 @@
   </section>
 
   <section>
-    <h2>타점 <span class="sub">거래량 급증 · 거래 회전율 · 가격 변동폭</span></h2>
+    <h2>타점 <span class="sub">거래량 급증   거래 회전율   가격 변동폭</span></h2>
     <div class="row" style="margin-bottom:12px">
       <label class="chk" style="margin:0"><input type="checkbox" id="scalp_auto_universe"> 조건에 맞는 종목 자동 추적</label>
       <select id="scalp_rank_basis" style="width:auto">
@@ -105,7 +110,7 @@
       <div class="field"><label>대상 갱신 주기 (초)</label><input id="scalp_universe_refresh_sec" type="number" step="5"></div>
     </div>
     <div class="field" style="margin-top:10px">
-      <label>내가 지정한 종목 <span class="sub">쉼표로 구분 · 자동 갱신이 돌아도 빠지지 않습니다</span></label>
+      <label>내가 지정한 종목 <span class="sub">쉼표로 구분   자동 갱신이 돌아도 빠지지 않습니다</span></label>
       <input id="scalp_pinned" type="text" placeholder="032680, 002630">
     </div>
     <p class="note">추적 종목 수는 설정하지 않습니다. 조건을 통과한 종목을 전부 담고,
@@ -129,7 +134,7 @@
   </section>
 
   <section>
-    <h2>차트 <span class="sub">체결을 모아 만든 초봉 · 산 지점과 판 지점</span></h2>
+    <h2>차트 <span class="sub">체결을 모아 만든 초봉   산 지점과 판 지점</span></h2>
     <div class="row" style="margin-bottom:10px">
       <select id="chartSymbol" style="width:auto;min-width:190px"></select>
       <select id="chartInterval" style="width:auto">
@@ -162,7 +167,7 @@
 window.PAGE = {
   nav: "penny",
   title: "페니주식 초단타",
-  desc: "동전주 틱 매매 — 위험 등급 최상. 투자금액과 일일 손실 금액이 유일한 규모 통제입니다.",
+  desc: "동전주 틱 매매, 위험 등급 최상. 투자금액과 일일 손실 금액이 유일한 규모 통제입니다.",
   _dirty: false,
   NUM: ["budget_krw","daily_loss_krw","take_profit_ticks","stop_loss_ticks",
         "max_hold_sec","reentry_cooldown_sec","min_net_ticks","entry_score",
@@ -174,7 +179,7 @@ window.PAGE = {
           muted: "#9c8f73", gold: "#c9a227", olive: "#74815b", warn: "#c9762a"},
   _chart: null,
   _timer: null,
-  _charted: null,   // 지금 차트에 올린 종목 — 폴링마다 다시 부르지 않기 위한 표시
+  _charted: null,   // 지금 차트에 올린 종목, 폴링마다 다시 부르지 않기 위한 표시
   _state: null,     // 초단타 진행 상태 (관망중 / 매수 준비중 / 매도 준비중)
 
   init() {
@@ -229,14 +234,14 @@ window.PAGE = {
 
     const rows = s.symbols || [];
     A.$("stateWhy").textContent = s.reason
-      || (s.running ? `${rows.length}종목을 ${s.interval_sec}초마다 봅니다 · `
+      || (s.running ? `${rows.length}종목을 ${s.interval_sec}초마다 봅니다   `
                       + `오늘 실현 ${A.won(s.realized_today)} (한도 ${A.won(-s.daily_loss_krw)})` : "");
     // 멈춰 있는데 종목마다 '매수 준비중'이 또렷하게 떠 있으면, 지금도 그걸
     // 노리고 있는 것으로 읽힙니다. 남은 판단은 흐리게 두고 언제 것인지 밝힙니다.
     const judged = rows.some((r) => r.phase);
     A.$("stateSub").textContent = s.running
-      ? "엔진이 마지막 회전에서 내린 판단입니다 — 화면이 새로 계산한 값이 아닙니다"
-      : (judged ? "지금은 판단이 돌지 않습니다 — 아래는 멈추기 직전의 마지막 판단입니다"
+      ? "엔진이 마지막 회전에서 내린 판단입니다. 화면이 새로 계산한 값이 아닙니다"
+      : (judged ? "지금은 판단이 돌지 않습니다. 아래는 멈추기 직전의 마지막 판단입니다"
                 : "지금은 판단이 돌지 않습니다");
     A.$("phaseTable").classList.toggle("pos-unmanaged", !s.running);
 
@@ -244,13 +249,13 @@ window.PAGE = {
     A.$("phaseEmpty").classList.toggle("hide", rows.length > 0);
     A.$("phaseTable").querySelector("tbody").innerHTML = rows.map((r) => `
       <tr>
-        <td>${A.esc(r.name)}<div class="muted mono" style="font-size:11px">${A.esc(r.key)}</div></td>
+        <td>${A.esc(r.name)}<div class="muted mono" style="font-size:13.5px">${A.esc(r.key)}</div></td>
         <td><span class="pill ph-${r.phase || "none"}">${A.esc(r.label)}</span></td>
         <td class="num">${A.num(r.price, 0)}</td>
-        <td class="num ${A.sign(r.score)}">${r.score == null ? "—"
+        <td class="num ${A.sign(r.score)}">${r.score == null ? "-"
             : (r.score >= 0 ? "+" : "") + r.score.toFixed(2)}</td>
         <td class="note">${A.esc(r.note)}</td>
-        <td class="num muted">${r.age_sec == null ? "—" : Math.round(r.age_sec) + "초 전"}</td>
+        <td class="num muted">${r.age_sec == null ? "-" : Math.round(r.age_sec) + "초 전"}</td>
       </tr>`).join("");
   },
 
@@ -266,7 +271,7 @@ window.PAGE = {
       // 대상이 사라졌는데 옛 차트를 그대로 두면, 지금 추적 중인 종목으로 읽힙니다
       if (this._charted) { this._chart = null; this._charted = null; this.drawChart(); }
       AT.$("chartEmpty").textContent =
-        "지정한 종목이 없습니다 — [찾은 종목] 에서 [대상 지정] 을 누르면 여기에 뜹니다.";
+        "지정한 종목이 없습니다. [찾은 종목] 에서 [대상 지정] 을 누르면 여기에 뜹니다.";
       return;
     }
     sel.innerHTML = list.map((k) =>
@@ -312,7 +317,7 @@ window.PAGE = {
     if (warnings) A.$("pennyWarn").innerHTML = warnings.map((w) => `<li>${A.esc(w)}</li>`).join("");
     if (hardLimits) A.$("hardLimits").innerHTML = hardLimits.map((l) =>
       `<div class="box"><div class="k">${A.esc(l.label)}</div>
-       <div class="v" style="font-size:14px">${A.esc(l.value)}</div></div>`).join("");
+       <div class="v" style="font-size:17.5px">${A.esc(l.value)}</div></div>`).join("");
     A.$("clampInfo").textContent = (clamped && clamped.length)
       ? "안전 한도로 조정됨: " + clamped.join(" / ") : "";
     if (stream) {
@@ -320,11 +325,11 @@ window.PAGE = {
       const el = A.$("streamInfo");
       if (stream.connected) {
         el.innerHTML = `<span class="pill-ok">실시간 체결 연결됨</span> `
-          + `${(stream.active || []).length}종목 구독 · ${stream.tick_count || 0}틱`
-          + ((stream.dropped || []).length ? ` · 한도 초과 ${stream.dropped.length}종목 제외` : "");
+          + `${(stream.active || []).length}종목 구독   ${stream.tick_count || 0}틱`
+          + ((stream.dropped || []).length ? `   한도 초과 ${stream.dropped.length}종목 제외` : "");
       } else {
         el.innerHTML = `<span class="pill-no">실시간 체결 끊김</span> `
-          + `REST 폴링(20초 지연)으로 동작합니다${stream.error ? " — " + A.esc(stream.error) : ""}`;
+          + `REST 폴링(20초 지연)으로 동작합니다${stream.error ? ", " + A.esc(stream.error) : ""}`;
       }
     }
   },
@@ -344,16 +349,16 @@ window.PAGE = {
       const e = await A.call(`/autotrade/scalp/economics?price=${price}`);
       const warn = e.viable ? "" : "pos-unmanaged";
       A.$("econBox").innerHTML = `
-        <div class="box"><div class="k">호가단위</div><div class="v" style="font-size:14px">
+        <div class="box"><div class="k">호가단위</div><div class="v" style="font-size:17.5px">
           ${e.tick_size.toLocaleString()}원 <span class="muted">(1틱 = ${e.tick_pct}%)</span></div></div>
-        <div class="box"><div class="k">왕복 비용</div><div class="v" style="font-size:14px">${e.breakeven_ticks}틱</div></div>
-        <div class="box ${warn}"><div class="k">실질 손익</div><div class="v" style="font-size:14px">
+        <div class="box"><div class="k">왕복 비용</div><div class="v" style="font-size:17.5px">${e.breakeven_ticks}틱</div></div>
+        <div class="box ${warn}"><div class="k">실질 손익</div><div class="v" style="font-size:17.5px">
           +${e.net_win_ticks} / −${e.net_loss_ticks}틱</div></div>
         <div class="box ${e.required_win_rate >= 60 ? "pos-unmanaged" : ""}">
-          <div class="k">필요 승률</div><div class="v" style="font-size:14px">${e.required_win_rate}%</div></div>
-        <div class="box"><div class="k">목표 / 손절</div><div class="v" style="font-size:14px">
+          <div class="k">필요 승률</div><div class="v" style="font-size:17.5px">${e.required_win_rate}%</div></div>
+        <div class="box"><div class="k">목표 / 손절</div><div class="v" style="font-size:17.5px">
           ${e.target_price.toLocaleString()} / ${e.stop_price.toLocaleString()}</div></div>
-        <div class="box"><div class="k">최소 익절</div><div class="v" style="font-size:14px">
+        <div class="box"><div class="k">최소 익절</div><div class="v" style="font-size:17.5px">
           ${e.min_viable_tp_ticks}틱 <span class="muted">(${e.min_viable_tp_price.toLocaleString()}원)</span></div></div>`;
     } catch (err) { A.$("econBox").innerHTML = `<div class="note up">${A.esc(err.message)}</div>`; }
   },
@@ -370,10 +375,10 @@ window.PAGE = {
     patch.pinned = A.$("scalp_pinned").value.split(",").map((s) => s.trim()).filter(Boolean);
     if (patch.enabled && !confirm(
         "페니주식 초단타를 켭니다.\n\n" +
-        `· 이 전략은 ${(patch.budget_krw || 0).toLocaleString()}원까지 씁니다\n` +
-        `· 오늘 ${(patch.daily_loss_krw || 0).toLocaleString()}원을 잃으면 그날은 종료합니다\n` +
-        "· 하루 매매 횟수 제한은 없습니다\n" +
-        "· 저가주는 유동성이 얇아 팔고 싶을 때 못 팔 수 있습니다\n\n" +
+        `,  이 전략은 ${(patch.budget_krw || 0).toLocaleString()}원까지 씁니다\n` +
+        `,  오늘 ${(patch.daily_loss_krw || 0).toLocaleString()}원을 잃으면 그날은 종료합니다\n` +
+        ",  하루 매매 횟수 제한은 없습니다\n" +
+        ",  저가주는 유동성이 얇아 팔고 싶을 때 못 팔 수 있습니다\n\n" +
         "잃어도 되는 금액으로만 하시겠습니까?")) return;
     try {
       const res = await A.call("/autotrade/config", {method: "POST", body: {config: {scalp: patch}}});
@@ -395,26 +400,26 @@ window.PAGE = {
       this.renderMeta(d.warnings, d.hard_limits, d.clamped, d.stream);
       const rows = d.candidates || [];
       A.$("candEmpty").classList.toggle("hide", rows.length > 0);
-      const where = d.universe_detail?.label ? ` · ${d.universe_detail.label} 안에서` : "";
+      const where = d.universe_detail?.label ? `   ${d.universe_detail.label} 안에서` : "";
       A.$("candSub").textContent =
-        `${d.scanned}종목 훑음${where} · 투자금액 ${A.won(rows[0]?.budget_cap || 0)} 기준 · ${d.sources.join(", ")}`;
-      const pct = (v, digits) => (v == null ? '<span class="muted">—</span>'
+        `${d.scanned}종목 훑음${where}   투자금액 ${A.won(rows[0]?.budget_cap || 0)} 기준   ${d.sources.join(", ")}`;
+      const pct = (v, digits) => (v == null ? '<span class="muted">-</span>'
         : v.toLocaleString(undefined, {maximumFractionDigits: digits ?? 0}) + "%");
       A.$("candTable").querySelector("tbody").innerHTML = rows.map((c) => {
         const e = c.economics || {};
         return `<tr class="${c.eligible ? "" : "pos-unmanaged"}">
-        <td>${A.esc(c.name)}<div class="muted mono" style="font-size:11px">${c.key} · ${c.segment || c.market}${
-          c.weight != null ? ` · 비중 ${c.weight}%` : ""}</div></td>
+        <td>${A.esc(c.name)}<div class="muted mono" style="font-size:13.5px">${c.key}   ${c.segment || c.market}${
+          c.weight != null ? `   비중 ${c.weight}%` : ""}</div></td>
         <td class="num">${A.num(c.price)}</td>
         <td class="num ${A.sign(c.change_rate)}">${A.pct(c.change_rate)}</td>
         <td class="num">${pct(c.vol_increase_pct)}</td>
         <td class="num">${pct(c.turnover_pct, 1)}</td>
         <td class="num">${pct(c.day_range_pct, 1)}</td>
         <td class="num">${(c.trading_value_krw || c.trading_value) > 0
-            ? Math.round((c.trading_value_krw || c.trading_value) / 1e8).toLocaleString() + "억" : "—"}</td>
+            ? Math.round((c.trading_value_krw || c.trading_value) / 1e8).toLocaleString() + "억" : "-"}</td>
         <td class="num">${c.affordable ? c.max_quantity.toLocaleString() + "주" : '<span class="muted">부족</span>'}</td>
         <td class="num">${A.won(c.order_krw)}</td>
-        <td class="num ${e.required_win_rate >= 60 ? "up" : ""}">${e.required_win_rate != null ? e.required_win_rate + "%" : "—"}</td>
+        <td class="num ${e.required_win_rate >= 60 ? "up" : ""}">${e.required_win_rate != null ? e.required_win_rate + "%" : "-"}</td>
         <td class="${c.eligible ? "pill-ok" : "pill-no"}" title="${A.esc((c.reasons || []).join(" / "))}">
           ${c.eligible ? "적합" : "부적합"}${(c.notes || []).length ? " ⚠" : ""}</td>
         <td>${c.eligible && c.affordable ? `<button class="sm" data-adopt="${c.key}">대상 지정</button>` : ""}</td>
@@ -449,12 +454,12 @@ window.PAGE = {
       const c = this._chart, src = c.source === "tick"
         ? `초봉 (체결 ${c.buffered_bars.toLocaleString()}초 분량 보유)`
         : `분봉 대체`;
-      A.$("chartInfo").innerHTML = `${A.esc(c.name)} · ${c.interval_sec}초봉 ${c.bars}개 · ${src}`
+      A.$("chartInfo").innerHTML = `${A.esc(c.name)}   ${c.interval_sec}초봉 ${c.bars}개   ${src}`
         + (c.note ? `<div class="note up">${A.esc(c.note)}</div>` : "");
     } catch (e) {
       A.$("chartInfo").textContent = "";
       // 아직 아무것도 못 그린 상태면 빈 칸으로 두지 않고 이유를 그 자리에 씁니다
-      if (!this._chart) A.$("chartEmpty").textContent = `${symbol} 차트를 못 불러왔습니다 — ${e.message}`;
+      if (!this._chart) A.$("chartEmpty").textContent = `${symbol} 차트를 못 불러왔습니다. ${e.message}`;
       if (!quiet) A.toast(e.message, true);
     }
   },
@@ -614,7 +619,7 @@ window.PAGE = {
     }
     g.stroke(); g.restore();
     g.fillStyle = C.muted; g.textAlign = "left"; g.font = "9px ui-monospace, monospace";
-    g.fillText(`거래량 ${maxVol.toLocaleString()} · 체결건수 ${maxTrades}`, padL + 4, volTop + 8);
+    g.fillText(`거래량 ${maxVol.toLocaleString()}   체결건수 ${maxTrades}`, padL + 4, volTop + 8);
 
     // --- RSI(2) ---
     const ry = (v) => rsiTop + rsiH - v / 100 * rsiH;
@@ -633,7 +638,7 @@ window.PAGE = {
     }
     g.stroke(); g.restore();
     g.fillStyle = C.muted; g.textAlign = "left";
-    g.fillText(`RSI(${c.indicator_periods.rsi}) · 90↑ 과열 / 10↓ 급락`, padL + 4, rsiTop + 8);
+    g.fillText(`RSI(${c.indicator_periods.rsi})   90↑ 과열 / 10↓ 급락`, padL + 4, rsiTop + 8);
 
     // --- 시각 축 ---
     g.textAlign = "center"; g.fillStyle = C.muted;
@@ -647,7 +652,7 @@ window.PAGE = {
       + `<span style="color:#8a7bb5">■</span> EMA${p.ema_slow} &nbsp;`
       + `<span style="color:${C.olive}">■</span> 볼린저(${p.bollinger}, 2σ) / 체결건수 &nbsp;`
       + `<span style="color:${C.up}">▲</span> 매수 &nbsp;<span style="color:${C.down}">▼</span> 매도`
-      + `<br>주기는 <b>봉 개수</b> 기준입니다 — ${c.interval_sec}초봉이면 EMA${p.ema_fast} 는 `
+      + `<br>주기는 <b>봉 개수</b> 기준입니다. ${c.interval_sec}초봉이면 EMA${p.ema_fast} 는 `
       + `${p.ema_fast * c.interval_sec}초입니다.`;
   },
 

@@ -53,7 +53,7 @@ function readStoredSymbol() {
 export function Providers({ children }) {
   const [user, setUser] = useState(null);
   const [ready, setReady] = useState(false);
-  const [theme, setTheme] = useState("dark");
+  const [theme, setTheme] = useState("light");
 
   // 선택 종목. 서버 렌더와 첫 클라이언트 렌더가 어긋나면 hydration 경고가 나므로,
   // 초기값은 항상 기본값으로 두고 마운트 후에 저장값으로 교체합니다.
@@ -103,7 +103,7 @@ export function Providers({ children }) {
     let saved = null;
     try { saved = localStorage.getItem("athena-theme"); } catch {}
     const initial = saved
-      || (window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      || (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     setTheme(initial);
     document.documentElement.setAttribute("data-theme", initial);
   }, []);

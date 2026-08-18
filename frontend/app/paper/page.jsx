@@ -44,7 +44,7 @@ function PaperDesk() {
         setResult({
           ok: true,
           message: d.just_filled.map((f) =>
-            `지정가 체결 — ${f.name} ${f.side === "buy" ? "매수" : "매도"} ` +
+            `지정가 체결   ${f.name} ${f.side === "buy" ? "매수" : "매도"} ` +
             `${fmtNum(f.quantity, 4)}주 @ ${fmtNum(f.price)}원`).join(" / "),
         });
       }
@@ -137,19 +137,19 @@ function PaperDesk() {
       if (r.order_type === "limit" && r.status === "pending" && !r.filled_now) {
         setResult({
           ok: true,
-          message: `지정가 ${ticket.side === "buy" ? "매수" : "매도"} 접수 — ` +
-            `${fmtNum(r.quantity, 4)}주 @ ${fmtNum(r.limit_price)} · 미체결 대기` +
+          message: `지정가 ${ticket.side === "buy" ? "매수" : "매도"} 접수   ` +
+            `${fmtNum(r.quantity, 4)}주 @ ${fmtNum(r.limit_price)}   미체결 대기` +
             (r.reserved_cash ? ` (예수금 ${fmtNum(r.reserved_cash)}원 구속)` : ""),
         });
       } else {
         const f = r.filled_now || r;
         setResult({
           ok: true,
-          message: `${ticket.side === "buy" ? "매수" : "매도"} 체결 — ` +
+          message: `${ticket.side === "buy" ? "매수" : "매도"} 체결   ` +
             `${fmtNum(f.quantity, 4)}주 @ ${fmtNum(f.price)}원` +
             (r.fee != null ? ` (수수료 ${fmtNum(r.fee)}원${r.tax ? `, 거래세 ${fmtNum(r.tax)}원` : ""})` : "") +
             (r.realized_pnl != null
-              ? ` · 실현손익 ${r.realized_pnl >= 0 ? "+" : ""}${fmtNum(r.realized_pnl)}원` : ""),
+              ? `   실현손익 ${r.realized_pnl >= 0 ? "+" : ""}${fmtNum(r.realized_pnl)}원` : ""),
         });
       }
       await load();
@@ -185,9 +185,9 @@ function PaperDesk() {
         { ticker, side: "sell", order_type: "market" }, { timeout: 60000 });
       setResult({
         ok: true,
-        message: `시장가 매도 체결 — ${fmtNum(r.quantity, 4)}주 @ ${fmtNum(r.price)}원` +
+        message: `시장가 매도 체결   ${fmtNum(r.quantity, 4)}주 @ ${fmtNum(r.price)}원` +
           (r.realized_pnl != null
-            ? ` · 실현손익 ${r.realized_pnl >= 0 ? "+" : ""}${fmtNum(r.realized_pnl)}원` : ""),
+            ? `   실현손익 ${r.realized_pnl >= 0 ? "+" : ""}${fmtNum(r.realized_pnl)}원` : ""),
       });
       await load();
     } catch (err) {
@@ -198,7 +198,7 @@ function PaperDesk() {
   };
 
   const reset = async () => {
-    if (!confirm("모의투자 계좌를 초기화합니다.\n보유 종목·미체결 주문·거래 내역이 모두 삭제됩니다.")) return;
+    if (!confirm("모의투자 계좌를 초기화합니다.\n보유 종목, 미체결 주문, 거래 내역이 모두 삭제됩니다.")) return;
     setBusy(true);
     try {
       await api.post("/paper/reset", {}, { timeout: 30000 });
@@ -225,7 +225,7 @@ function PaperDesk() {
           <div className="eyebrow">가상머니</div>
           <h2>모의투자</h2>
           <p>
-            시장가·지정가 주문을 실제 증권 프로그램처럼 넣어봅니다. 수수료·거래세까지
+            시장가, 지정가 주문을 실제 증권 프로그램처럼 넣어봅니다. 수수료, 거래세까지
             반영한 <strong>실제 손익</strong>을 보여줍니다.
             <strong> 실제 주문은 절대 나가지 않습니다.</strong>
           </p>
@@ -270,7 +270,7 @@ function PaperDesk() {
                 <button type="button" className="suggest-item" key={s.key}
                         onClick={() => pick(s)}>
                   <span>{s.name}</span>
-                  <span className="suggest-meta">{s.key} · {s.market}</span>
+                  <span className="suggest-meta">{s.key}   {s.market}</span>
                 </button>
               ))}
             </div>
@@ -303,7 +303,7 @@ function PaperDesk() {
                   </div>
                   <div className="dq-meta">
                     {quote.market_status?.label}
-                    {isUS && ` · 원화 ${fmtNum(quote.price_krw)}원`}
+                    {isUS && `   원화 ${fmtNum(quote.price_krw)}원`}
                   </div>
                 </div>
               </div>
@@ -353,7 +353,7 @@ function PaperDesk() {
               {o.side === "buy" ? "매수" : "매도"}</span></span>
             <div>
               <div className="row-name">{o.name || o.ticker}</div>
-              <div className="row-sub">{o.ticker} · 지정가</div>
+              <div className="row-sub">{o.ticker}   지정가</div>
             </div>
             <span className="m ta-r">{fmtNum(o.quantity, 4)}</span>
             <span className="m ta-r">{fmtNum(o.limit_price, o.currency === "USD" ? 2 : 0)}</span>
@@ -388,7 +388,7 @@ function PaperDesk() {
           <div className="row hold-row" key={p.ticker}>
             <div>
               <div className="row-name">{p.name || p.ticker}</div>
-              <div className="row-sub">{p.ticker} · {p.market}</div>
+              <div className="row-sub">{p.ticker}   {p.market}</div>
             </div>
             <div className="m ta-r">
               {fmtNum(p.quantity, 4)}
@@ -397,7 +397,7 @@ function PaperDesk() {
               )}
             </div>
             <div className="m ta-r">{fmtNum(p.avg_price)}</div>
-            <div className="m ta-r">{p.price_available ? fmtNum(p.current_price) : "—"}</div>
+            <div className="m ta-r">{p.price_available ? fmtNum(p.current_price) : "-"}</div>
             <div className="m ta-r" style={{ color: signColor(p.pnl) }}>
               {p.pnl >= 0 ? "+" : ""}{fmtNum(p.pnl)}
               <div className="row-sub" style={{ color: signColor(p.pnl) }}>
@@ -442,7 +442,7 @@ function PaperDesk() {
             <span className="m">{fmtNum(t.quantity, 4)}</span>
             <span className="m">{fmtNum(t.price)}</span>
             <span className="m" style={{ color: t.realized_pnl == null ? "var(--muted)" : signColor(t.realized_pnl) }}>
-              {t.realized_pnl == null ? "—" : `${t.realized_pnl >= 0 ? "+" : ""}${fmtNum(t.realized_pnl)}`}
+              {t.realized_pnl == null ? "-" : `${t.realized_pnl >= 0 ? "+" : ""}${fmtNum(t.realized_pnl)}`}
             </span>
           </div>
         )) : (
@@ -451,9 +451,9 @@ function PaperDesk() {
       </div>
 
       <div className="order-hint">
-        수수료 국내 {data.fees?.kr_fee_pct}% · 매도 거래세 {data.fees?.kr_tax_pct}% · 미국 {data.fees?.us_fee_pct}%
-        {data.fx && ` · 환율 ${fmtNum(data.fx.usd_krw)}원/USD (${data.fx.source})`}
-        {" "}— 미국 종목도 원화로 환산해 거래합니다.
+        수수료 국내 {data.fees?.kr_fee_pct}%   매도 거래세 {data.fees?.kr_tax_pct}%   미국 {data.fees?.us_fee_pct}%
+        {data.fx && `   환율 ${fmtNum(data.fx.usd_krw)}원/USD (${data.fx.source})`}
+        <br />미국 종목도 원화로 환산해 거래합니다.
       </div>
     </section>
   );

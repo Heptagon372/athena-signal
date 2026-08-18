@@ -75,6 +75,57 @@ _skipped_notice: dict[int, set] = {}
 _BROKER_REJECT_COOLDOWN_SEC = 1800
 _broker_rejects: dict[tuple, tuple] = {}
 
+# 분할 추가 매수를 **왜 지금 안 하는가**. 판단(split.plan_buy)은 회전마다 하면서
+# 결과를 버리면 "다음 매수 35,245 인데 34,000 인데도 왜 안 사지"를 화면에서
+# 답할 수 없습니다. 마지막 사유를 메모리에 들고 있다가 콘솔 스냅샷에 붙이고,
+# 사유의 **종류**가 바뀌었을 때만 이벤트 로그에 남깁니다 (60초마다 같은 줄이
+# 쌓이면 정작 중요한 로그가 묻힙니다).
+_SPLIT_WAIT_REPEAT_SEC = 1800
+_split_waits: dict[tuple, dict] = {}
+
+
+def split_wait(user_id: int, mode: str, key: str) -> dict:
+    """콘솔 스냅샷이 읽는 마지막 대기 사유. 없으면 빈 dict."""
+    return _split_waits.get((user_id, mode, key)) or {}
+
+
+def clear_split_wait(user_id: int, mode: str, key: str = ""):
+    if key:
+        _split_waits.pop((user_id, mode, key), None)
+        return
+    for slot in [s for s in _split_waits if s[0] == user_id and s[1] == mode]:
+        _split_waits.pop(slot, None)
+
+
+# 가격이 아직 트리거 위인 것은 "정상 대기"라 로그로 남기지 않습니다 — 화면의
+# 대기 문구로 충분합니다. 아래 사유들은 **가격 조건을 이미 통과했는데도**
+# 못 사는 경우라, 사람이 설정을 볼지 말지 정해야 합니다.
+_SPLIT_WAIT_LOGGED = ("oversold", "gap", "daily_cap", "qty", "plan_overflow",
+                      "no_price")
+
+
+def _note_split_wait(user_id: int, mode: str, inst, decision):
+    """분할 추가 매수 대기 사유를 기록합니다 (화면용 + 조건부 로그)."""
+    text = (decision.rejects or [""])[0]
+    if not text:
+        return
+    slot = (user_id, mode, inst.key)
+    previous = _split_waits.get(slot) or {}
+    now = time.time()
+    _split_waits[slot] = {"code": decision.code, "text": text,
+                          "detail": decision.detail,
+                          "at": datetime.now().isoformat(),
+                          "logged_at": previous.get("logged_at", 0.0)}
+    if decision.code not in _SPLIT_WAIT_LOGGED:
+        return
+    if (previous.get("code") == decision.code
+            and now - float(previous.get("logged_at") or 0) < _SPLIT_WAIT_REPEAT_SEC):
+        return
+    _split_waits[slot]["logged_at"] = now
+    store.log_event(user_id, "reject", f"{inst.name} 분할 추가 매수 대기 — {text}",
+                    symbol=inst.key, name=inst.name,
+                    detail={"split_wait": decision.to_dict()})
+
 
 def _reject_cooldown_left(user_id: int, key: str) -> tuple[float, str]:
     """(남은 대기 초, 사유). 대기 중이 아니면 (0, "")."""
@@ -499,6 +550,27 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
 # 이 조회로는 영영 못 찾습니다.
 _ORDER_LOST_SEC = 86_400.0
 
+# 취소를 거부당한 사유가 '그런 주문이 없다' 인가.
+#
+# 브로커가 주문을 모른다는 것은 그 주문이 **더 이상 살아 있지 않다**는 확정적
+# 답입니다. 재시도해도 영영 같은 답이 오므로 여기서 결말을 지어야 합니다.
+#
+# 미국 지정가는 당일 만료(DAY)라 장이 끝나면 죽는데, KIS 주문내역 조회에는
+# 미체결 잔량이 그대로 남습니다. 그래서 order_status 는 계속 known=True/pending
+# 을 돌려주고, '내역에 없음' 경로(_settle_open_orders 의 not known 블록)에 있는
+# lost 판정에는 영영 닿지 못합니다. 조회 API 와 취소 API 가 서로 다른 말을 하는
+# 상태입니다.
+#
+# 실측: DBGI 주문 하나가 7일간 3,076회 폴링되며 매 회전 취소에 실패했고,
+# 그동안 has_open_order 가 그 종목의 신규 주문을 전부 막았습니다.
+_CANCEL_GONE_HINTS = ("주문내역이 존재하지 않", "주문이 존재하지 않",
+                      "해당 주문 없", "미체결 목록에 없")
+
+
+def _cancel_says_gone(error: str) -> bool:
+    text = str(error or "")
+    return any(hint in text for hint in _CANCEL_GONE_HINTS)
+
 
 def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
     """접수만 된 주문을 브로커에 조회해 결말을 짓습니다.
@@ -576,6 +648,25 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
                             level="warn", symbol=record["symbol"])
             continue
 
+        # 취소를 요청했는데 브로커가 계속 '미체결' 이라 답하는 주문.
+        # 아래 자동 취소는 cancel_requested 를 건너뛰므로, 이 주문은 어느 분기도
+        # 타지 못한 채 영원히 폴링만 됩니다 (실측: 2,934회). 위 lost 판정도
+        # known=True 라 닿지 않습니다. 그래서 나이 제한을 여기서 한 번 더 겁니다.
+        if record["status"] == "cancel_requested" and age > _ORDER_LOST_SEC:
+            store.update_order(
+                record["id"], status="lost",
+                settled_at=datetime.now().isoformat(),
+                reason=f"취소 요청 후 {age / 3600:.0f}시간째 결말 미확정 — 종료")
+            store.log_event(
+                user_id, "error",
+                f"{record['name'] or record['symbol']} 취소 요청이 "
+                f"{age / 3600:.0f}시간째 확정되지 않아 추적을 중단합니다. "
+                f"체결 여부는 증권사 화면에서 확인하세요 — 실제 보유 수량은 "
+                f"다음 회전의 재동기화가 계좌 기준으로 맞춥니다.",
+                level="error", symbol=record["symbol"],
+                detail={"order": record["client_order_id"]})
+            continue
+
         # 아직 미체결 — 시간이 지났으면 거둬들입니다.
         # 안 걷으면 장 마감까지 남아 원하지 않는 가격에 체결될 수 있습니다.
         if timeout and age > timeout and record["status"] != "cancel_requested":
@@ -591,6 +682,23 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
             elif cancel.status == "filled":
                 # 취소하려 했는데 이미 체결된 경우 — 다음 회전에 체결로 잡힙니다
                 store.update_order(record["id"], reason="취소 시도했으나 이미 처리됨")
+            elif _cancel_says_gone(cancel.error):
+                # 브로커가 모르는 주문 = 이미 끝난 주문입니다. 체결이었는지
+                # 만료였는지는 이 API 로 가릴 수 없으므로 결말 미상으로 닫고,
+                # 실제 보유 수량은 재동기화(_reconcile)가 계좌 기준으로 맞춥니다.
+                # 여기서 닫지 않으면 매 회전 같은 취소를 재시도하며 오류만 쌓고,
+                # has_open_order 가 그 종목의 신규 주문을 영구히 막습니다.
+                store.update_order(
+                    record["id"], status="lost",
+                    settled_at=datetime.now().isoformat(),
+                    reason=f"취소 거부 — 브로커에 주문이 없음 ({cancel.error})")
+                store.log_event(
+                    user_id, "error",
+                    f"{record['name'] or record['symbol']} 주문이 브로커에 없어 "
+                    f"추적을 중단합니다 ({cancel.error}). 체결 여부는 증권사 화면에서 "
+                    f"확인하세요 — 실제 보유 수량은 다음 회전의 재동기화가 맞춥니다.",
+                    level="error", symbol=record["symbol"],
+                    detail={"order": record["client_order_id"]})
             else:
                 result["errors"].append(
                     f"{record['symbol']} 주문 취소 실패: {cancel.error}")
@@ -1464,13 +1572,16 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
             "stop_loss_pct": unit * scalp["stop_loss_ticks"] / sig.price * 100,
             "take_profit_pct": unit * scalp["take_profit_ticks"] / sig.price * 100,
         }
-        # 들고 있는 동안은 '파는 조건을 지켜보는 중'입니다
+        # 들고 있는 동안은 '파는 조건을 지켜보는 중'입니다.
+        # 고정된 포지션은 시간 청산이 없으므로 '최대 N초'를 적으면 거짓말입니다.
+        limit_note = ("고정 (시간 청산 없음)" if state.get("pinned")
+                      else f"최대 {scalp['max_hold_sec']:g}초")
         mark_scalp_phase(
             user_id, position.key, HOLD, name=position.name,
             note=f"보유 {position.quantity:g}{_unit(inst)} · "
                  f"목표 {state.get('target_price') or econ['target_price']:,.0f} / "
                  f"손절 {state.get('stop_price') or econ['stop_price']:,.0f} / "
-                 f"최대 {scalp['max_hold_sec']:g}초",
+                 f"{limit_note}",
             price=sig.price, quantity=position.quantity,
             entry_price=state.get("entry_price") or position.avg_price,
             target_price=state.get("target_price") or econ["target_price"],
@@ -1741,12 +1852,20 @@ def _handle_split(user_id: int, cfg: dict, brk, engine_risk, inst: Instrument,
         return
 
     if not allow_add:
+        # 안전장치가 걸린 회전입니다. 이것도 "왜 안 사는가"의 답이라 화면에
+        # 남깁니다 — 안 남기면 손실 한도에 걸린 날의 침묵과 지표 조건에 걸린
+        # 날의 침묵이 화면에서 똑같이 보입니다.
+        _note_split_wait(user_id, mode, inst, split.Decision().reject(
+            "halted", "안전장치가 걸려 있어 추가 매수를 멈췄습니다 "
+                      "(일일 손실 한도 등) — 차수 매도는 그대로 봅니다"))
         return
 
     # -- 2) 차수 추가 매수 ------------------------------------------------
     buy = split.plan_buy(cfg, inst, ledger, price, rsi=rsi, bb_pct=bb)
     if not buy.ok:
+        _note_split_wait(user_id, mode, inst, buy)
         return
+    clear_split_wait(user_id, mode, inst.key)
 
     # 리스크 게이트는 신규 진입과 **똑같이** 통과해야 합니다. 추가 매수는
     # 노출을 늘리는 행위이고, 분할이라는 이유로 한도를 비켜가면 안 됩니다.
@@ -1950,6 +2069,11 @@ def _maybe_rotate(user_id: int, cfg: dict, brk, engine_risk, inst: Instrument,
         if not is_managed(cfg, pos.key, states):
             continue
         if position_owner(cfg, pos.key, state) != OWNER_AUTO:
+            continue
+        # 고정한 포지션은 매도 후보가 아닙니다. 회전은 "더 좋은 후보가 있으니
+        # 이걸 팔자"는 판단인데, 고정은 목표가·손절가 말고는 팔지 말라는
+        # 지시입니다 — 더 좋은 자리가 있다는 것은 매도 사유가 되지 않습니다.
+        if state.get("pinned"):
             continue
         if store.has_open_order(user_id, mode, pos.key):
             continue

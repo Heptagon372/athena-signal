@@ -85,7 +85,7 @@ function Countdown() {
     <div className={`countdown${open ? " open" : h < 1 ? " soon" : ""}`}
          title="다음 장 세션까지 남은 시간">
       <span className="cd-dot" />
-      <span className="cd-label">{open ? `${status.label} · ${next[2]}` : next[2]}</span>
+      <span className="cd-label">{open ? `${status.label}   ${next[2]}` : next[2]}</span>
       <span className="cd-time mono">{text}</span>
     </div>
   );
@@ -116,7 +116,7 @@ export default function Chrome({ children }) {
             </svg>
             <div>
               <div className="brand-text">ATHENA SIGNAL</div>
-              <div className="brand-sub">코스피 · 코스닥 · 미국</div>
+              <div className="brand-sub"><span>코스피</span><span>코스닥</span><span>미국</span></div>
             </div>
           </Link>
 
@@ -174,7 +174,7 @@ export default function Chrome({ children }) {
 
       <footer className="shell">
         <div className="disclaimer">
-          ATHENA SIGNAL이 표시하는 확률은 검증된 투자 자문이 아니라, 기술적 지표·뉴스·커뮤니티
+          ATHENA SIGNAL이 표시하는 확률은 검증된 투자 자문이 아니라, 기술적 지표, 뉴스, 커뮤니티
           여론을 결합한 실험적 휴리스틱 점수입니다. 기술적 지표는 과거 가격의 통계적 요약일 뿐
           미래 수익을 보장하지 않으며, 종목토론방 여론은 노이즈와 의도적 선동이 섞인 채널입니다.
           모의투자는 가상 자금이며 실제 주문은 발생하지 않습니다. 실제 매매 판단의 유일한 근거로

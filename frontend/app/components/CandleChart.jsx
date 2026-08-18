@@ -248,7 +248,7 @@ export default function CandleChart({ data }) {
           <span key={o.key}><i style={{ background: o.color }} />{o.label}</span>
         ))}
         <span style={{ color: "var(--muted)" }}>
-          · {data.timeframe_label || ""} {n}봉 ({data.dates[0]} ~ {data.dates[n - 1]})
+          {data.timeframe_label || ""} {n}봉 ({data.dates[0]} ~ {data.dates[n - 1]})
         </span>
 
         <div className="ind-picker">
@@ -296,7 +296,7 @@ export default function CandleChart({ data }) {
             <line x1={PADL} y1={py(v)} x2={W - PADR} y2={py(v)}
                   stroke="var(--hairline)" strokeWidth="0.6" opacity="0.55" />
             <text x={PADL - 7} y={py(v) + 3.5} textAnchor="end" fill="var(--muted)"
-                  fontFamily="monospace" fontSize="10">{fmtNum(v)}</text>
+                  fontSize="12">{fmtNum(v)}</text>
           </g>
         ))}
 
@@ -333,7 +333,7 @@ export default function CandleChart({ data }) {
           return (
             <g key={panel.key}>
               <text x={PADL} y={panel.top - 6} fill="var(--muted)"
-                    fontFamily="monospace" fontSize="9.5">{panel.label}</text>
+                    fontSize="11.5">{panel.label}</text>
 
               {/* 과열/침체 구간 음영 */}
               {panel.band && (
@@ -347,7 +347,7 @@ export default function CandleChart({ data }) {
                   <line x1={PADL} y1={y(v)} x2={W - PADR} y2={y(v)}
                         stroke="var(--hairline)" strokeWidth="0.7" strokeDasharray="3 3" />
                   <text x={PADL - 7} y={y(v) + 3.5} textAnchor="end" fill="var(--muted)"
-                        fontFamily="monospace" fontSize="9.5">
+                        fontSize="11.5">
                     {format ? format(v) : v}
                   </text>
                 </g>
@@ -391,7 +391,7 @@ export default function CandleChart({ data }) {
 
         {data.dates.map((d, i) => i % tickEvery === 0 && (
           <text key={i} x={x(i)} y={height - 8} textAnchor="middle" fill="var(--muted)"
-                fontFamily="monospace" fontSize="9.5">{d}</text>
+                fontSize="11.5">{d}</text>
         ))}
 
         {h !== null && (

@@ -13,6 +13,11 @@
     · 공개 모드     ATHENA_PUBLIC_ORIGIN 설정 시 로컬 계정도 KIS 주문에
                    자기 키가 필수가 되는가. Mongo 가 죽어도 **차단 쪽으로**
                    실패하는가 (fail-closed)
+    · 토큰 지문     세션 토큰이 원문이 아니라 SHA-256 지문으로 저장되는가.
+                   지문 도입 전에 발급된 토큰도 계속 통하는가 (자동 이전)
+    · 외부 URL      javascript: 링크가 걸러지는가. 스킴 사이에 제어문자를 끼운
+                   우회도 막히는가 — <a href> 는 esc() 로 막히지 않습니다
+    · 비밀번호      8자 미만·흔한 값·같은 글자 반복이 거부되는가
 
 설계 근거는 security.py 모듈 docstring 과 DEPLOY.md 에 있습니다.
 """
@@ -183,6 +188,132 @@ try:
 finally:
     credentials.get = _real_get
     security.reset()
+
+
+# ---------------------------------------------------------------------------
+# 4. 세션 토큰 지문
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("  4. 세션 토큰 지문 — DB 가 새도 토큰 원문은 복원되지 않아야")
+print("=" * 70)
+
+_tok = "abcdefghijklmnopqrstuvwxyz0123456789"
+_dig = security.token_digest(_tok)
+check("지문은 64자 hex", len(_dig) == 64 and all(c in "0123456789abcdef" for c in _dig))
+check("같은 토큰은 같은 지문", _dig == security.token_digest(_tok))
+check("다른 토큰은 다른 지문", _dig != security.token_digest(_tok + "x"))
+check("지문에서 원문이 보이지 않는다", _tok not in _dig)
+check("조회 키는 [지문, 원문] 두 개",
+      security.token_lookup_keys(_tok) == [_dig, _tok],
+      "원문도 찾아봐야 지문 도입 전 세션이 로그아웃되지 않습니다")
+check("빈 토큰은 조회 키 없음", security.token_lookup_keys("") == [])
+
+# 실제 저장·조회 왕복 (SQLite)
+from storage import users as _users
+
+_uname = "__qa_digest_user__"
+
+
+def _wipe_qa_user():
+    with _users._conn() as conn:
+        conn.execute("DELETE FROM sessions WHERE user_id IN "
+                     "(SELECT id FROM users WHERE username = ?)", (_uname,))
+        conn.execute("DELETE FROM users WHERE username = ?", (_uname,))
+
+
+try:
+    _wipe_qa_user()
+    _users.register(_uname, "qa-password-1234")
+    _login = _users.login(_uname, "qa-password-1234")
+    _session = _login["token"]
+    _uid = _login["user"]["id"]
+
+    with _users._conn() as _c:
+        _stored = [r["token"] for r in _c.execute(
+            "SELECT token FROM sessions WHERE user_id = ?", (_uid,))]
+
+    check("로그인 토큰으로 사용자가 복원된다",
+          (_users.user_from_token(_session) or {}).get("username") == _uname)
+    check("DB 에는 토큰 원문이 없다", _session not in _stored)
+    check("DB 에 있는 것은 지문", security.token_digest(_session) in _stored)
+
+    # 지문 도입 전에 발급된 세션 흉내 — 원문으로 한 줄 심어 둡니다
+    _legacy = "legacy-plaintext-token-0001"
+    with _users._conn() as _c:
+        _c.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) "
+                   "VALUES (?, ?, ?, ?)",
+                   (_legacy, _uid, "2026-01-01T00:00:00", "2099-01-01T00:00:00"))
+    check("원문으로 저장된 옛 세션도 계속 통한다",
+          (_users.user_from_token(_legacy) or {}).get("username") == _uname,
+          "지문 도입이 이미 로그인해 둔 사람을 쫓아내면 안 됩니다")
+
+    with _users._conn() as _c:
+        _after = [r["token"] for r in _c.execute(
+            "SELECT token FROM sessions WHERE user_id = ?", (_uid,))]
+    check("한 번 쓰이면 그 자리에서 지문으로 바뀐다",
+          _legacy not in _after and security.token_digest(_legacy) in _after)
+
+    _users.logout(_session)
+    check("로그아웃하면 세션이 사라진다", _users.user_from_token(_session) is None)
+finally:
+    _wipe_qa_user()
+
+
+# ---------------------------------------------------------------------------
+# 5. 외부 URL — javascript: 링크 차단
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("  5. 외부 URL — <a href> 에 들어가도 되는 값만 통과")
+print("=" * 70)
+
+for _good in ("https://finance.naver.com/item/board.naver?code=005930",
+              "http://example.com/a?b=c#d"):
+    check(f"통과: {_good[:44]}", security.safe_external_url(_good) == _good)
+
+_BAD_URLS = {
+    "javascript:alert(1)": "javascript: — 클릭 한 번이 스크립트 실행",
+    "JaVaScRiPt:alert(1)": "대소문자 섞기",
+    "java\tscript:alert(1)": "스킴 사이 탭",
+    "java\nscript:alert(1)": "스킴 사이 개행",
+    "  javascript:alert(1)": "앞 공백",
+    "data:text/html,<script>alert(1)</script>": "data: 문서",
+    "vbscript:msgbox(1)": "vbscript:",
+    "file:///etc/passwd": "로컬 파일",
+    "//evil.example.com": "프로토콜 상대 URL",
+}
+for _u, _why in _BAD_URLS.items():
+    check(f"차단: {_why}", security.safe_external_url(_u) == "", repr(_u))
+
+check("빈 값은 빈 값", security.safe_external_url("") == "")
+check("길이 상한이 걸린다",
+      len(security.safe_external_url("https://x.com/" + "a" * 900)) == 500)
+
+_DIRTY_NAME = 'a"b\nc.pdf'
+check("파일명에서 따옴표·개행이 제거된다",
+      '"' not in security.safe_filename(_DIRTY_NAME)
+      and "\n" not in security.safe_filename(_DIRTY_NAME),
+      "Content-Disposition 헤더가 쪼개지면 안 됩니다")
+check("파일명이 비면 기본값", security.safe_filename("///") == "download")
+
+
+# ---------------------------------------------------------------------------
+# 6. 비밀번호 정책
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("  6. 비밀번호 — 가입·변경 때만 검사 (기존 계정은 그대로 로그인)")
+print("=" * 70)
+
+check("7자는 거부", _users.validate_password("abc1234") is not None)
+check("8자는 통과", _users.validate_password("nabi8391") is None)
+check("흔한 값은 8자여도 거부", _users.validate_password("abcd1234") is not None,
+      "길이만 채운 사전 단어는 남이 첫 번째로 찍어봅니다")
+check("흔한 비밀번호는 거부", _users.validate_password("password") is not None)
+check("대소문자가 달라도 흔한 값은 거부", _users.validate_password("PassWord") is not None)
+check("같은 글자 반복은 거부", _users.validate_password("aaaaaaaa") is not None)
+check("두 글자 반복도 거부", _users.validate_password("12121212") is not None)
+check("긴 문장은 통과", _users.validate_password("부엉이가 밤에 시세를 본다") is None,
+      "복잡도 규칙 대신 길이를 봅니다")
+check("200자 초과는 거부", _users.validate_password("a1b2" * 60) is not None)
 
 print("\n" + "=" * 70)
 print(f"  통과 {len(PASS)}  실패 {len(FAIL)}")

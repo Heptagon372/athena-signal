@@ -100,6 +100,11 @@ async def _security_headers(request: Request, call_next):
     """모든 응답에 붙는 보안 헤더.
 
     · nosniff / frame DENY / referrer 축소 — 비용 없는 기본기입니다.
+    · CSP — 이 서버가 그리는 화면(자동매매 콘솔·구버전 index.html)은 인라인
+      스크립트 덩어리라 script-src 를 조일 수 없습니다. 대신 connect-src 와
+      img-src, form-action 을 'self' 로 잠급니다. 스크립트가 주입되더라도
+      localStorage 의 세션 토큰을 **밖으로 보낼 통로**가 없어야 합니다 —
+      그 토큰이 곧 KIS 주문 권한이기 때문입니다. (근거: security.py)
     · 인증·키 경로는 no-store — 세션 토큰이나 마스킹된 키 정보가 브라우저
       캐시·중간 프록시에 남으면 안 됩니다.
     · HSTS 는 실제로 https 로 서비스될 때만 — nginx 뒤(X-Forwarded-Proto)에서
@@ -111,6 +116,8 @@ async def _security_headers(request: Request, call_next):
     headers.setdefault("X-Content-Type-Options", "nosniff")
     headers.setdefault("X-Frame-Options", "DENY")
     headers.setdefault("Referrer-Policy", "same-origin")
+    headers.setdefault("Content-Security-Policy", security.CONTENT_SECURITY_POLICY)
+    headers.setdefault("Permissions-Policy", security.PERMISSIONS_POLICY)
     path = request.url.path
     if path.startswith("/api/auth") or path.startswith("/api/keys"):
         headers["Cache-Control"] = "no-store"
@@ -118,6 +125,36 @@ async def _security_headers(request: Request, call_next):
             request.headers.get("x-forwarded-proto", "") == "https":
         headers.setdefault("Strict-Transport-Security", "max-age=31536000")
     return response
+
+
+# 로그인 없이 부를 수 있으면서 한 번에 CPU·외부 API 를 크게 쓰는 경로입니다.
+# 예측 한 번이 지표 수십 개와 뉴스·커뮤니티 수집을 돌리므로, 스크립트로
+# 두드리면 서버가 아니라 **외부 API 쿼터**가 먼저 죽습니다 (그러면 로그인한
+# 사용자의 자동매매까지 시세를 못 받습니다).
+_ANON_HEAVY_PATHS = ("/api/predict/", "/api/verify/", "/api/community/",
+                     "/api/news/", "/api/chart/", "/api/search")
+_ANON_HEAVY_LIMIT = 120          # IP 당
+_ANON_HEAVY_WINDOW = 60.0        # 초
+
+
+@app.middleware("http")
+async def _anon_rate_limit(request: Request, call_next):
+    """비로그인 고비용 조회의 IP 당 상한.
+
+    로그인한 요청은 세지 않습니다 — 자기 계정으로 자기 화면을 보는 폴링까지
+    막으면 정상 사용이 끊깁니다. 익명 경로만 셉니다.
+
+    한도(분당 120)는 사람이 화면을 쓰는 속도보다 한참 위입니다. 걸리는 것은
+    루프를 도는 스크립트뿐입니다.
+    """
+    path = request.url.path
+    if request.method == "GET" and any(path.startswith(p) for p in _ANON_HEAVY_PATHS) \
+            and not _bearer_token(request):
+        retry = security.throttle(f"anon:{security.client_ip(request)}",
+                                  _ANON_HEAVY_LIMIT, _ANON_HEAVY_WINDOW)
+        if retry:
+            return _too_many(retry)
+    return await call_next(request)
 
 
 def _too_many(retry_after: int) -> JSONResponse:
@@ -1160,22 +1197,60 @@ class ScrapRequest(BaseModel):
     items: list[ScrapItem] = []
 
 
+# 한 번의 POST 로 받을 게시글 수 상한 (게시판 한 페이지 분량이면 충분합니다)
+MAX_SCRAP_ITEMS = 200
+
+
 @app.post("/api/scrap")
-def ingest_scrap(req: ScrapRequest):
+def ingest_scrap(req: ScrapRequest, request: Request):
     """확장프로그램이 브라우저에서 긁은 게시글을 받습니다.
 
     서버가 직접 접근할 수 없는 커뮤니티(토스·팍스넷·카카오페이증권 등)를
     사용자 브라우저를 통해 수집하기 위한 경로입니다. 사용자가 이미 열람 중인
     페이지의 공개 게시글만 대상으로 하며, 자격증명은 주고받지 않습니다.
+
+    공개 서버에서 로그인을 요구하는 이유 — 여기는 **예측 입력에 글을 쓰는 문**입니다
+        여기 들어온 글은 커뮤니티 여론 점수가 되고, 그 점수는 예측 확률과
+        자동매매 판단에 그대로 들어갑니다. 인터넷에 열어두면 누구나 "삼성전자
+        사자" 수천 건을 밀어 넣어 남의 자동매매가 사게 만들 수 있습니다.
+        시세를 조작하는 것보다 훨씬 싼 신호 조작 경로입니다.
+
+        그런데 확장프로그램은 tossinvest.com 위에서 도는 콘텐츠 스크립트라
+        localhost 의 세션 쿠키도, Authorization 헤더도 붙일 수 없습니다
+        (extension/scraper.js). 그래서 로컬 전용 서버에서는 지금까지처럼 열어
+        둡니다 — 어차피 8000번은 127.0.0.1 에만 묶여 있어 그 PC 안에서만
+        닿습니다. 공개 오리진이 설정된 순간(=인터넷에 노출된 순간)에만 로그인을
+        요구합니다. 확장프로그램의 host_permissions 도 localhost 뿐이라 공개
+        서버로는 애초에 전송하지 않습니다.
+
+        must_use_own_keys() 와 같은 판단 기준입니다 — "로컬이면 기존 동작,
+        공개면 조인다".
     """
+    if security.public_mode():
+        user = require_user(request)
+        limit_key = f"scrap:{user['id']}"
+    else:
+        limit_key = f"scrap:{security.client_ip(request)}"
+    # 한 사람이 정상적으로 게시판을 훑는 속도의 상한 (10분에 120번).
+    # 공개 서버에서 계정을 만들어 우회하려 해도 가입이 IP 당 시간당 10개입니다.
+    retry = security.throttle(limit_key, 120, 600)
+    if retry:
+        return _too_many(retry)
+
     try:
         symbol = symbol_registry.resolve(req.ticker)
     except SymbolNotFoundError as exc:
         return _not_found(exc)
 
+    # 한 번에 받을 글 수 상한 — 게시판 한 페이지가 이보다 많을 일은 없습니다
+    items = [i.model_dump() for i in req.items[:MAX_SCRAP_ITEMS]]
+    # javascript: 링크는 저장 단계에서 버립니다. 이 url 은 뉴스·커뮤니티 목록의
+    # <a href> 로 그대로 들어가서, 클릭 한 번이 스크립트 실행이 됩니다.
+    for item in items:
+        item["url"] = security.safe_external_url(item.get("url") or "")
+
     result = scrap_store.save_batch(
-        symbol.key, req.source,
-        [i.model_dump() for i in req.items], req.kind,
+        symbol.key, req.source, items, req.kind,
     )
     # 새 글이 들어왔으면 캐시를 비워 다음 조회에 바로 반영되게 합니다
     if result["saved"]:
@@ -1413,8 +1488,11 @@ def save_report_pdf(report_id: str):
                       "(SAVETICKER_COOKIE)가 없거나 만료되었을 수 있습니다."},
             status_code=502)
     content, filename = fetched
+    # 파일명은 외부(세이브)에서 온 문자열입니다. 따옴표나 개행이 섞이면
+    # Content-Disposition 헤더가 쪼개지므로 헤더에 넣기 전에 걸러냅니다.
+    safe_name = security.safe_filename(filename, fallback="report.pdf")
     return Response(content=content, media_type="application/pdf",
-                    headers={"Content-Disposition": f'inline; filename="{filename}"'})
+                    headers={"Content-Disposition": f'inline; filename="{safe_name}"'})
 
 
 @app.get("/api/news/{query}")
@@ -1487,8 +1565,21 @@ def scorecard(request: Request, limit: int = 40):
 
 
 @app.post("/api/scorecard/resolve")
-def scorecard_resolve():
-    """지금 바로 채점 — 만기가 지난 예측을 전 종목에 대해 처리합니다."""
+def scorecard_resolve(request: Request):
+    """지금 바로 채점 — 만기가 지난 예측을 전 종목에 대해 처리합니다.
+
+    로그인을 요구하는 이유: 이 한 번의 호출이 **전 사용자의** 미채점 예측을
+    훑고 시세를 조회한 뒤 전역 가중치까지 다시 씁니다. 열려 있으면 반복 호출
+    하나로 서버와 외부 API 쿼터가 함께 말라붙고, 그 사이 자동매매가 시세를
+    받지 못합니다. 화면(성적표)은 이미 로그인 뒤에만 열립니다.
+    """
+    user = require_user(request)
+    # 채점은 10분마다 도는 자동 루프(_auto_resolve_loop)가 이미 합니다.
+    # 이 버튼은 "지금 당장" 용이라 자주 누를 이유가 없습니다.
+    retry = security.throttle(f"resolve:{user['id']}", 6, 600)
+    if retry:
+        return _too_many(retry)
+
     global _last_auto_resolve
     result = backtest.auto_resolve_all()
     _last_auto_resolve = result
@@ -1901,7 +1992,18 @@ class CloseRequest(BaseModel):
 
 
 @app.post("/api/close")
-def close_market(req: CloseRequest):
+def close_market(req: CloseRequest, request: Request):
+    """장마감 일괄 채점 + 가중치 재조정 (main.py close 와 같은 일).
+
+    /api/scorecard/resolve 와 같은 이유로 로그인을 요구합니다 — 전역 가중치를
+    다시 쓰는 호출이라 아무나 부를 수 있으면 모든 사용자의 예측 공식이
+    외부인의 손에 흔들립니다.
+    """
+    user = require_user(request)
+    retry = security.throttle(f"close:{user['id']}", 6, 600)
+    if retry:
+        return _too_many(retry)
+
     resolved, unknown = [], []
     for raw in req.tickers:
         try:
@@ -1933,6 +2035,10 @@ class AutoTradeConfig(BaseModel):
 class AutoTradeToggle(BaseModel):
     enabled: bool
     confirm: str = ""          # live 모드에서 켤 때 필요한 확인 문구
+
+
+class PositionPin(BaseModel):
+    pinned: bool
 
 
 class BacktestRequest(BaseModel):
@@ -1985,7 +2091,7 @@ def _account_identity(mode: str) -> dict:
 # 서버가 옛 코드면 스스로 "재시작하세요"를 띄우게 합니다.
 # 콘솔이 쓰는 엔드포인트를 추가/변경할 때마다 1씩 올리세요 (autotrade.html 의
 # REQUIRED_API 와 짝).
-CONSOLE_API_VERSION = 9
+CONSOLE_API_VERSION = 10       # 10: 포지션 고정 (/api/autotrade/position/{symbol}/pin)
 
 
 # 포지션·계좌 블록 캐시 — 스냅샷의 유일하게 비싼 부분입니다 (시세·잔고 실호출).
@@ -2048,6 +2154,14 @@ def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> di
             if ledger.tranches:
                 row["split"] = split.describe(
                     ledger, float(row.get("current_price") or 0))
+                # "다음 매수 가격은 이미 지났는데 왜 안 사는가"의 답. 엔진이
+                # 회전마다 판단하고 버리던 값을 그대로 붙입니다 (엔진 루프와
+                # 이 API 는 한 프로세스라 메모리에서 바로 읽힙니다).
+                wait = autotrade.split_wait(user_id, mode, row["key"])
+                if wait.get("text"):
+                    row["split"]["wait"] = {"code": wait.get("code") or "",
+                                            "text": wait.get("text") or "",
+                                            "at": wait.get("at") or ""}
         # 평가손익·예수금을 반드시 함께 넘깁니다. 예전에는 총자산만 넘겨서,
         # 콘솔이 7초마다 예수금 기록을 NULL 로 덮어썼고 입출금 판별이 통째로
         # 무력화됐습니다. 지금 계산식은 평가손익 기준이라 이 값이 빠지면
@@ -2693,6 +2807,42 @@ def autotrade_close_position(symbol: str, request: Request):
     _invalidate_snapshot(user["id"])          # 청산으로 포지션이 바뀌었습니다
     return {"ok": True, "order": order.to_dict(),
             **_autotrade_snapshot(user["id"])}
+
+
+@app.post("/api/autotrade/position/{symbol}/pin")
+def autotrade_pin_position(symbol: str, req: PositionPin, request: Request):
+    """포지션 고정 — 켜면 **목표가·손절가에서만** 매도합니다.
+
+    막는 것   트레일링 되돌림 · 신호 반전 · 보유 시간 초과 · 회전(갈아타기)
+    두는 것   손절가 · 손실 한도 % · 목표가 · 목표 수익률 % · 파생 만기
+              그리고 **수동 청산** — 사람이 누른 버튼은 고정이 막지 않습니다.
+
+    자동매매가 관리하지 않는 종목(계좌에만 있는 주식)에는 걸 수 없습니다.
+    걸 필요도 없습니다 — 그런 종목은 애초에 자동매매가 팔지 않습니다.
+    """
+    user = require_user(request)
+    cfg = at_store.get_config(user["id"])
+    mode = cfg.get("mode", "paper")
+    inst = instruments.try_resolve(symbol)
+    key = inst.key if inst else symbol
+    name = inst.name if inst else symbol
+
+    if not at_store.set_position_pinned(user["id"], mode, key, req.pinned):
+        return JSONResponse(status_code=404, content={
+            "ok": False,
+            "error": f"{name} 은(는) 자동매매가 관리하는 포지션이 아니어서 "
+                     f"고정할 수 없습니다 (자동매매가 팔지도 않습니다). "
+                     f"관리하려면 매매 대상에 추가하세요."})
+
+    at_store.log_event(
+        user["id"], "config",
+        (f"{name} 포지션을 고정했습니다 — 이제 목표가나 손절가에서만 팝니다 "
+         f"(트레일링, 신호 반전, 보유 시간, 회전 매도 없음)."
+         if req.pinned else
+         f"{name} 포지션 고정을 풀었습니다 — 자동 청산 규칙이 다시 전부 적용됩니다."),
+        level="warn", symbol=key, name=name, detail={"pinned": req.pinned})
+    _invalidate_snapshot(user["id"])       # 화면이 고정 표시를 바로 그리도록
+    return {"ok": True, "pinned": req.pinned, **_autotrade_snapshot(user["id"])}
 
 
 @app.post("/api/autotrade/backtest")

@@ -16,7 +16,7 @@ import { api, fmtNum, signColor, SymbolNotFound } from "../lib/api";
 import { useSymbol } from "../providers";
 
 function countdown(seconds) {
-  if (seconds == null) return "—";
+  if (seconds == null) return "-";
   if (seconds <= 0) return "채점 대기";
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
@@ -133,7 +133,7 @@ export default function LiveScoring({ onResolved }) {
       <div className="lv-head">
         <span className="eyebrow">실시간 채점</span>
         <span className={`lv-dot ${live.market_status?.is_open ? "on" : ""}`} />
-        <span className="lv-market">{live.market_status?.label || "—"}</span>
+        <span className="lv-market">{live.market_status?.label || "-"}</span>
       </div>
 
       {/* 종목 — 지금 보고 있는 주식 */}
@@ -146,7 +146,7 @@ export default function LiveScoring({ onResolved }) {
         <div className={`lv-price ${flash ? "flash" : ""}`}>
           {/* 달러는 앞에, 원은 뒤에 붙습니다 ("304.52$" 가 되지 않도록) */}
           {digits === 2 && <span className="lv-cur pre">$</span>}
-          {live.price != null ? px(live.price) : "—"}
+          {live.price != null ? px(live.price) : "-"}
           {digits !== 2 && <span className="lv-cur">원</span>}
         </div>
         {live.change_rate != null && (
@@ -170,7 +170,7 @@ export default function LiveScoring({ onResolved }) {
             잠정 적중률 <b style={{ color: s.provisional_accuracy >= 50 ? "var(--up)" : "var(--down)" }}>
               {s.provisional_accuracy}%
             </b>
-            <span> · 판정 가능 {decided}건</span>
+            <span>   판정 가능 {decided}건</span>
           </div>
         </>
       )}

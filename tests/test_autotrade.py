@@ -310,6 +310,84 @@ def test_exits():
     check("청산", "만기 임박 파생은 신호와 무관하게 청산",
           d.should_exit and d.urgency == "urgent", d.reason)
 
+    test_pinned_exits(inst, cfg, position, base)
+
+
+def test_pinned_exits(inst, cfg, position, base):
+    """고정한 포지션 — 목표가와 손절가 말고는 팔지 않습니다.
+
+    여기서 가장 나쁜 실패는 **고정했는데 팔리는 것**입니다. 사용자가 "이건
+    들고 간다"고 못박은 종목을 엔진이 시간이나 신호로 팔면, 그건 설정 하나가
+    안 먹은 게 아니라 지시를 어긴 것입니다. 그래서 막아야 하는 네 경로를
+    전부 확인합니다 (트레일링 · 신호 반전 · 시간 · 승자 보유).
+
+    반대 방향도 같이 봅니다 — 고정이 **손절을 끄면 절대 안 됩니다.**
+    """
+    pinned = {**base, "pinned": 1}
+    sig = lambda price, score=0.2: strategy.Signal(   # noqa: E731
+        key=inst.key, ok=True, score=score, price=price)
+
+    # -- 고정이 막아야 하는 것 --------------------------------------------
+    d = strategy.check_exit(inst, position, sig(11_000), cfg,
+                            {**pinned, "peak_price": 12_000})
+    check("고정", "고정하면 트레일링 되돌림으로 팔지 않는다", not d.should_exit, d.reason)
+
+    d = strategy.check_exit(inst, position, sig(10_500, score=-0.4), cfg, pinned)
+    check("고정", "고정하면 신호 반전으로 팔지 않는다", not d.should_exit, d.reason)
+
+    old = (datetime.now() - timedelta(days=20)).isoformat()
+    d = strategy.check_exit(inst, position, sig(10_500, score=0.5), cfg,
+                            {**pinned, "opened_at": old, "target_price": 99_999})
+    check("고정", "고정하면 보유 기간 초과로 팔지 않는다", not d.should_exit, d.reason)
+
+    d = strategy.check_exit(inst, position, sig(10_500, score=0.5),
+                            {**cfg, "max_hold_sec": 1, "max_hold_minutes": 1},
+                            {**pinned, "opened_at": old, "target_price": 99_999})
+    check("고정", "초 단위, 분 단위 시간 청산도 고정이 막는다", not d.should_exit, d.reason)
+
+    # -- 고정이 막으면 안 되는 것 ------------------------------------------
+    d = strategy.check_exit(inst, position, sig(9_400), cfg, pinned)
+    check("고정", "고정해도 손절가는 그대로 나간다(urgent)",
+          d.should_exit and d.urgency == "urgent", d.reason)
+
+    d = strategy.check_exit(inst, position, sig(8_000),
+                            {**cfg, "stop_loss_pct": 5.0},
+                            {**pinned, "stop_price": 0})
+    check("고정", "고정해도 손실 한도 %는 그대로 나간다",
+          d.should_exit and d.urgency == "urgent", d.reason)
+
+    d = strategy.check_exit(inst, position, sig(12_500), cfg, pinned)
+    check("고정", "고정해도 목표가 도달이면 판다", d.should_exit, d.reason)
+
+    d = strategy.check_exit(inst, position, sig(11_500),
+                            {**cfg, "take_profit_pct": 10.0},
+                            {**pinned, "target_price": 99_999})
+    check("고정", "고정해도 목표 수익률 달성이면 판다", d.should_exit, d.reason)
+
+    # 승자 보유는 "추세가 살아 있으니 목표가 익절을 미루자"입니다. 고정은
+    # "목표가에서 팔라"는 명시적 지시라 이 보류를 적용하지 않습니다.
+    winner = strategy.Signal(key=inst.key, ok=True, score=0.2, price=11_000,
+                             ma50=10_000)
+    win_state = {"entry_price": 10_000, "target_price": 10_800,
+                 "peak_price": 11_100, "opened_at": datetime.now().isoformat()}
+    d = strategy.check_exit(inst, position, winner, {**cfg, "hold_winners": True},
+                            dict(win_state))
+    check("고정", "고정 아님 + 승자 보유 → 익절 보류(기존 동작 그대로)",
+          not d.should_exit, d.reason)
+    d = strategy.check_exit(inst, position, winner, {**cfg, "hold_winners": True},
+                            {**win_state, "pinned": 1})
+    check("고정", "고정이면 승자 보유를 제치고 목표가에서 판다",
+          d.should_exit and "목표가" in d.reason, d.reason)
+
+    # 만기만은 예외입니다 — 안 팔아도 거래소가 정산합니다
+    near = instruments.parse_derivative("101H6000")
+    near.expiry = date.today() + timedelta(days=1)
+    d = strategy.check_exit(near, position, sig(350, score=0.9), cfg,
+                            {"entry_price": 349, "pinned": 1,
+                             "opened_at": datetime.now().isoformat()})
+    check("고정", "고정해도 파생 만기 청산은 막지 못한다",
+          d.should_exit and d.urgency == "urgent", d.reason)
+
 
 # ---------------------------------------------------------------------------
 # 4. 리스크 게이트
@@ -536,6 +614,21 @@ def test_store():
     state = store.get_position_states(TEST_USER, "paper")["X"]
     check("원장", "포지션 상태는 부분 갱신 가능",
           state["entry_price"] == 100 and state["stop_price"] == 97)
+    # 고정 — 매 회전 upsert 되는 고점 갱신에 **쓸려나가면 안 됩니다.**
+    # 조용히 0 으로 돌아가면 사용자는 고정한 줄 알고 있는데 다음 회전에 팔립니다.
+    check("고정", "관리하지 않는 종목에는 고정을 걸 수 없다 (줄을 만들지 않음)",
+          store.set_position_pinned(TEST_USER, "paper", "NOPE", True) is False
+          and "NOPE" not in store.get_position_states(TEST_USER, "paper"))
+    check("고정", "고정을 켜면 상태에 남는다",
+          store.set_position_pinned(TEST_USER, "paper", "X", True)
+          and store.get_position_states(TEST_USER, "paper")["X"]["pinned"] == 1)
+    store.upsert_position_state(TEST_USER, "paper", "X", peak_price=120)
+    check("고정", "고점 갱신이 고정을 지우지 않는다",
+          store.get_position_states(TEST_USER, "paper")["X"]["pinned"] == 1)
+    store.set_position_pinned(TEST_USER, "paper", "X", False)
+    check("고정", "고정을 풀면 0 으로 돌아간다",
+          store.get_position_states(TEST_USER, "paper")["X"]["pinned"] == 0)
+
     store.clear_position_state(TEST_USER, "paper", "X")
     check("원장", "청산 시 상태 삭제",
           "X" not in store.get_position_states(TEST_USER, "paper"))

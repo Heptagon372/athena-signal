@@ -865,6 +865,7 @@ athena-signal/
 | POST | `/api/autotrade/run` | 지금 1회전 실행 |
 | POST | `/api/autotrade/kill` \| `/resume` | 킬 스위치 — 신규 진입 즉시 차단 / 해제 |
 | POST | `/api/autotrade/close/{symbol}` | 개별 포지션 수동 청산 |
+| POST | `/api/autotrade/position/{symbol}/pin` | 포지션 고정 켜기·끄기 (목표가·손절가에서만 매도) |
 | POST | `/api/autotrade/backtest` | 같은 신호·청산 규칙으로 과거 검증 |
 | GET | `/api/autotrade/events` \| `/orders` | 판단 로그 / 주문 원장 (체결·슬리피지 포함) |
 | POST | `/api/autotrade/orders/{id}/cancel` | 미체결 주문 수동 취소 |

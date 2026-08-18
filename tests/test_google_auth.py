@@ -27,6 +27,7 @@ def check(name, ok, detail=""):
 
 
 import api
+import security
 from data_sources import credentials, google_oauth
 from storage import accounts, users
 
@@ -248,11 +249,37 @@ class FakeCollection:
         FakeCollection._next_id += 1
         self.docs.append(stored)
 
+    @staticmethod
+    def _matches(doc, spec):
+        """{필드: 값} 과 {필드: {"$in": [...]}} 두 가지만 봅니다.
+
+        $in 이 필요한 이유: 세션 조회가 "지문 또는 (이전 방식의) 원문" 두 값을
+        한 번에 찾습니다 (storage/accounts.user_from_token). 진짜 Mongo 는 이걸
+        지원하므로, 흉내내는 쪽도 알아들어야 검사가 실제 동작을 봅니다.
+        """
+        for key, want in spec.items():
+            have = doc.get(key)
+            if isinstance(want, dict) and "$in" in want:
+                if have not in want["$in"]:
+                    return False
+            elif have != want:
+                return False
+        return True
+
     def find_one(self, spec, projection=None):
         for doc in self.docs:
-            if all(doc.get(k) == v for k, v in spec.items()):
+            if self._matches(doc, spec):
                 return doc
         return None
+
+    def delete_many(self, spec):
+        removed = [d for d in self.docs if self._matches(d, spec)]
+        for doc in removed:
+            self.docs.remove(doc)
+
+        class Result:
+            deleted_count = len(removed)
+        return Result()
 
     def find_one_and_delete(self, spec):
         found = self.find_one(spec)
@@ -403,8 +430,12 @@ try:
           "handoff" in returned and "token" not in returned)
     check("돌아갈 경로가 유지된다", returned.get("next") == "/paper")
 
-    session_token = fake2.sessions.docs[0]["token"]
-    check("핸드오프 코드는 세션 토큰과 다른 값", returned["handoff"] != session_token)
+    # DB 에 남는 것은 토큰 원문이 아니라 지문입니다 (storage/accounts.create_session).
+    stored_session = fake2.sessions.docs[0]["token"]
+    check("핸드오프 코드는 세션 지문과 다른 값", returned["handoff"] != stored_session)
+    check("핸드오프 코드도 지문으로 저장된다",
+          fake2.handoffs.docs[0]["code"] != returned["handoff"],
+          "URL 에 실려 히스토리·로그에 남는 값이라 저장소에서까지 원문이면 안 됩니다")
 
     account_doc = fake2.accounts.docs[0]
     created_ids.append(account_doc["user_id"])
@@ -419,14 +450,19 @@ try:
           users.find_by_username(f"google:{PROFILE['sub']}")["id"] == account_doc["user_id"])
 
     # --- 핸드오프 교환 ---
-    exchanged = api.auth_google_exchange(api.GoogleExchange(handoff=returned["handoff"]))
+    exchanged = api.auth_google_exchange(api.GoogleExchange(handoff=returned["handoff"]), make_request())
+    session_token = exchanged["token"]
     check("핸드오프 교환으로 토큰과 사용자를 받는다",
-          exchanged["token"] == session_token and exchanged["user"]["id"] == account_doc["user_id"])
+          bool(session_token) and exchanged["user"]["id"] == account_doc["user_id"])
+    check("돌려준 토큰 원문은 DB 에 없다 (지문만 저장)",
+          session_token != stored_session
+          and security.token_digest(session_token) == stored_session,
+          "athena.db·Atlas 가 새도 Authorization 에 넣을 값은 복원되지 않아야 합니다")
     check("사용자 dict 가 기존 코드가 쓰는 모양 (id/username/display_name)",
           all(k in exchanged["user"] for k in ("id", "username", "display_name")))
     check("표시 이름이 구글 이름", exchanged["user"]["display_name"] == PROFILE["name"])
 
-    reused = api.auth_google_exchange(api.GoogleExchange(handoff=returned["handoff"]))
+    reused = api.auth_google_exchange(api.GoogleExchange(handoff=returned["handoff"]), make_request())
     check("같은 핸드오프 재사용은 400", getattr(reused, "status_code", 200) == 400)
 
     # --- 세션으로 사용자 복원 ---

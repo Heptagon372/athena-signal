@@ -347,11 +347,23 @@ class Decision:
     tranche: int = 0                              # 대상 차수 번호
     reason: str = ""                              # 주문 사유·로그에 그대로 씁니다
     rejects: list = field(default_factory=list)   # 왜 안 하는가
+    # 거부 사유의 **종류**. 사람이 읽는 rejects 문구에는 RSI 값처럼 회전마다
+    # 달라지는 숫자가 섞여 있습니다. 로그를 "사유가 바뀔 때만" 남기려면
+    # 숫자가 빠진 안정적인 키가 따로 있어야 합니다.
+    code: str = ""
     detail: dict = field(default_factory=dict)    # 판단에 쓴 숫자 전부 (감사용)
+
+    def reject(self, code: str, text: str, **detail) -> "Decision":
+        self.code = code
+        self.rejects.append(text)
+        if detail:
+            self.detail.update(detail)
+        return self
 
     def to_dict(self) -> dict:
         return {"ok": self.ok, "quantity": self.quantity, "tranche": self.tranche,
-                "reason": self.reason, "rejects": self.rejects, "detail": self.detail}
+                "reason": self.reason, "rejects": self.rejects, "code": self.code,
+                "detail": self.detail}
 
 
 def _minutes_since(stamp) -> float | None:
@@ -404,28 +416,25 @@ def plan_buy(cfg: dict, inst, ledger: Ledger, price: float,
     now = now or datetime.now()
 
     if not p["split_enabled"]:
-        d.rejects.append("분할 매매가 꺼져 있습니다 (split_enabled)")
-        return d
+        return d.reject("disabled", "분할 매매가 꺼져 있습니다 (split_enabled)")
     if not ledger.tranches:
-        d.rejects.append("차수 원장이 없습니다 — 분할로 잡은 포지션이 아닙니다")
-        return d
+        return d.reject("no_ledger",
+                        "차수 원장이 없습니다 — 분할로 잡은 포지션이 아닙니다")
     if price <= 0:
-        d.rejects.append("현재가를 몰라 차수 판단을 할 수 없습니다")
-        return d
+        return d.reject("no_price", "현재가를 몰라 차수 판단을 할 수 없습니다")
 
     plan = ledger.plan or {}
     total = int(len(plan.get("qty") or []) or p["split_tranches"])
 
     # ① 남은 차수
     if ledger.count >= total:
-        d.rejects.append(f"차수를 다 썼습니다 ({ledger.count}/{total}차)")
-        return d
+        return d.reject("exhausted", f"차수를 다 썼습니다 ({ledger.count}/{total}차)")
 
     last = ledger.last
     n = ledger.next_n()
     if n > total:
-        d.rejects.append(f"다음 차수 번호가 계획을 넘습니다 ({n} > {total})")
-        return d
+        return d.reject("plan_overflow",
+                        f"다음 차수 번호가 계획을 넘습니다 ({n} > {total})")
 
     # ② 하락률 — 직전 차수 체결가 대비
     drops = plan.get("drop") or _steps(p["split_buy_drop_steps"], total - 1,
@@ -436,9 +445,12 @@ def plan_buy(cfg: dict, inst, ledger: Ledger, price: float,
     # 로그를 읽는 사람이 오른 것으로 읽습니다.
     change_pct = (price - last.price) / last.price * 100.0
     if price > trigger:
-        d.rejects.append(f"{n}차 매수가 아직입니다 — 직전 차수 {last.price:,.0f} 대비 "
-                         f"{change_pct:+.2f}% (필요 -{drop_pct:g}%, 기준가 {trigger:,.0f})")
-        return d
+        return d.reject(
+            "price",
+            f"{n}차 매수가 아직입니다 — 직전 차수 {last.price:,.0f} 대비 "
+            f"{change_pct:+.2f}% (필요 -{drop_pct:g}%, 기준가 {trigger:,.0f})",
+            tranche=n, price=price, trigger=round(trigger, 4),
+            prev_price=last.price, change_pct=round(change_pct, 4))
 
     # ③ 과매도 지표
     is_oversold, note = oversold(p, rsi, bb_pct)
@@ -448,30 +460,35 @@ def plan_buy(cfg: dict, inst, ledger: Ledger, price: float,
             have.append(f"RSI {float(rsi):.1f}")
         if bb_pct is not None:
             have.append(f"%B {float(bb_pct):.2f}")
-        d.rejects.append(
+        return d.reject(
+            "oversold",
             f"{n}차 가격 조건은 맞지만 과매도가 아닙니다 "
-            f"({' · '.join(have) or '지표 없음'}) — 떨어진다는 사실만으로는 담지 않습니다")
-        return d
+            f"({' · '.join(have) or '지표 없음'}) — 떨어진다는 사실만으로는 담지 않습니다",
+            tranche=n, price=price, trigger=round(trigger, 4),
+            rsi=(round(float(rsi), 2) if rsi is not None else None),
+            bb_pct=(round(float(bb_pct), 3) if bb_pct is not None else None),
+            need_rsi=p["split_oversold_rsi"], need_bb=p["split_oversold_bb"])
 
     # ④ 차수 간 최소 간격
     gap = _minutes_since(last.at)
     if gap is not None and gap < p["split_min_gap_min"]:
-        d.rejects.append(f"직전 차수로부터 {gap:.0f}분 — "
-                         f"{p['split_min_gap_min']}분은 지나야 다음 차수를 담습니다")
-        return d
+        return d.reject("gap", f"직전 차수로부터 {gap:.0f}분 — "
+                        f"{p['split_min_gap_min']}분은 지나야 다음 차수를 담습니다",
+                        tranche=n, gap_min=round(gap, 1))
 
     # ⑤ 하루 상한
     today = now.strftime("%Y-%m-%d")
     adds = ledger.adds_on(today)
     if adds >= p["split_max_adds_per_day"]:
-        d.rejects.append(f"오늘 추가 매수 한도 도달 ({adds}/{p['split_max_adds_per_day']}회)")
-        return d
+        return d.reject("daily_cap",
+                        f"오늘 추가 매수 한도 도달 "
+                        f"({adds}/{p['split_max_adds_per_day']}회)",
+                        tranche=n, adds_today=adds)
 
     quantities = plan.get("qty") or []
     quantity = float(quantities[n - 1]) if len(quantities) >= n else float(ledger.tranches[0].quantity)
     if quantity <= 0:
-        d.rejects.append(f"{n}차 계획 수량이 0입니다")
-        return d
+        return d.reject("qty", f"{n}차 계획 수량이 0입니다", tranche=n)
 
     d.ok = True
     d.quantity = quantity

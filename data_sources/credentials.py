@@ -29,6 +29,20 @@ from config import BASE_DIR
 
 KEY_FILE = BASE_DIR / "api_keys.json"
 
+
+def _harden(path) -> None:
+    """비밀이 든 파일을 소유자만 읽게 (chmod 600).
+
+    security.harden_file() 과 같은 일을 합니다. 그 모듈을 import 하지 않는 이유는
+    security 가 이 모듈을 import 하기 때문입니다 (순환). 세 줄짜리라 여기 둡니다.
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
 # ---------------------------------------------------------------------------
 # 사용자 오버레이
 # ---------------------------------------------------------------------------
@@ -288,11 +302,19 @@ def status() -> dict:
 
 
 def save(values: dict) -> Path:
-    """setup 도구가 호출 — 키를 api_keys.json 에 저장."""
+    """setup 도구가 호출 — 키를 api_keys.json 에 저장.
+
+    저장 후 소유자만 읽도록 권한을 좁힙니다. 이 파일에는 MONGODB_URI 와
+    ATHENA_CRED_KEY 가 들어가는데, 후자는 **모든 사용자의 KIS 키를 푸는
+    복호화 키**입니다. 기본 umask(022)로 만들어지면 같은 리눅스 서버의 다른
+    계정이 그냥 읽을 수 있고, 그 순간 Atlas 에 암호문으로 보낸 의미가
+    사라집니다. (윈도우에서는 개념이 달라 아무 일도 하지 않습니다)
+    """
     global _file_cache
     current = dict(_from_file())
     current.update({k: v for k, v in values.items() if v})
     KEY_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    _harden(KEY_FILE)
     _file_cache = current
     return KEY_FILE
 

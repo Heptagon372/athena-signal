@@ -9,8 +9,10 @@
 격리된 임시 DB에서만 돕니다 — 실계좌 athena.db 를 건드리지 않습니다.
 """
 import os
+import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +28,7 @@ config.DB_PATH = TMPDB
 from data_sources import fx
 from engine import autotrade as at
 from engine import risk, strategy
-from engine.broker import OrderStatus, Position
+from engine.broker import OrderResult, OrderStatus, Position
 from engine.instruments import FUTURES, STOCK, Instrument
 from models import ResolvedSymbol
 from storage import autotrade as store
@@ -270,6 +272,78 @@ print(f"  복원된 손절가 {stop:,.2f} / 현재가 300.00 (달러)")
 report("복원된 미국 포지션의 손절가가 현재가와 같은 통화다", stop < 300.0,
        "손절가가 현재가보다 위라 check_exit 가 즉시 '손절 도달'로 판정해 "
        "복원 직후 전량 청산됩니다.")
+
+
+# ---------------------------------------------------------------------------
+section("S-1. 브로커가 모르는 주문이 영원히 미결로 남지 않는가")
+# ---------------------------------------------------------------------------
+# 미국 지정가는 당일 만료(DAY)라 장이 끝나면 죽습니다. 그런데 KIS 주문내역
+# 조회에는 미체결 잔량이 그대로 남아, order_status 는 계속 known=True/pending 을
+# 돌려주고 취소는 "주문내역이 존재하지 않습니다" 로 거부됩니다 — 두 API 가 서로
+# 다른 말을 하는 상태입니다.
+#
+# 이때 lost 판정(not known 블록)에는 영영 닿지 못하고, 취소 실패는 오류만 남기고
+# 끝나서 주문이 미결로 굳습니다. 그동안 has_open_order 가 그 종목의 신규 주문을
+# 전부 막습니다.
+#
+# 실측(2026-08-18): DBGI 주문 하나가 7일간 3,076회 폴링되며 매 회전 취소에
+# 실패했고, 같은 상태의 주문 7건이 7개 종목을 자동매매에서 통째로 빼놨습니다.
+
+
+class GoneBroker:
+    """조회에는 미체결로 남고, 취소는 '주문내역 없음' 으로 거부하는 브로커."""
+
+    def order_status(self, record):
+        return OrderStatus(known=True, status="pending", filled_quantity=0.0,
+                           remaining=record["quantity"], detail="체결 0/1")
+
+    def cancel(self, record):
+        return OrderResult(ok=False, status="pending",
+                           error="주문내역이 존재하지 않습니다.")
+
+
+def aged_order(symbol, status, hours):
+    """나이를 지정한 미결 주문 하나.
+
+    record_order 는 created_at 을 now() 로 고정하므로 나이는 넣은 뒤 심습니다.
+    """
+    coid = f"{symbol}:{status}:{hours}"
+    store.record_order(U, {
+        "client_order_id": coid, "broker_mode": MODE, "broker_order_id": "9",
+        "symbol": symbol, "name": symbol, "asset_class": STOCK,
+        "action": "entry", "side": "long", "quantity": 1.0, "price": 18.0,
+        "status": status})
+    row = next(o for o in store.open_orders(U, MODE)
+               if o["client_order_id"] == coid)
+    with sqlite3.connect(TMPDB) as conn:
+        conn.execute("UPDATE at_orders SET created_at = ? WHERE id = ?",
+                     ((datetime.now() - timedelta(hours=hours)).isoformat(),
+                      row["id"]))
+    return row["id"]
+
+
+def settle_once(order_id):
+    at._settle_open_orders(U, {"mode": MODE, "order_timeout_sec": 180},
+                           GoneBroker(),
+                           {"errors": [], "exits": [], "settled": []})
+    with sqlite3.connect(TMPDB) as conn:
+        return conn.execute("SELECT status FROM at_orders WHERE id = ?",
+                            (order_id,)).fetchone()[0]
+
+
+for _sym, _st, _hrs, _expect, _label in (
+        ("DBGI", "pending", 168, "lost",
+         "취소가 '주문 없음' 으로 거부되면 결말 미상으로 닫는다"),
+        ("ANTX", "cancel_requested", 84, "lost",
+         "취소 요청이 하루 넘게 확정 안 되면 결말 미상으로 닫는다"),
+        ("SLS", "pending", 0.01, "pending",
+         "타임아웃 전 주문은 건드리지 않는다"),
+        ("JUNS", "cancel_requested", 2, "cancel_requested",
+         "취소 요청이 아직 어리면 그대로 기다린다")):
+    _got = settle_once(aged_order(_sym, _st, _hrs))
+    report(f"{_label} ({_sym})", _got == _expect,
+           f"status={_got} (기대 {_expect}) · "
+           f"신규주문 차단={store.has_open_order(U, MODE, _sym)}")
 
 
 # ---------------------------------------------------------------------------

@@ -169,11 +169,19 @@ def _load_saved_token(cache_key: str) -> tuple[str, float]:
 
 
 def _save_token(cache_key: str, token: str, expires_at: float):
+    """접근토큰을 .cache 에 저장.
+
+    이 토큰은 유효기간(약 24시간) 동안 **그 자체로 주문 권한**입니다 — APP KEY
+    없이도 이 문자열만 있으면 KIS 주문 API 를 부를 수 있습니다. 그래서 저장한
+    뒤 소유자만 읽도록 권한을 좁힙니다 (api_keys.json 과 같은 이유).
+    """
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _token_file(cache_key).write_text(json.dumps({
+        path = _token_file(cache_key)
+        path.write_text(json.dumps({
             "key": cache_key, "token": token, "expires_at": expires_at,
         }), encoding="utf-8")
+        credentials._harden(path)
     except OSError:
         pass        # 저장에 실패해도 이번 프로세스 안에서는 정상 동작합니다
 

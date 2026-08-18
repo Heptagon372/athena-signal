@@ -9,6 +9,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "../providers";
 
+/** 받침 유무에 따라 은/는 을 고릅니다 ("성적표은" 같은 어색한 문구 방지). */
+function topicParticle(word) {
+  const last = (word || "").trim().slice(-1);
+  const code = last.charCodeAt(0);
+  if (code < 0xac00 || code > 0xd7a3) return "는";   // 한글이 아니면 기본형
+  return (code - 0xac00) % 28 === 0 ? "는" : "은";
+}
+
 export default function RequireAuth({ children, what = "이 기능" }) {
   const { user, ready } = useAuth();
   const pathname = usePathname();
@@ -20,9 +28,9 @@ export default function RequireAuth({ children, what = "이 기능" }) {
       <section className="section">
         <div className="card auth-gate">
           <div className="eyebrow">로그인 필요</div>
-          <h2>{what}은 로그인 후 이용할 수 있습니다</h2>
+          <h2>{what}{topicParticle(what)} 로그인 후 이용할 수 있습니다</h2>
           <p>
-            계정마다 예측 기록·성적표·모의투자 계좌가 따로 저장되기 때문에,
+            계정마다 예측 기록, 성적표, 모의투자 계좌가 따로 저장되기 때문에,
             어느 계정의 데이터인지 알아야 합니다.
           </p>
           <Link href={`/login?next=${encodeURIComponent(pathname)}`}

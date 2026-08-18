@@ -1,5 +1,17 @@
 ﻿# 변경 이력
 
+## v2.2.5 - 2026-08-19 07:35
+
+수정 45 · 삭제 2
+- data_sources: credentials.py, kis_client.py 수정
+- engine: autotrade.py, split.py, strategy.py 수정
+- frontend: CandleChart.jsx, Chrome.jsx 외 15개 수정
+- storage: accounts.py, autotrade.py 외 3개 수정
+- tests: test_autotrade.py, test_autotrade_qa_repro.py 외 3개 수정
+- web: at_ai.html, at_backtest.html 외 6개 수정
+- 루트: .gitignore, api.py, security.py 수정 · athena.db.bak-20260811, athena.db.bak-20260811-083804 삭제
+- 문서: AUTOTRADE.md, README.md 수정
+
 ## v2.2.4 - 2026-08-15 15:21
 
 수정 25 · 추가 8
@@ -37,6 +49,7 @@
 - web: at_ai.html, at_common.js 외 2개 수정
 - 루트: api.py, requirements.txt 외 2개 수정 · VERSION, athena.py 외 2개 추가 · build_exe.bat, setup_api.bat 외 8개 삭제
 - 문서: ACCOUNTS.md, AUTOTRADE.md, README.md 수정
+
 
 
 

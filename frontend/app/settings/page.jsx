@@ -56,7 +56,7 @@ function Field({ field, value, onChange }) {
         type={secret ? "password" : "text"}
         value={value ?? ""}
         autoComplete="off"
-        placeholder={field.set ? "비워 두면 그대로 둡니다 · 지우려면 서비스 삭제" : "값 입력"}
+        placeholder={field.set ? "비워 두면 그대로 둡니다   지우려면 서비스 삭제" : "값 입력"}
         onChange={(e) => onChange(field.name, e.target.value)}
       />
     </label>
@@ -128,14 +128,14 @@ function ProviderCard({ id, provider, onSaved }) {
 
       {provider.extra.length > 0 && (
         <details className="key-extra" open={provider.extra.some((f) => f.set)}>
-          <summary>거래 설정 (계좌·모의/실전)</summary>
+          <summary>거래 설정 (계좌, 모의/실전)</summary>
           {provider.extra.map((f) => (
             <Field key={f.name} field={f} value={draft[f.name]} onChange={change} />
           ))}
           <p className="key-note">
-            ⚠️ 실거래 스위치는 <strong>본인 키·본인 계좌</strong>에만 적용됩니다.
-            구글 계정은 앱 키·시크릿·계좌번호를 모두 저장해야 KIS 주문(모의/실전)을
-            낼 수 있습니다 — 저장 전에는 가상 자금 모의투자만 가능합니다.
+            실거래 스위치는 <strong>본인 키, 본인 계좌</strong>에만 적용됩니다.
+            구글 계정은 앱 키, 시크릿, 계좌번호를 모두 저장해야 KIS 주문(모의/실전)을
+            낼 수 있습니다. 저장 전에는 가상 자금 모의투자만 가능합니다.
           </p>
         </details>
       )}
@@ -184,7 +184,7 @@ function SettingsBody() {
       <div className="eyebrow">설정</div>
       <h1 className="settings-title">내 API 키</h1>
       <p className="settings-lede">
-        여기 저장한 키는 <strong>내 계정에만</strong> 적용됩니다 — 시세·뉴스 조회와
+        여기 저장한 키는 <strong>내 계정에만</strong> 적용됩니다. 시세, 뉴스 조회와
         자동매매가 서버 공용 키 대신 내 키로 동작합니다. 키는 암호화되어
         저장되며, 저장된 값은 다시 표시되지 않습니다 (끝 4자리만 확인용으로 보여줍니다).
       </p>

@@ -67,6 +67,12 @@ ALLOWED_KEYS = allowed_keys()
 # 값을 화면에 돌려줄 때 보여주는 꼬리 글자 수 (키 확인용 — 전체는 절대 안 나감)
 _MASK_TAIL = 4
 
+# 저장 요청 한 번의 상한. 화이트리스트가 이미 "어떤 키"를 막고 있으니, 여기서는
+# "얼마나 큰가"를 막습니다 — 토큰을 훔친 쪽이 Atlas 를 저장소로 쓰는 것을 막는
+# 용도라, 정상 사용에는 닿지 않는 넉넉한 값입니다.
+_MAX_FIELDS = 40
+_MAX_VALUE_LENGTH = 512
+
 CACHE_TTL_SECONDS = 60
 
 _cache: dict[int, tuple[float, dict]] = {}
@@ -148,17 +154,28 @@ def save_keys(user_id: int, values: dict) -> dict:
     오류를 보고 "저장이 안 됐구나" 라고 이해하는데 실제로는 일부가 바뀐,
     화면과 실제가 어긋난 상태가 됩니다.
     """
+    values = values or {}
+    # 항목 수 상한 — ALLOWED_KEYS 보다 많이 보내는 정상 요청은 없습니다.
+    # 훔친 토큰으로 거대한 문서를 밀어 넣어 Atlas 용량을 채우는 경로를 막습니다.
+    if len(values) > _MAX_FIELDS:
+        return {"ok": False, "saved": [], "removed": [],
+                "rejected": [f"항목이 너무 많습니다 (최대 {_MAX_FIELDS}개)"]}
+
     saved, rejected, removed = [], [], []
     sets, unsets = {}, {}
 
-    for name, value in (values or {}).items():
-        name = str(name).strip().upper()
+    for name, value in values.items():
+        name = str(name).strip().upper()[:64]
         if name not in ALLOWED_KEYS:
             # 서버 설정 키(MONGODB_URI 등)를 계정 경로로 밀어넣는 시도 포함.
             # 조용히 버리지 않고 알려줍니다 — 오타(KIS_APPKEY)도 이 길로 옵니다.
             rejected.append(name)
             continue
         value = str(value or "").strip()
+        if len(value) > _MAX_VALUE_LENGTH:
+            # 실제 API 키는 길어야 200자 남짓입니다. 그보다 긴 값은 키가 아닙니다.
+            rejected.append(f"{name} (값이 너무 깁니다)")
+            continue
         if not value:
             unsets[f"values.{name}"] = ""
             removed.append(name)

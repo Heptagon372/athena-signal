@@ -498,11 +498,37 @@ class FakeCollection:
         FakeCollection._next_id += 1
         self.docs.append(stored)
 
+    @staticmethod
+    def _matches(doc, spec):
+        """{필드: 값} 과 {필드: {"$in": [...]}} 두 가지만 봅니다.
+
+        $in 이 필요한 이유: 세션 조회가 "지문 또는 (이전 방식의) 원문" 두 값을
+        한 번에 찾습니다 (storage/accounts.user_from_token). 진짜 Mongo 는 이걸
+        지원하므로, 흉내내는 쪽도 알아들어야 검사가 실제 동작을 봅니다.
+        """
+        for key, want in spec.items():
+            have = doc.get(key)
+            if isinstance(want, dict) and "$in" in want:
+                if have not in want["$in"]:
+                    return False
+            elif have != want:
+                return False
+        return True
+
     def find_one(self, spec, projection=None):
         for doc in self.docs:
-            if all(doc.get(k) == v for k, v in spec.items()):
+            if self._matches(doc, spec):
                 return doc
         return None
+
+    def delete_many(self, spec):
+        removed = [d for d in self.docs if self._matches(d, spec)]
+        for doc in removed:
+            self.docs.remove(doc)
+
+        class Result:
+            deleted_count = len(removed)
+        return Result()
 
     def find_one_and_delete(self, spec):
         found = self.find_one(spec)

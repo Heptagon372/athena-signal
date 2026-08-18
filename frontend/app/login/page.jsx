@@ -100,7 +100,7 @@ function LoginForm() {
           {mode === "login" ? "다시 오셨군요" : "계정을 만듭니다"}
         </h1>
         <p className="auth-lede">
-          계정마다 <strong>예측 기록·성적표·모의투자 계좌</strong>가 따로 저장됩니다.
+          계정마다 <strong>예측 기록, 성적표, 모의투자 계좌</strong>가 따로 저장됩니다.
           같은 종목을 봐도 성적과 잔고는 계정별로 독립적입니다.
         </p>
 
@@ -119,7 +119,7 @@ function LoginForm() {
             <span>아이디</span>
             <input className="input" value={username} autoComplete="username"
                    onChange={(e) => setUsername(e.target.value)}
-                   placeholder="3자 이상 · 한글/영문/숫자" required />
+                   placeholder="3자 이상   한글/영문/숫자" required />
           </label>
 
           {mode === "register" && (
@@ -136,7 +136,7 @@ function LoginForm() {
             <input className="input" type="password" value={password}
                    autoComplete={mode === "login" ? "current-password" : "new-password"}
                    onChange={(e) => setPassword(e.target.value)}
-                   placeholder="6자 이상" required />
+                   placeholder="8자 이상" required />
           </label>
 
           {mode === "register" && (
@@ -169,7 +169,7 @@ function LoginForm() {
 
         <div className="auth-note">
           비밀번호는 PBKDF2-SHA256(20만 회)로 해싱해 저장하며 평문은 남기지 않습니다.
-          {googleReady && " 구글로 로그인하면 계정 정보(이메일·이름)만 MongoDB에 저장되고, 비밀번호는 받지 않습니다."}
+          {googleReady && " 구글로 로그인하면 계정 정보(이메일, 이름)만 MongoDB에 저장되고, 비밀번호는 받지 않습니다."}
         </div>
       </div>
     </div>

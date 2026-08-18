@@ -98,8 +98,8 @@ export default function Owl({ direction = "up", probability = 50, marketOpen = t
       <div className="owl-caption">
         <b>{name}</b>{" "}
         {marketOpen
-          ? `${up ? "상승" : "하락"} 신호 — 확신도 ${probability}%`
-          : `개장 시 ${up ? "상승" : "하락"} 예상 — 확신도 ${probability}%`}
+          ? `${up ? "상승" : "하락"} 신호, 확신도 ${probability}%`
+          : `개장 시 ${up ? "상승" : "하락"} 예상, 확신도 ${probability}%`}
       </div>
       <div className="owl-mood">{mood}</div>
     </div>

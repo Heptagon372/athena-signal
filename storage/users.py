@@ -11,6 +11,16 @@
     로그인하면 무작위 토큰을 발급하고 DB에 만료시각과 함께 저장합니다.
     프론트엔드는 이 토큰을 Authorization: Bearer 로 보냅니다.
 
+    DB 에 들어가는 것은 토큰이 아니라 **SHA-256 지문**입니다. athena.db 는
+    백업 파일까지 포함해 이 폴더에 그냥 놓여 있는 파일이라, 원문을 저장하면
+    파일 하나가 새는 순간 30일짜리 로그인 세션이 통째로 딸려 나갑니다. 그
+    세션은 KIS 주문 권한이기도 합니다. 지문만 있으면 훔쳐도 Authorization
+    헤더에 넣을 값을 되돌릴 수 없습니다. (security.token_digest)
+
+    지문 방식 이전에 발급된 세션은 원문으로 저장돼 있습니다. 조회할 때 두 값을
+    모두 찾아보고, 원문으로 맞으면 그 자리에서 지문으로 바꿉니다 — 이미
+    로그인해 둔 사람을 로그아웃시키지 않고 저절로 이전됩니다.
+
 사용자별 데이터
     예측 기록·모의투자 계좌·관심종목이 모두 user_id 로 분리됩니다.
     같은 종목을 봐도 성적표와 계좌는 계정마다 따로 쌓입니다.
@@ -24,10 +34,16 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+import security
 from config import DB_PATH
 
 PBKDF2_ROUNDS = 200_000
 SESSION_DAYS = 30
+
+
+def _digest(token: str) -> str:
+    """DB 에 넣을 세션 토큰 지문 (모듈 docstring 의 '세션' 참고)."""
+    return security.token_digest(token)
 
 # 로그인하지 않고 쓰던 기존 데이터를 담아둘 계정
 LEGACY_USER = "__local__"
@@ -119,11 +135,42 @@ def validate_username(username: str) -> str | None:
     return None
 
 
+# 실제 유출 목록 상위권에서 한국어권 가입에 실제로 들어오는 것들만 추렸습니다.
+# 큰 사전을 들고 오는 대신, "이건 남이 첫 번째로 찍어보는 값"만 걸러냅니다.
+_WEAK_PASSWORDS = frozenset({
+    "password", "passw0rd", "12345678", "123456789", "1234567890",
+    "qwerty123", "qwertyui", "asdfasdf", "abcd1234", "a1234567",
+    "iloveyou", "admin123", "administrator", "letmein1", "welcome1",
+    "athena12", "signal12", "athenasignal",
+})
+
+
 def validate_password(password: str) -> str | None:
-    if not password or len(password) < 6:
-        return "비밀번호는 6자 이상이어야 합니다."
+    """가입·변경 때만 검사합니다 (로그인은 검사하지 않음).
+
+    최소 길이가 8자인 이유
+        이 계정 하나로 KIS API 키·계좌번호·자동매매 설정에 닿습니다. 로그인
+        레이트 리밋(IP 당 5분에 10회, 계정당 15분에 15회 실패)이 온라인 대입을
+        늦춰 주지만, 6자는 그 한도 안에서도 흔한 조합이 뚫릴 만큼 짧습니다.
+
+    복잡도 규칙(대문자·특수문자 필수) 대신 길이와 약한 비밀번호 목록을 쓰는
+    이유: 복잡도 규칙은 사람을 `Password1!` 로 몰아갑니다. 길이가 실제 강도와
+    더 잘 맞고, 진짜 위험한 것은 남이 첫 번째로 찍어보는 값입니다.
+
+    기존 계정은 그대로 로그인됩니다 — 여기를 지나가지 않기 때문입니다.
+    비밀번호를 바꿀 때 새 기준을 만나게 됩니다.
+    """
+    if not password or len(password) < 8:
+        return "비밀번호는 8자 이상이어야 합니다."
     if len(password) > 200:
         return "비밀번호가 너무 깁니다."
+
+    lowered = password.strip().lower()
+    if lowered in _WEAK_PASSWORDS:
+        return "너무 흔한 비밀번호입니다. 다른 값을 써 주세요."
+    if len(set(password)) < 4:
+        # "aaaaaaaa", "12121212" 처럼 글자 종류가 거의 없는 값
+        return "같은 글자만 반복된 비밀번호는 쓸 수 없습니다."
     return None
 
 
@@ -174,7 +221,7 @@ def login(username: str, password: str) -> dict:
     with _conn() as conn:
         conn.execute(
             "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, row["id"], now.isoformat(),
+            (_digest(token), row["id"], now.isoformat(),
              (now + timedelta(days=SESSION_DAYS)).isoformat()))
         conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?",
                      (now.isoformat(), row["id"]))
@@ -189,8 +236,12 @@ def login(username: str, password: str) -> dict:
 def logout(token: str):
     if not token:
         return
+    # 지문·원문 두 형태 모두 지웁니다 (이전 중인 옛 세션도 확실히 끊기도록)
+    keys = security.token_lookup_keys(token)
     with _conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.execute(
+            f"DELETE FROM sessions WHERE token IN ({','.join('?' * len(keys))})",
+            keys)
 
 
 def user_from_token(token: str) -> dict | None:
@@ -198,11 +249,13 @@ def user_from_token(token: str) -> dict | None:
     if not token:
         return None
     init()
+    keys = security.token_lookup_keys(token)
+    placeholders = ",".join("?" * len(keys))
     with _conn() as conn:
-        row = conn.execute("""
-            SELECT u.id, u.username, u.display_name, s.expires_at
+        row = conn.execute(f"""
+            SELECT u.id, u.username, u.display_name, s.expires_at, s.token
             FROM sessions s JOIN users u ON u.id = s.user_id
-            WHERE s.token = ?""", (token,)).fetchone()
+            WHERE s.token IN ({placeholders})""", keys).fetchone()
 
     if not row:
         return None
@@ -212,6 +265,13 @@ def user_from_token(token: str) -> dict | None:
             return None
     except ValueError:
         return None
+
+    # 원문으로 저장돼 있던 옛 세션이면 지금 지문으로 바꿔 둡니다.
+    # 로그인한 채로 쓰다 보면 저절로 전부 이전됩니다.
+    if row["token"] != keys[0]:
+        with _conn() as conn:
+            conn.execute("UPDATE sessions SET token = ? WHERE token = ?",
+                         (keys[0], row["token"]))
 
     return {"id": row["id"], "username": row["username"],
             "display_name": row["display_name"] or row["username"]}

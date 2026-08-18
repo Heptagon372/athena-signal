@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI 추천·추적 — 아테나 시그널</title>
+<title>아테나 시그널 AI 추천</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="/static/at_common.css">
 </head>
 <body>
@@ -17,7 +22,7 @@
       <button id="btnRecommend">지금 추천 받기</button>
       <div style="flex:1"></div>
       <div class="field" style="margin:0;width:110px"><label>회전당 계산 수</label>
-        <input id="cfg_auto_universe_scan_limit" type="number" step="10" title="갱신 1회에 팩터를 새로 계산할 종목 수 (10~300) — 한국·미국 각각. 전 종목을 순환하며 이만큼씩 계산하고, 하루 안에 계산해 둔 종목은 캐시로 순위에 함께 올립니다. 한 바퀴 = 종목수 ÷ 이 값 × 갱신주기 (국내 2,600종목이면 100개·30분에 13시간, 300개·10분에 1.5시간)"></div>
+        <input id="cfg_auto_universe_scan_limit" type="number" step="10" title="갱신 1회에 팩터를 새로 계산할 종목 수 (10~300), 한국, 미국 각각. 전 종목을 순환하며 이만큼씩 계산하고, 하루 안에 계산해 둔 종목은 캐시로 순위에 함께 올립니다. 한 바퀴 = 종목수 ÷ 이 값 × 갱신주기 (국내 2,600종목이면 100개, 30분에 13시간, 300개, 10분에 1.5시간)"></div>
       <div class="field" style="margin:0;width:110px"><label>추적 종목 수</label>
         <input id="cfg_auto_universe_size" type="number" step="1"></div>
       <div class="field" style="margin:0;width:110px"><label>갱신 주기(분)</label>
@@ -27,41 +32,41 @@
       <button id="btnSaveAuto" class="sm">저장</button>
     </div>
     <div class="row" style="margin-top:8px;align-items:center">
-      <span class="muted" style="font-size:12px">추적 시장</span>
+      <span class="muted" style="font-size:15px">추적 시장</span>
       <span id="segBox" class="row" style="gap:10px;margin:0"></span>
       <span style="flex:1"></span>
-      <label class="chk" style="margin:0" title="코스피·코스닥 상장 전 종목(KRX 상장법인목록)을 순환 평가합니다. 끄면 KIS 거래량순위 상위 30종목만 봅니다"><input type="checkbox" id="cfg_auto_universe_full_market">
+      <label class="chk" style="margin:0" title="코스피, 코스닥 상장 전 종목(KRX 상장법인목록)을 순환 평가합니다. 끄면 KIS 거래량순위 상위 30종목만 봅니다"><input type="checkbox" id="cfg_auto_universe_full_market">
         국내 전 종목 순환</label>
       <label class="chk" style="margin:0"><input type="checkbox" id="cfg_auto_universe_keep_manual">
         손으로 넣은 종목은 유지</label>
     </div>
     <div class="row" style="margin-top:8px;align-items:center">
-      <span class="muted" style="font-size:12px">탐색 범위</span>
+      <span class="muted" style="font-size:15px">탐색 범위</span>
       <select id="poolSelect" style="width:auto;min-width:190px"></select>
       <span class="note" id="poolSelectNote" style="margin:0"></span>
     </div>
     <div class="note">
       추적은 <b>종목 선정까지만</b> 합니다. 실제 주문은 상단 [시작] 으로 자동매매를 켜야 나갑니다.
-      다중 팩터(모멘텀 · 상대강도(IBD식) · 트렌드템플릿(미너비니) · U/D 거래량비(오닐) ·
-      추세품질 · 위험조정 · 스마트머니 · 경제물리학 · 화제성)를 국면 가중으로 합산하며,
-      표준화는 <b>같은 시장 후보끼리만</b> 합니다 — 한국·미국을 함께 추적해도 점수가 왜곡되지 않습니다.
-      <br>모집단은 <b>시장 전체</b>입니다 — 국내는 KRX 상장법인목록(코스피·코스닥 전 종목),
+      다중 팩터(모멘텀   상대강도(IBD식)   트렌드템플릿(미너비니)   U/D 거래량비(오닐) , 
+      추세품질   위험조정   스마트머니   경제물리학   화제성)를 국면 가중으로 합산하며,
+      표준화는 <b>같은 시장 후보끼리만</b> 합니다. 한국, 미국을 함께 추적해도 점수가 왜곡되지 않습니다.
+      <br>모집단은 <b>시장 전체</b>입니다. 국내는 KRX 상장법인목록(코스피, 코스닥 전 종목),
       미국은 나스닥 스크리너 표. 한 번에 다 계산하지 않고 갱신마다 [회전당 계산 수]만큼씩
       <b>순환</b>하며, 하루 안에 계산해 둔 종목은 캐시로 순위에 함께 올립니다.
-      <br>탐색 범위를 고르면 <b>그 안에서만</b> 찾습니다. 코스피200·코스닥150 은
+      <br>탐색 범위를 고르면 <b>그 안에서만</b> 찾습니다. 코스피200, 코스닥150 은
       구성종목 명단을 받아 <b>범위 전체를 순환 계산</b>하고(전부 순위에 오를 때까지
-      몇 회전 걸립니다), KRX100·섹터는 명단이 없어 순위·ETF 상위 약 30종목만 봅니다.
+      몇 회전 걸립니다), KRX100, 섹터는 명단이 없어 순위, ETF 상위 약 30종목만 봅니다.
     </div>
   </section>
 
   <section>
     <h2>매매 대상 (유니버스) <span class="sub" id="uniSub"></span></h2>
     <div class="row">
-      <input id="uniInput" placeholder="종목명·코드·티커 (삼성전자 / 069500 / AAPL / FUT_FRONT)" style="flex:1;min-width:220px">
+      <input id="uniInput" placeholder="종목명, 코드, 티커 (삼성전자 / 069500 / AAPL / FUT_FRONT)" style="flex:1;min-width:220px">
       <button id="btnAddUni">추가</button>
     </div>
     <div class="note" style="margin-top:6px">
-      선물은 <code>FUT_FRONT</code>(코스피200 최근월물) · <code>MINI_FUT</code> · <code>KQ150_FUT</code>
+      선물은 <code>FUT_FRONT</code>(코스피200 최근월물)   <code>MINI_FUT</code>   <code>KQ150_FUT</code>
       로 넣으면 만기마다 자동으로 갈아탑니다.
     </div>
     <div class="tagrow" id="uniTags"></div>
@@ -83,7 +88,7 @@
 <script>
 window.PAGE = {
   nav: "ai",
-  title: "AI 추천 · 자동 추적",
+  title: "AI 추천   자동 추적",
   desc: "시장을 훑어 종목을 고르고 매매 대상을 자동 갱신합니다. 주문은 여기서 나가지 않습니다.",
   _dirty: false,
   _lastWouldPick: [],
@@ -119,12 +124,12 @@ window.PAGE = {
       tb.className = "pill on";
       tb.lastElementChild.textContent = track.refreshing ? "새 종목 찾는 중…"
         : (track.next_in_sec != null
-           ? `추적 중 · 다음 갱신 ${Math.max(1, Math.round(track.next_in_sec / 60))}분 후`
+           ? `추적 중   다음 갱신 ${Math.max(1, Math.round(track.next_in_sec / 60))}분 후`
            : "추적 중");
       A.$("btnTrack").textContent = "추적 중지";
       A.$("btnTrack").className = "danger";
       A.$("trackNote").textContent = track.last_refresh_at
-        ? `마지막 갱신 ${track.last_refresh_at.slice(11, 16)} · ${track.period_min ?? 30}분 주기`
+        ? `마지막 갱신 ${track.last_refresh_at.slice(11, 16)}   ${track.period_min ?? 30}분 주기`
         : "곧 첫 추천을 계산합니다 (30초~1분)";
     } else {
       tb.className = "pill off";
@@ -168,7 +173,7 @@ window.PAGE = {
     A.$("uniTags").innerHTML = list.map((t) => {
       const d = info[t] || {};
       const tip = d.auto
-        ? `AI 추천 ${d.rank}위 · 점수 ${(d.score ?? 0).toFixed(2)}\n${(d.reasons || []).join("\n")}`
+        ? `AI 추천 ${d.rank}위   점수 ${(d.score ?? 0).toFixed(2)}\n${(d.reasons || []).join("\n")}`
         : "직접 추가한 종목";
       return `<span class="tag" title="${A.esc(tip)}">${d.auto ? '<b class="gold">AI</b> ' : ""}`
         + `${A.esc(d.name && d.name !== t ? d.name : t)}`
@@ -177,7 +182,7 @@ window.PAGE = {
     }).join("") || '<span class="note">비어 있습니다. 종목을 추가하거나 추적을 켜세요.</span>';
     const autoCount = detail.filter((d) => d.auto).length;
     A.$("uniSub").textContent = list.length
-      ? `${list.length}종목 (AI ${autoCount} · 직접 ${list.length - autoCount})` : "";
+      ? `${list.length}종목 (AI ${autoCount}   직접 ${list.length - autoCount})` : "";
     document.querySelectorAll("[data-uni]").forEach((b) => b.onclick = async () => {
       const next = (AT.SNAP.config.universe || []).filter((x) => x !== b.dataset.uni);
       try { await AT.call("/autotrade/config", {method: "POST", body: {config: {universe: next}}});
@@ -191,18 +196,18 @@ window.PAGE = {
     A.$("recTable").querySelector("tbody").innerHTML = list.map((r) => `<tr>
       <td class="muted">${r.rank}</td>
       <td>${A.esc(r.name)}${r.picked ? ' <span class="gold" title="AI가 매매 대상에 편입">★편입</span>' : ""}
-        <div class="muted mono" style="font-size:11px">${r.key} · ${r.market}</div></td>
+        <div class="muted mono" style="font-size:13.5px">${r.key}   ${r.market}</div></td>
       <td class="num ${r.score >= (threshold ?? 0.55) ? "up" : "muted"}">${(r.score ?? 0).toFixed(3)}</td>
-      <td class="muted" style="font-size:11.5px">${(r.reasons || []).map(A.esc).join("<br>") || "—"}
-        ${(r.warnings || []).length ? `<div class="up">${r.warnings.map(A.esc).join(" · ")}</div>` : ""}</td>
-      <td class="num">${r.max_quantity == null ? '<span class="muted">—</span>'
+      <td class="muted" style="font-size:14.5px">${(r.reasons || []).map(A.esc).join("<br>") || "-"}
+        ${(r.warnings || []).length ? `<div class="up">${r.warnings.map(A.esc).join("   ")}</div>` : ""}</td>
+      <td class="num">${r.max_quantity == null ? '<span class="muted">-</span>'
         : (r.tradable ? (r.max_quantity || 0).toLocaleString() + "주"
                       : '<span class="muted">자금 부족</span>')}</td>
       <td>${r.tradable && !r.picked ? `<button class="sm" data-adopt="${r.key}">대상 추가</button>` : ""}</td>
     </tr>`).join("");
     document.querySelectorAll("[data-adopt]").forEach((b) => b.onclick = () => this.adopt(b.dataset.adopt));
     if (factors) A.$("recFactors").innerHTML = "팩터: " + factors.map((f) =>
-      `<b title="${A.esc(f.desc)}">${A.esc(f.label)}</b>`).join(" · ");
+      `<b title="${A.esc(f.desc)}">${A.esc(f.label)}</b>`).join("   ");
   },
 
   async toggleTracking() {
@@ -210,7 +215,7 @@ window.PAGE = {
     try {
       await AT.call("/autotrade/track", {method: "POST", body: {enabled: enable}});
       await AT.refresh();
-      AT.toast(enable ? "AI 자동 추적을 시작했습니다 — 곧 첫 추천이 나타납니다."
+      AT.toast(enable ? "AI 자동 추적을 시작했습니다. 곧 첫 추천이 나타납니다."
                       : "AI 자동 추적을 중지했습니다.");
     } catch (e) { AT.toast(e.message, true); }
   },
@@ -227,7 +232,7 @@ window.PAGE = {
       this._lastWouldPick = d.would_pick || [];
       A.$("btnApplyPicks").classList.toggle("hide", !this._lastWouldPick.length);
       A.toast(this._lastWouldPick.length
-        ? `추천 ${d.recommendations.length}종목 · 편입 후보 ${this._lastWouldPick.join(", ")}`
+        ? `추천 ${d.recommendations.length}종목   편입 후보 ${this._lastWouldPick.join(", ")}`
         : "기준 점수를 넘는 종목이 없습니다.");
     } catch (e) { A.$("recSub").textContent = ""; A.toast(e.message, true); }
     finally { A.$("btnRecommend").disabled = false; }
@@ -252,7 +257,7 @@ window.PAGE = {
     try {
       await AT.call("/autotrade/config", {method: "POST", body: {config: {universe: merged}}});
       await AT.refresh();
-      AT.toast(`매매 대상에 편입했습니다 — ${this._lastWouldPick.join(", ")}`);
+      AT.toast(`매매 대상에 편입했습니다. ${this._lastWouldPick.join(", ")}`);
     } catch (e) { AT.toast(e.message, true); }
   },
 
@@ -291,10 +296,10 @@ window.PAGE = {
       if (!list.includes(entry)) list.push(entry);
       await A.call("/autotrade/config", {method: "POST", body: {config: {universe: list}}});
       A.$("uniInput").value = "";
-      A.$("uniPreview").innerHTML = `<b>${A.esc(i.name)}</b> · ${i.asset_label} ·
+      A.$("uniPreview").innerHTML = `<b>${A.esc(i.name)}</b>   ${i.asset_label} , 
         1단위 필요자금 ${A.won(d.unit_cost_krw)}
-        ${i.expiry ? ` · 만기 ${i.expiry} (${d.days_to_expiry}일)` : ""}
-        ${d.quote ? ` · 현재가 ${A.num(d.quote.price)}` : ' · <span class="up">시세 조회 실패</span>'}`;
+        ${i.expiry ? `   만기 ${i.expiry} (${d.days_to_expiry}일)` : ""}
+        ${d.quote ? `   현재가 ${A.num(d.quote.price)}` : '   <span class="up">시세 조회 실패</span>'}`;
       await A.refresh();
     } catch (e) { A.toast(e.message, true); }
   },

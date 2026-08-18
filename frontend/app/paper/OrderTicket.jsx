@@ -146,7 +146,7 @@ export default function OrderTicket({ quote, busy, onSubmit }) {
           <div className="tk-note">
             호가 단위 {isUS ? "$0.01" : `${fmtNum(unit)}원`}
             {quote.price != null && (
-              <> · 현재가 대비{" "}
+              <>   현재가 대비{" "}
                 <b style={{ color: Number(limitPrice) >= quote.price ? "var(--up)" : "var(--down)" }}>
                   {(((Number(limitPrice) || 0) / quote.price - 1) * 100).toFixed(2)}%
                 </b>
@@ -177,7 +177,7 @@ export default function OrderTicket({ quote, busy, onSubmit }) {
         </div>
         <div className="tk-note">
           {side === "buy"
-            ? <>주문가능 {fmtNum(acc.available_cash)}원 · 최대 <b>{fmtNum(maxQty, isUS ? 4 : 0)}</b>주</>
+            ? <>주문가능 {fmtNum(acc.available_cash)}원   최대 <b>{fmtNum(maxQty, isUS ? 4 : 0)}</b>주</>
             : <>매도가능 <b>{fmtNum(acc.sellable_quantity, isUS ? 4 : 0)}</b>주
                 {acc.owned_quantity > acc.sellable_quantity &&
                   ` (보유 ${fmtNum(acc.owned_quantity, isUS ? 4 : 0)}주 중 ` +
@@ -202,7 +202,7 @@ export default function OrderTicket({ quote, busy, onSubmit }) {
         </div>
         {isUS && calc.n > 0 && (
           <div className="tk-fxnote">
-            환율 {fmtNum(rate)}원/USD 적용 · 계좌는 원화 단일 통화입니다
+            환율 {fmtNum(rate)}원/USD 적용   계좌는 원화 단일 통화입니다
           </div>
         )}
       </div>

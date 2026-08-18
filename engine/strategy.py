@@ -570,7 +570,20 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
     (익절보다 손절이 먼저, 신호 반전보다 만기가 먼저)
 
     state 는 이 포지션에 대해 엔진이 기억하고 있는 값입니다.
-        entry_price, stop_price, target_price, peak_price, opened_at
+        entry_price, stop_price, target_price, peak_price, opened_at, pinned
+
+    고정 (state["pinned"])
+        사용자가 "이 종목은 **목표가나 손절가에서만** 팔아라"고 못박은
+        포지션입니다. 가격선이 아닌 사유 — 트레일링 되돌림 · 신호 반전 ·
+        보유 시간 초과 — 로는 나가지 않습니다. 회전(갈아타기)의 매도
+        후보에서도 빠집니다 (engine/autotrade._maybe_rotate).
+
+        그대로 작동하는 것: 손절가 · 손실 한도 % · 목표가 · 목표 수익률 %.
+        승자 보유(hold_winners)의 익절 보류도 고정에는 적용하지 않습니다 —
+        "목표가에 판다"가 사용자의 명시적 지시라 추세를 이유로 미루면 안 됩니다.
+
+        예외는 파생 만기 하나입니다 (아래 1). 만기는 우리가 안 팔아도
+        거래소가 정산합니다 — 고정으로 막으면 가격을 우리가 못 고릅니다.
 
     protective_only
         **지키는 조건만** 봅니다 — 만기·손절·손실한도·트레일링·보유시간.
@@ -602,7 +615,12 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
     entry = float(state.get("entry_price") or position.avg_price or price)
     pnl_pct = (price - entry) / entry * 100 * direction if entry else 0.0
 
-    # 1) 만기 (파생) — 만기일에 물려 있으면 강제 청산됩니다
+    # 사용자가 고정한 포지션인가 (위 docstring 의 '고정' 참고)
+    pinned = bool(state.get("pinned"))
+
+    # 1) 만기 (파생) — 만기일에 물려 있으면 강제 청산됩니다.
+    # 고정도 이것만은 못 막습니다. 만기는 우리 규칙이 아니라 거래소 규칙이라
+    # "안 판다"는 선택지가 없고, 남는 것은 **누가 가격을 고르느냐**뿐입니다.
     if inst.asset_class in (FUTURES, OPTION):
         days = feed.days_to_expiry(inst)
         min_days = int(cfg.get("deriv_min_days_to_expiry", 2))
@@ -622,9 +640,11 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
         return ExitDecision(True, f"손실 한도 {hard_stop:g}% 초과 ({pnl_pct:+.2f}%)", "urgent")
 
     # 3) 트레일링 스톱 — 고점 대비 되돌림
+    # 고정된 포지션은 보지 않습니다. 트레일링은 "손절가는 아직 멀지만 여기서
+    # 끊자"는 판단이고, 고정은 정확히 그 판단을 하지 말라는 지시입니다.
     trail = float(cfg.get("trailing_stop_pct", 0) or 0)
     peak = state.get("peak_price")
-    if trail > 0 and peak:
+    if trail > 0 and peak and not pinned:
         drop = (float(peak) - price) / float(peak) * 100 * direction
         if drop >= trail:
             return ExitDecision(True, f"고점 대비 {drop:.2f}% 되돌림 (트레일링 {trail:g}%)")
@@ -638,8 +658,8 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
     # 익절을 보류합니다. 손절·트레일링·시간 청산은 이 게이트와 무관하게
     # 그대로 작동합니다 (지키는 장치는 절대 끄지 않습니다).
     winner_hold = False
-    if (cfg.get("hold_winners") and direction > 0 and sig.ok and sig.ma50
-            and price >= sig.ma50 * 1.03):
+    if (cfg.get("hold_winners") and not pinned and direction > 0 and sig.ok
+            and sig.ma50 and price >= sig.ma50 * 1.03):
         peak = state.get("peak_price")
         if peak and price >= float(peak) * 0.97:
             winner_hold = True
@@ -656,16 +676,22 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
     if take > 0 and pnl_pct >= take and not skip_take:
         return ExitDecision(True, f"목표 수익 {take:g}% 달성 ({pnl_pct:+.2f}%)")
 
-    # 5) 신호 반전 / 소멸
-    if sig.ok and not protective_only:
+    # 5) 신호 반전 / 소멸 (고정된 포지션은 신호로 팔지 않습니다)
+    if sig.ok and not protective_only and not pinned:
         exit_score = float(cfg.get("exit_score", 0.05))
         if direction > 0 and sig.score <= -abs(exit_score):
             return ExitDecision(True, f"신호 반전 (점수 {sig.score:+.2f})")
         if direction < 0 and sig.score >= abs(exit_score):
             return ExitDecision(True, f"신호 반전 (점수 {sig.score:+.2f})")
 
-    # 6) 보유 기간 초과 — 신호가 죽었는데 계속 들고 있는 것을 막습니다
+    # 6) 보유 기간 초과 — 신호가 죽었는데 계속 들고 있는 것을 막습니다.
+    #
+    # 여기부터 끝까지는 **시간 청산뿐**입니다. 고정된 포지션은 시간으로 팔지
+    # 않으므로 여기서 끝냅니다. 시간이 아닌 새 청산 규칙을 추가할 때는 이
+    # 줄 **위**에 두세요 — 아래에 두면 고정 포지션에서 조용히 사라집니다.
     opened = state.get("opened_at")
+    if pinned or not opened:
+        return ExitDecision(False, "")
 
     # 초단타는 **초 단위**로 끊습니다. max_hold_minutes 는 분 정수라 90초 같은
     # 값을 표현할 수 없어서, 페니 초단타는 이쪽을 씁니다. 둘 다 설정돼 있으면

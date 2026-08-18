@@ -75,7 +75,7 @@ function Scorecard() {
         <div><div className="stat-label">적중률</div>
           <div className="stat-value big"
                style={{ color: acc == null ? "var(--muted)" : acc >= 50 ? "var(--up)" : "var(--down)" }}>
-            {acc ?? "—"}{acc != null ? "%" : ""}
+            {acc ?? "-"}{acc != null ? "%" : ""}
           </div>
           <div className="stat-sub">
             {acc == null ? "표본 없음" : acc >= 50 ? "동전던지기보다 나음" : "동전던지기보다 못함"}
@@ -88,9 +88,9 @@ function Scorecard() {
       <div className="resolve-note">
         {note && <div style={{ marginBottom: 6 }}>{note}</div>}
         {sc.last_auto_resolve
-          ? `마지막 자동 채점 ${new Date(sc.last_auto_resolve.checked_at).toLocaleString("ko-KR")} · ${sc.last_auto_resolve.scored}건 처리`
+          ? `마지막 자동 채점 ${new Date(sc.last_auto_resolve.checked_at).toLocaleString("ko-KR")}   ${sc.last_auto_resolve.scored}건 처리`
           : "서버가 10분마다 만기가 지난 예측을 자동 채점합니다."}
-        {sc.voided > 0 && ` · 무효 ${sc.voided}건(만기 구간에 거래 없음)`}
+        {sc.voided > 0 && `   무효 ${sc.voided}건(만기 구간에 거래 없음)`}
       </div>
 
       <h3 className="sub-head">시평선별 적중률</h3>
@@ -99,7 +99,7 @@ function Scorecard() {
           <div className="hz-cell" key={h.horizon}>
             <div className="hz-label">{h.label}{h.legacy ? " (구)" : ""}</div>
             <div className="hz-prob" style={{ color: (h.accuracy ?? 0) >= 50 ? "var(--up)" : "var(--down)" }}>
-              {h.accuracy ?? "—"}%
+              {h.accuracy ?? "-"}%
             </div>
             <div className="hz-meta">{h.correct}/{h.total}건</div>
           </div>
@@ -112,14 +112,14 @@ function Scorecard() {
           <div className="hz-cell" key={t.ticker}>
             <div className="hz-label">{t.name}</div>
             <div className="hz-prob" style={{ color: (t.accuracy ?? 0) >= 50 ? "var(--up)" : "var(--down)" }}>
-              {t.accuracy ?? "—"}%
+              {t.accuracy ?? "-"}%
             </div>
             <div className="hz-meta">{t.correct}/{t.total}건</div>
           </div>
         )) : <div className="empty">아직 채점된 종목이 없습니다.</div>}
       </div>
 
-      <h3 className="sub-head">채점 상세 — 예측이 실제로 어떻게 됐는지</h3>
+      <h3 className="sub-head">채점 상세<span>예측이 실제로 어떻게 됐는지</span></h3>
       <div className="rows">
         <div className="row head scored-row">
           <span>종목</span><span>시평선</span><span>예측 → 실제</span>
@@ -141,7 +141,7 @@ function Scorecard() {
                 <span style={{ color: dirCol(r.actual_result) }}>{dirTxt(r.actual_result)}</span>
               </div>
               <div className="m">
-                {r.base_price != null ? `${fmtNum(r.base_price)} → ${fmtNum(r.resolved_price)}` : "—"}
+                {r.base_price != null ? `${fmtNum(r.base_price)} → ${fmtNum(r.resolved_price)}` : "-"}
                 {r.change_pct != null && (
                   <div className="row-sub" style={{ color: signColor(r.change_pct) }}>
                     {r.change_pct >= 0 ? "+" : ""}{r.change_pct}%

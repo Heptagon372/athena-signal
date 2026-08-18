@@ -3,26 +3,31 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>자동매매 — 아테나 시그널</title>
+<title>아테나 시그널 자동매매</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="/static/at_common.css">
 <style>
 /* ---- 포지션 상세 슬라이드 (오른쪽에서 왼쪽으로) ---- */
 #posTable tbody tr.clickable{cursor:pointer}
-#posTable tbody tr.clickable:hover td{background:rgba(201,162,39,.05)}
+#posTable tbody tr.clickable:hover td{background:color-mix(in srgb, var(--gold) 10%, transparent)}
 
-#slideOverlay{position:fixed;inset:0;z-index:55;background:rgba(15,12,8,.6);
+#slideOverlay{position:fixed;inset:0;z-index:55;background:rgba(36,29,21,.45);
   backdrop-filter:blur(2px);opacity:0;pointer-events:none;transition:opacity .25s}
 #slideOverlay.open{opacity:1;pointer-events:auto}
 #slidePanel{position:fixed;top:0;right:0;bottom:0;z-index:56;width:min(980px,100vw);
-  background:var(--bg);border-left:1px solid var(--line);box-shadow:-18px 0 48px rgba(0,0,0,.5);
+  background:var(--bg);border-left:1px solid var(--line);box-shadow:-18px 0 48px rgba(60,45,25,.20);
   transform:translateX(102%);transition:transform .28s cubic-bezier(.3,.8,.3,1);
   display:flex;flex-direction:column}
 #slidePanel.open{transform:translateX(0)}
 .slide-head{display:flex;align-items:center;gap:10px;padding:12px 18px;
   border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
-.slide-head .idx{font-family:Consolas,monospace;color:var(--gold);font-size:15px;white-space:nowrap}
-.slide-head .nm{font-size:16px;font-weight:600}
-.slide-head .cd{color:var(--muted);font-family:Consolas,monospace;font-size:12px}
+.slide-head .idx{font-variant-numeric:tabular-nums;color:var(--gold);font-size:23px;white-space:nowrap}
+.slide-head .nm{font-size:25px;font-weight:600}
+.slide-head .cd{color:var(--muted);font-variant-numeric:tabular-nums;font-size:15px}
 .slide-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:16px 18px;display:grid;gap:14px;
   align-content:start}
 /* 안의 내용이 통째로 오른쪽에서 미끄러져 들어옵니다 (다음/이전 넘길 때) */
@@ -34,13 +39,13 @@
 .slide-stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:8px}
 .slide-stat .box{background:var(--raised);border:1px solid var(--line);border-radius:var(--radius);
   padding:8px 10px}
-.slide-stat .k{font-size:10.5px;color:var(--muted)}
-.slide-stat .v{font-size:14.5px;font-family:Consolas,monospace;margin-top:1px}
+.slide-stat .k{font-size:16px;color:var(--muted)}
+.slide-stat .v{font-size:22.5px;font-variant-numeric:tabular-nums;margin-top:1px}
 
 #slideChartWrap{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
   padding:10px 12px}
 #slideChart{width:100%;display:block}
-.chart-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-bottom:6px}
+.chart-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:16.5px;color:var(--muted);margin-bottom:6px}
 .chart-legend b{font-weight:500}
 .lg{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px}
 
@@ -48,11 +53,11 @@
 .pipe{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:4px 0}
 .pipe .st{min-width:118px;flex:1;background:var(--raised);border:1px solid var(--line);
   border-radius:var(--radius);padding:8px 10px;position:relative}
-.pipe .st .lb{font-size:10.5px;color:var(--muted)}
-.pipe .st .vl{font-size:16px;font-family:Consolas,monospace;margin:1px 0}
-.pipe .st .dt{font-size:10px;color:var(--muted);line-height:1.5}
-.pipe .arrow{align-self:center;color:var(--gold);padding:0 6px;font-size:15px;flex:0 0 auto}
-.pipe .st.final{border-color:var(--gold);background:rgba(201,162,39,.07)}
+.pipe .st .lb{font-size:16px;color:var(--muted)}
+.pipe .st .vl{font-size:25px;font-variant-numeric:tabular-nums;margin:1px 0}
+.pipe .st .dt{font-size:16px;color:var(--muted);line-height:1.5}
+.pipe .arrow{align-self:center;color:var(--gold);padding:0 6px;font-size:23px;flex:0 0 auto}
+.pipe .st.final{border-color:var(--gold);background:color-mix(in srgb, var(--gold) 10%, transparent)}
 
 /* 점수 게이지 (-1 ~ +1, 진입 임계값 표시) */
 .gauge{position:relative;height:34px;margin:8px 2px 2px}
@@ -62,20 +67,20 @@
 .gauge .tick.thr{background:var(--gold);opacity:1}
 .gauge .needle{position:absolute;top:2px;width:3px;height:30px;border-radius:2px;background:var(--text);
   box-shadow:0 0 8px rgba(236,227,208,.5)}
-.gauge .lab{position:absolute;top:-14px;transform:translateX(-50%);font-size:10px;color:var(--gold);
+.gauge .lab{position:absolute;top:-14px;transform:translateX(-50%);font-size:16px;color:var(--gold);
   white-space:nowrap}
 
 /* 지표 기여도 바 (0 을 가운데로 ±) */
 .contrib{display:grid;gap:4px}
-.contrib .row2{display:grid;grid-template-columns:150px 1fr 76px;gap:8px;align-items:center;font-size:11.5px}
+.contrib .row2{display:grid;grid-template-columns:150px 1fr 76px;gap:8px;align-items:center;font-size:14.5px}
 .contrib .bar{position:relative;height:13px;background:#14110d;border-radius:3px;overflow:hidden}
 .contrib .bar i{position:absolute;top:1.5px;bottom:1.5px;border-radius:2px}
 .contrib .bar .mid{position:absolute;top:0;bottom:0;left:50%;width:1px;background:var(--line)}
-.contrib .val{font-family:Consolas,monospace;text-align:right}
+.contrib .val{font-variant-numeric:tabular-nums;text-align:right}
 .contrib .nm2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-.slide-note{font-size:11.5px;color:var(--muted);line-height:1.7}
-.slide-sec h3{font-size:12px;margin:0 0 8px;color:var(--gold);letter-spacing:.06em;font-weight:600}
+.slide-note{font-size:18px;color:var(--muted);line-height:1.7}
+.slide-sec h3{font-size:18.5px;margin:0 0 8px;color:var(--gold);font-weight:600}
 .slide-sec{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
 @media(max-width:640px){.contrib .row2{grid-template-columns:96px 1fr 64px}}
 </style>
@@ -89,7 +94,7 @@
 
   <div class="grid side">
     <section>
-      <h2>보유 포지션 <span class="sub">자동 손절·익절이 걸려 있습니다 · 행을 누르면 상세 슬라이드</span>
+      <h2>보유 포지션 <span class="sub">자동 손절, 익절이 걸려 있습니다   고정하면 목표가와 손절가에서만 팝니다   행을 누르면 상세 슬라이드</span>
         <button id="btnSlides" class="sm" style="margin-left:auto">1번부터 차례로 보기 ▶</button></h2>
       <div class="scroll-x"><table id="posTable">
         <thead><tr>
@@ -110,14 +115,14 @@
     </section>
 
     <section>
-      <h2>실행 로그 <span class="sub">모든 판단·장 상태가 기록됩니다</span></h2>
+      <h2>실행 로그 <span class="sub">모든 판단, 장 상태가 기록됩니다</span></h2>
       <div class="log" id="logBox"></div>
     </section>
   </div>
 
   <div class="grid two">
     <section>
-      <h2>거래할 자산군 · 실행 모드</h2>
+      <h2>거래할 자산군   실행 모드</h2>
       <div id="assetBoxes"></div>
       <div class="field" style="margin-top:12px">
         <label>실행 모드 (계좌)</label>
@@ -126,25 +131,25 @@
       <div class="field">
         <label>전체 회전 주기 (초)</label>
         <input id="cfg_interval_sec" type="number" min="15" step="5">
-        <span class="muted" style="font-size:11px">신호 계산 + 신규 진입</span>
+        <span class="muted" style="font-size:13.5px">신호 계산 + 신규 진입</span>
       </div>
       <div class="field">
         <label>보호 회전 주기 (초)</label>
         <input id="cfg_guard_interval_sec" type="number" min="0" step="1">
-        <span class="muted" style="font-size:11px">
-          보유 종목의 손절·트레일링만 확인 (지표 계산 없음). 0 = 사용 안 함</span>
+        <span class="muted" style="font-size:13.5px">
+          보유 종목의 손절, 트레일링만 확인 (지표 계산 없음). 0 = 사용 안 함</span>
       </div>
       <label class="chk"><input type="checkbox" id="cfg_dry_run"> 모의 판단만 (주문 안 냄)</label>
       <label class="chk"><input type="checkbox" id="cfg_manage_only_universe">
-        매매 대상 종목만 관리 <span class="muted" style="font-size:11px">— 내 다른 보유분 보호</span></label>
+        매매 대상 종목만 관리 <span class="muted" style="font-size:17.5px">   내 다른 보유분 보호</span></label>
       <label class="chk"><input type="checkbox" id="cfg_regular_session_only"> 정규장에만 매매</label>
       <label class="chk"><input type="checkbox" id="cfg_us_extended_hours">
-        미국 프리·애프터마켓 허용 <span class="muted" style="font-size:11px">— 미국 종목만, 한국 시간외와 별개</span></label>
+        미국 프리, 애프터마켓 허용 <span class="muted" style="font-size:17.5px">   미국 종목만, 한국 시간외와 별개</span></label>
       <div class="field" style="margin-top:10px">
         <label>미국 주문 결제 재원</label>
         <select id="usFundingSelect">
-          <option value="fx">외화(달러)만 — 달러가 없으면 주문하지 않음</option>
-          <option value="krw">원화도 시도(통합증거금) — 달러가 0이어도 보내봄</option>
+          <option value="fx">외화(달러)만, 달러가 없으면 주문하지 않음</option>
+          <option value="krw">원화도 시도(통합증거금), 달러가 0이어도 보내봄</option>
         </select>
         <div class="note" style="margin-top:4px">
           KIS 해외주문 API 에는 통화를 고르는 항목이 <b>없습니다</b>. 앱의 [통합매수] 같은
@@ -153,12 +158,12 @@
         </div>
       </div>
       <label class="chk"><input type="checkbox" id="cfg_min_one_unit">
-        최소 1주 허용 <span class="muted" style="font-size:11px">— 소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
+        최소 1주 허용 <span class="muted" style="font-size:17.5px">   소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
       <label class="chk"><input type="checkbox" id="cfg_allow_short"> 숏 진입 허용 (파생만)</label>
       <label class="chk"><input type="checkbox" id="cfg_use_news"> 뉴스 감성 반영 (느림)</label>
       <label class="chk"><input type="checkbox" id="cfg_rotation_enabled">
-        수익 회전(갈아타기) 허용 <span class="muted" style="font-size:11px">—
-        더 좋은 신호가 떴는데 현금·슬롯이 없으면, 수수료 빼고도 이익인 보유 종목을
+        수익 회전(갈아타기) 허용 <span class="muted" style="font-size:17.5px">   
+        더 좋은 신호가 떴는데 현금, 슬롯이 없으면, 수수료 빼고도 이익인 보유 종목을
         목표가 전에 팔아 재원 확보. 조건은 아래 [회전] 항목들</span></label>
     </section>
 
@@ -173,17 +178,17 @@
   </div>
 
   <section>
-    <h2>전략 · 리스크 설정 <span class="sub">바꾸면 바로 저장됩니다 — 다음 회전부터 적용</span></h2>
+    <h2>전략   리스크 설정 <span class="sub">바꾸면 바로 저장됩니다, 다음 회전부터 적용</span></h2>
 
     <div class="field" style="margin-bottom:12px">
       <label>NNFX 규칙 오버레이
-        <span class="sub">기준선·모멘텀·추세·거래량·과열거리 — 다섯 슬롯으로 신호를 한 번 더 봅니다</span></label>
+        <span class="sub">기준선, 모멘텀, 추세, 거래량, 과열거리, 다섯 슬롯으로 신호를 한 번 더 봅니다</span></label>
       <div class="row">
         <select id="cfg_nnfx_mode" style="width:auto;min-width:210px">
           <option value="off">사용 안 함</option>
           <option value="soft">소프트 결합 (권장)</option>
           <option value="veto">거부권만</option>
-          <option value="hard">원본 NNFX — 권장하지 않음</option>
+          <option value="hard">원본 NNFX, 권장하지 않음</option>
         </select>
         <div class="field" style="margin:0;width:150px">
           <input id="cfg_nnfx_soft_weight" type="number" step="0.05" min="0" max="1"
@@ -193,7 +198,7 @@
     </div>
 
     <div class="field" style="margin-bottom:12px">
-      <label>분할 매수 · 분할 매도 (차수별 독립 관리)
+      <label>분할 매수   분할 매도 (차수별 독립 관리)
         <span class="sub">한 종목을 차수로 나눠 사고, 각 차수를 <b>그 차수 매수가 기준으로 따로</b> 팝니다</span></label>
       <div class="row" style="flex-wrap:wrap;gap:10px">
         <label class="chk" style="margin:0"><input type="checkbox" id="cfg_split_enabled">
@@ -224,13 +229,13 @@
         <div class="field"><label>마지막 차수 후 손절 (%)</label><input id="cfg_split_final_stop_pct" type="number" step="1"
           title="마지막 차수 예정가에서 이만큼 더 빠지면 전량 손절합니다"></div>
         <div class="field"><label>차수 수익 / 왕복비용 최소 배수</label><input id="cfg_split_cost_multiple" type="number" step="0.5"
-          title="수수료·거래세를 빼면 마이너스인 매도를 막습니다"></div>
+          title="수수료, 거래세를 빼면 마이너스인 매도를 막습니다"></div>
         <div class="field"><label>체증 배수 (체증일 때)</label><input id="cfg_split_pyramid_ratio" type="number" step="0.1"></div>
         <div class="field"><label>차수별 하락률 (직접 지정)</label><input id="cfg_split_buy_drop_steps" type="text"
-          placeholder="비우면 위 값 균등 · 예: 10, 20, 30"
+          placeholder="비우면 위 값 균등   예: 10, 20, 30"
           title="쉼표로 구분. 차수마다 다른 하락률을 쓸 때만 채우세요"></div>
         <div class="field"><label>차수별 익절률 (직접 지정)</label><input id="cfg_split_sell_gain_steps" type="text"
-          placeholder="비우면 위 값 균등 · 예: 3, 5, 7"
+          placeholder="비우면 위 값 균등   예: 3, 5, 7"
           title="쉼표로 구분. 차수마다 다른 익절률을 쓸 때만 채우세요"></div>
       </div>
       <div class="note" id="splitNote" style="margin-top:8px"></div>
@@ -282,12 +287,12 @@
   </section>
 </main>
 
-<!-- 포지션 상세 슬라이드 — 오른쪽에서 왼쪽으로 넘어가며 1번부터 차례로 봅니다 -->
+<!-- 포지션 상세 슬라이드, 오른쪽에서 왼쪽으로 넘어가며 1번부터 차례로 봅니다 -->
 <div id="slideOverlay"></div>
 <aside id="slidePanel" aria-hidden="true">
   <div class="slide-head">
     <button id="slPrev" class="sm">◀ 이전</button>
-    <span class="idx" id="slIdx">— / —</span>
+    <span class="idx" id="slIdx"></span>
     <button id="slNext" class="sm">다음 ▶</button>
     <span class="nm" id="slName"></span><span class="cd" id="slCode"></span>
     <span class="pill" id="slTag"></span>
@@ -303,8 +308,8 @@
 window.PAGE = {
   nav: "main",
   title: "자동매매",
-  desc: "계좌 · 포지션 · 설정 · 안전장치. 종목 선정은 [AI 추천·추적] 탭에서 합니다.",
-  lite: false,      // 유일하게 포지션·계좌를 그리는 페이지라 전체 스냅샷을 받습니다
+  desc: "계좌   포지션   설정   안전장치. 종목 선정은 [AI 추천] 탭에서 합니다.",
+  lite: false,      // 유일하게 포지션, 계좌를 그리는 페이지라 전체 스냅샷을 받습니다
   _dirty: false,
   _lastEventId: 0,
 
@@ -355,7 +360,7 @@ window.PAGE = {
       if (val !== before) {
         const warn = val === "live"
           ? "실제 자금 계좌로 전환합니다.\n지금부터 모든 숫자와 주문이 실계좌 기준입니다. 계속할까요?"
-          : "계좌를 전환합니다. 계좌마다 포지션·손익이 따로 관리됩니다. 계속할까요?";
+          : "계좌를 전환합니다. 계좌마다 포지션, 손익이 따로 관리됩니다. 계속할까요?";
         if (!confirm(warn)) { A.$("modeSelect").value = before; return; }
       }
       this.queueSave({mode: val}, true);         // 계좌 전환은 미루지 않습니다
@@ -402,12 +407,12 @@ window.PAGE = {
     off:  "기존 지표 점수만 씁니다.",
     soft: "NNFX 점수를 가중치만큼 섞습니다. 신호를 죽이지 않고 밀거나 당깁니다.",
     veto: "기준선 아래이거나 기준선에서 너무 멀 때만 신규 진입을 막습니다.",
-    hard: "전 슬롯 AND — 합성시장 실측에서 통과율 10%로 굶고 성과가 음수였습니다. 재현용입니다.",
+    hard: "전 슬롯 AND, 합성시장 실측에서 통과율 10%로 굶고 성과가 음수였습니다. 재현용입니다.",
   },
-  ASSETS: [["STOCK","주식","개별 종목 (코스피·코스닥·미국)"],
+  ASSETS: [["STOCK","주식","개별 종목 (코스피, 코스닥, 미국)"],
            ["ETF","ETF","매도 거래세 면제 반영"],
-           ["FUTURES","선물","승수·증거금 자동 계산 · KIS 필요"],
-           ["OPTION","옵션","프리미엄 호가 · KIS 필요"]],
+           ["FUTURES","선물","승수, 증거금 자동 계산   KIS 필요"],
+           ["OPTION","옵션","프리미엄 호가   KIS 필요"]],
   ACTION: {buy:"매수", sell:"매도", close:"청산", open_long:"롱진입", open_short:"숏진입"},
   STATUS: {filled:"체결", partial:"부분체결", pending:"대기", rejected:"거부",
            cancelled:"취소됨", cancel_requested:"취소요청", lost:"결말미상"},
@@ -415,7 +420,7 @@ window.PAGE = {
   hint() {
     AT.$("saveHint").textContent =
       this._pending || this._saveTimer ? "저장 중…"
-      : this._dirty ? "수정 중 — 칸을 벗어나면 저장됩니다." : "";
+      : this._dirty ? "수정 중, 칸을 벗어나면 저장됩니다." : "";
   },
 
   // "10, 20, 30" → [10, 20, 30]. 숫자가 아니거나 0 이하면 버립니다.
@@ -457,7 +462,7 @@ window.PAGE = {
   splitNote(cfg) {
     const el = AT.$("splitNote"); if (!el) return;
     if (!cfg.split_enabled) {
-      el.innerHTML = "분할 매매가 꺼져 있습니다 — 종목당 한 번 사고 한 번 팝니다.";
+      el.innerHTML = "분할 매매가 꺼져 있습니다. 종목당 한 번 사고 한 번 팝니다.";
       return;
     }
     const n = Math.max(2, Math.min(cfg.split_tranches ?? 5, 10));
@@ -473,11 +478,11 @@ window.PAGE = {
     }
     const dd = (1 - level * (1 - (cfg.split_final_stop_pct ?? 7) / 100)) * 100;
     el.innerHTML =
-      `1차 진입가를 기준으로 → <b>${AT.esc(steps.join(" · "))}</b>`
+      `1차 진입가를 기준으로 → <b>${AT.esc(steps.join("   "))}</b>`
       + `<br>각 차수는 <b>자기 매수가</b> 대비 오르면 그 차수만 팝니다. `
-      + `마지막 차수까지 다 담고도 더 빠지면 <b>1차가 대비 -${dd.toFixed(1)}%</b> 에서 전량 손절합니다 — `
+      + `마지막 차수까지 다 담고도 더 빠지면 <b>1차가 대비 -${dd.toFixed(1)}%</b> 에서 전량 손절합니다. `
       + `한 종목이 이만큼 버틴다는 뜻이므로 [종목당 최대 비중]을 그에 맞게 낮추세요.`
-      + `<br><span class="muted">이미 들고 있는 포지션에는 적용되지 않습니다 — 분할을 켠 뒤 새로 잡는 종목부터 차수로 관리됩니다. `
+      + `<br><span class="muted">이미 들고 있는 포지션에는 적용되지 않습니다. 분할을 켠 뒤 새로 잡는 종목부터 차수로 관리됩니다. `
       + `분할이 켜지면 [익절 (%)]과 [고정 손절 (%)]은 이 종목들에 적용되지 않습니다(차수별 익절과 위 손절선이 대신합니다).</span>`;
   },
 
@@ -504,7 +509,7 @@ window.PAGE = {
       if (!this._pending && !this._saveTimer && !editing) this._dirty = false;
       this.hint();
       if (res.stopped) AT.toast("계좌가 바뀌어 자동매매를 중지했습니다. 확인 후 다시 시작하세요.", true);
-      else AT.toast("저장했습니다 — 다음 회전부터 적용됩니다.");
+      else AT.toast("저장했습니다. 다음 회전부터 적용됩니다.");
       AT.refresh();
     } catch (e) {
       // 실패하면 화면 값을 지키기 위해 _dirty 를 유지합니다 (폴링이 되돌리지 않게)
@@ -536,10 +541,10 @@ window.PAGE = {
       ...settle,
       ["매입금액", A.won(acc.purchase_amount), ""],
       ["평가금액", A.won(acc.equity_value), ""],
-      ["평가손익", acc.unrealized_pnl == null ? "—"
+      ["평가손익", acc.unrealized_pnl == null ? "-"
         : A.won(acc.unrealized_pnl), A.sign(acc.unrealized_pnl)],
       ["묶인 증거금", A.won(acc.margin_locked), ""],
-      ["오늘 손익", dayPnl == null ? "—" : A.won(dayPnl) + (dayPct != null ? ` (${A.pct(dayPct)})` : ""), A.sign(dayPnl)],
+      ["오늘 손익", dayPnl == null ? "-" : A.won(dayPnl) + (dayPct != null ? ` (${A.pct(dayPct)})` : ""), A.sign(dayPnl)],
       // 누적 손익 = 일자별 '오늘 손익'의 합 (평가손익 포함).
       // 실현손익만 세면 사서 오르는 중인 종목이 통째로 빠져, 오늘 매매를
       // 시작한 계좌는 영원히 0원으로 보입니다.
@@ -548,9 +553,9 @@ window.PAGE = {
     ].map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("");
     // 잔고 출처를 적어 둡니다. 증권사 앱과 숫자가 다를 때 "우리가 다시 계산한
     // 값"인지 "증권사가 준 값"인지부터 알아야 어디를 볼지 정해집니다.
-    A.$("accSub").textContent = `${snap.identity?.label || ""} 기준 · 주문 ${snap.summary?.orders ?? 0}건 · `
-      + `청산 ${snap.summary?.closed_trades ?? 0}건 · 승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`
-      + (acc.account_source ? ` · 잔고 출처 ${acc.account_source}` : "");
+    A.$("accSub").textContent = `${snap.identity?.label || ""} 기준   주문 ${snap.summary?.orders ?? 0}건   `
+      + `청산 ${snap.summary?.closed_trades ?? 0}건   승률 ${(snap.summary?.win_rate ?? 0).toFixed(0)}%`
+      + (acc.account_source ? `   잔고 출처 ${acc.account_source}` : "");
 
     // 포지션
     const positions = snap.positions || [];
@@ -569,27 +574,40 @@ window.PAGE = {
       // 대표값 하나를 찍으면 "왜 저 가격에 안 팔았지"가 됩니다. 차수 진행도와
       // 다음 매수 트리거를 대신 보여줍니다.
       const sp = p.split;
+      // 고정한 포지션은 목표가·손절가에서만 팝니다. 표시가 없으면 "왜 저 종목만
+      // 트레일링에 안 걸렸지"를 화면에서 답할 수 없습니다.
+      const pin = !!s.pinned;
       return `<tr class="clickable ${off ? "pos-unmanaged" : ""}" data-slide="${i}">
         <td class="muted mono">${i + 1}</td>
         <td>${A.esc(p.name)}${off ? '<span class="tag-unmanaged">관리 안 함</span>' : ""}
+            ${pin ? '<span class="tag-pinned">고정</span>' : ""}
             ${scalp ? '<span class="tag-unmanaged">페니 초단타</span>' : ""}
             ${sp ? `<span class="tag-unmanaged">분할 ${sp.count}/${sp.total}차</span>` : ""}
-            <div class="muted mono" style="font-size:11px">${p.key}</div></td>
+            <div class="muted mono" style="font-size:13.5px">${p.key}</div></td>
         <td>${p.asset_label} ${p.side === "short" ? '<span class="down">숏</span>' : ""}</td>
         <td class="num">${A.num(p.quantity, 4)}</td>
         <td class="num">${A.num(p.avg_price)}</td>
         <td class="num">${A.num(p.current_price)}</td>
         <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}</td>
-        <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "—"}</td>
+        <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "-"}</td>
         <td class="num muted">${sp
             ? (sp.tranches.map((t) => A.num(t.target_price)).join(" / ")
-               + (sp.next_trigger ? `<div style="font-size:11px">다음 매수 ${A.num(sp.next_trigger)}</div>` : ""))
-            : (s.target_price ? A.num(s.target_price) : "—")}</td>
-        <td><button class="sm danger" data-close="${p.key}">청산</button></td>
+               + (sp.next_trigger ? `<div style="font-size:13.5px">다음 매수 ${A.num(sp.next_trigger)}</div>` : "")
+               // 트리거 가격을 지났는데도 안 사는 경우가 있습니다(과매도 조건,
+               // 시간 간격, 하루 한도). 사유를 여기 적지 않으면 화면은
+               // "다음 매수 35,245" 만 보여준 채 아무 일도 안 하는 것처럼 보입니다.
+               + (sp.wait ? `<div class="split-wait">대기 · ${A.esc(sp.wait.text)}</div>` : ""))
+            : (s.target_price ? A.num(s.target_price) : "-")}</td>
+        <td>${off ? "" : `<button class="sm ${pin ? "pinned" : ""}" data-pin="${p.key}"
+              data-pinned="${pin ? 1 : 0}">${pin ? "고정 해제" : "고정"}</button> `}
+            <button class="sm danger" data-close="${p.key}">청산</button></td>
       </tr>`;
     }).join("");
     document.querySelectorAll("[data-close]").forEach((b) =>
       b.onclick = (e) => { e.stopPropagation(); this.closePosition(b.dataset.close); });
+    document.querySelectorAll("[data-pin]").forEach((b) =>
+      b.onclick = (e) => { e.stopPropagation();
+        this.pinPosition(b.dataset.pin, b.dataset.pinned !== "1"); });
     document.querySelectorAll("[data-slide]").forEach((tr) =>
       tr.onclick = () => SLIDES.open(Number(tr.dataset.slide)));
 
@@ -628,7 +646,7 @@ window.PAGE = {
         + `${m.label}${m.available ? "" : " (사용 불가)"}</option>`).join("");
       A.$("assetBoxes").innerHTML = this.ASSETS.map(([key, label, desc]) =>
         `<label class="chk"><input type="checkbox" data-asset="${key}" ${cfg.asset_classes?.[key] ? "checked" : ""}>
-          ${label} <span class="muted" style="font-size:11px">— ${desc}</span></label>`).join("");
+          ${label} <span class="muted" style="font-size:17.5px">   ${desc}</span></label>`).join("");
       document.querySelectorAll("[data-asset]").forEach((el) =>
         el.onchange = () => this.queueSave({asset_classes: {[el.dataset.asset]: el.checked}}));
     }
@@ -636,16 +654,16 @@ window.PAGE = {
     // 한도
     A.$("limitStat").innerHTML = (snap.limits || []).map((l) =>
       `<div class="box"><div class="k">${A.esc(l.label)}</div>
-       <div class="v" style="font-size:14px">${A.esc(l.value)}</div></div>`).join("");
+       <div class="v" style="font-size:17.5px">${A.esc(l.value)}</div></div>`).join("");
 
     // 연결 상태
     const k = snap.kis || {};
     A.$("kisBox").innerHTML =
-      `KIS 키 <b>${k.keys_configured ? "설정됨" : "없음"}</b> ·
-       계좌 <b>${k.account_masked || "미설정"}</b> ·
-       서버 <span class="mono">${k.mock ? "모의투자" : "실전"}</span> ·
+      `KIS 키 <b>${k.keys_configured ? "설정됨" : "없음"}</b> , 
+       계좌 <b>${k.account_masked || "미설정"}</b> , 
+       서버 <span class="mono">${k.mock ? "모의투자" : "실전"}</span> , 
        실주문 <b class="${k.live_enabled ? "up" : "muted"}">${k.live_enabled ? "허용" : "잠김"}</b><br>
-       엔진 루프 ${snap.loop?.running ? "가동 중" : "정지"} · 회전 ${snap.loop?.tick_count ?? 0}회`;
+       엔진 루프 ${snap.loop?.running ? "가동 중" : "정지"}   회전 ${snap.loop?.tick_count ?? 0}회`;
   },
 
   async saveConfig() {
@@ -657,7 +675,7 @@ window.PAGE = {
     if (patch.mode !== before) {
       const warn = patch.mode === "live"
         ? "실제 자금 계좌로 전환합니다.\n지금부터 모든 숫자와 주문이 실계좌 기준입니다. 계속할까요?"
-        : "계좌를 전환합니다. 계좌마다 포지션·손익이 따로 관리됩니다. 계속할까요?";
+        : "계좌를 전환합니다. 계좌마다 포지션, 손익이 따로 관리됩니다. 계속할까요?";
       if (!confirm(warn)) return;
     }
     this.FIELDS.forEach((k) => { const el = A.$("cfg_" + k); if (el && el.value !== "") patch[k] = Number(el.value); });
@@ -694,6 +712,20 @@ window.PAGE = {
     try { await AT.call("/autotrade/close/" + encodeURIComponent(key), {method: "POST"});
           AT.toast("청산 주문을 냈습니다."); AT.refresh(); }
     catch (e) { AT.toast(e.message, true); }
+  },
+
+  async pinPosition(key, pinned) {
+    // 고정을 푸는 쪽만 확인을 받습니다 — 푸는 순간 트레일링·시간 청산이
+    // 다시 살아나서, 다음 회전에 바로 팔릴 수 있습니다.
+    if (!pinned && !confirm(`${key} 고정을 풉니다. 트레일링, 신호 반전, 보유 시간, `
+                          + `회전 매도가 다시 적용됩니다.`)) return;
+    try {
+      await AT.call(`/autotrade/position/${encodeURIComponent(key)}/pin`,
+                    {method: "POST", body: {pinned}});
+      AT.toast(pinned ? "고정했습니다. 이제 목표가나 손절가에서만 팝니다."
+                      : "고정을 풀었습니다.");
+      AT.refresh();
+    } catch (e) { AT.toast(e.message, true); }
   },
 
   async cancelOrder(id) {
@@ -741,9 +773,9 @@ window.PAGE = {
    포지션 상세 슬라이드
    --------------------------------------------------------------------------
    보유 종목을 1번부터 차례로 넘겨 봅니다 (오른쪽 → 왼쪽).
-   한 장에: 보유 정보 · 일봉 차트(매수/매도 지점, 손절·목표선) · AI 계산 과정.
+   한 장에: 보유 정보   일봉 차트(매수/매도 지점, 손절, 목표선)   AI 계산 과정.
 
-   AI 계산 과정은 여기서 **재현하지 않습니다** — 서버 신호(signal.stages)가
+   AI 계산 과정은 여기서 **재현하지 않습니다**, 서버 신호(signal.stages)가
    실제로 거친 단계를 그대로 그립니다. 화면이 따로 계산하면 반드시 엔진과
    어긋나고, 어긋난 화면은 없느니만 못합니다.
    ========================================================================== */
@@ -842,13 +874,16 @@ const SLIDES = {
       ["현재가", A.num(pos.current_price)],
       ["평가손익", `<span class="${A.sign(pos.unrealized_pnl)}">${A.won(pos.unrealized_pnl)}`
         + (pnlPct == null ? "" : ` (${A.pct(pnlPct)})`) + "</span>"],
-      ["손절선", st.stop_price ? A.num(st.stop_price) : "—"],
+      ["손절선", st.stop_price ? A.num(st.stop_price) : "-"],
       [sp ? `목표가 (${sp.count}/${sp.total}차)` : "목표가",
        sp && sp.tranches?.length
-        ? sp.tranches.map((t) => `${t.n}차 ${t.target_price ? A.num(t.target_price) : "—"}`).join(" · ")
-        : (st.target_price ? A.num(st.target_price) : "—")],
-      ...(sp ? [["다음 매수", sp.next_trigger ? A.num(sp.next_trigger) : "— (차수 소진)"]] : []),
-      ["진입 시각", opened || "—"],
+        ? sp.tranches.map((t) => `${t.n}차 ${t.target_price ? A.num(t.target_price) : "-"}`).join("   ")
+        : (st.target_price ? A.num(st.target_price) : "-")],
+      ...(sp ? [["다음 매수", sp.next_trigger ? A.num(sp.next_trigger) : "차수 소진"]] : []),
+      ...(sp && sp.wait ? [["추가 매수 대기 사유", A.esc(sp.wait.text)]] : []),
+      ["진입 시각", opened || "-"],
+      // 고정 여부는 "왜 아직 안 팔았나"의 답이라 손절선, 목표가와 같은 줄에 둡니다
+      ["자동 청산", st.pinned ? "고정 (목표가, 손절가만)" : "전체 규칙 적용"],
     ];
 
     AT.$("slBody").innerHTML = `
@@ -863,25 +898,25 @@ const SLIDES = {
           <span><i class="lg" style="background:#d24b3a;opacity:.7"></i>손절선</span>
           <span><i class="lg" style="background:var(--olive)"></i>${sp ? "차수별 목표가" : "목표가"}</span>
           ${sp ? '<span><i class="lg" style="background:#3f7fd0"></i>다음 매수</span>' : ""}
-          <span class="muted">MA20 · MA60 · 볼린저밴드 — 최근 90일</span>
+          <span class="muted">MA20   MA60   볼린저밴드, 최근 90일</span>
         </div>
         <canvas id="slideChart" height="360"></canvas>
         <div class="slide-note" id="slFillNote"></div>
       </div>
 
       <div class="slide-sec">
-        <h3>AI 계산 과정 — 점수가 만들어진 순서</h3>
+        <h3>AI 계산 과정, 점수가 만들어진 순서</h3>
         ${this.pipeHTML(sig)}
         ${this.gaugeHTML(sig)}
-        <div class="slide-note" style="margin-top:6px">${A.esc((sig.reasons || []).join(" · "))}</div>
+        <div class="slide-note" style="margin-top:6px">${A.esc((sig.reasons || []).join("   "))}</div>
       </div>
 
       <div class="slide-sec">
-        <h3>지표별 기여도 — 무엇이 점수를 끌었나 <span class="sub" style="text-transform:none">
+        <h3>지표별 기여도, 무엇이 점수를 끌었나 <span class="sub" style="text-transform:none">
           ${A.esc(d.regime?.label || "")} ${d.regime?.trend_score != null ? `(추세점수 ${Number(d.regime.trend_score) >= 0 ? "+" : ""}${Number(d.regime.trend_score).toFixed(2)})` : ""}</span></h3>
         ${this.contribHTML(d.indicators || [])}
         <div class="slide-note" style="margin-top:8px">${A.esc(d.regime?.strategy || "")}</div>
-        <div class="slide-note">${(d.regime?.evidence || []).map((e) => "· " + A.esc(e)).join("<br>")}</div>
+        <div class="slide-note">${(d.regime?.evidence || []).map((e) => ",  " + A.esc(e)).join("<br>")}</div>
       </div>`;
 
     this.drawChart(d);
@@ -894,7 +929,7 @@ const SLIDES = {
     if (!stages.length) {
       return `<div class="slide-note">${A.esc(sig.error || "신호 계산 결과가 없습니다.")}</div>`;
     }
-    const fmt = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + Number(v).toFixed(2);
+    const fmt = (v) => v == null ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(2);
     return `<div class="pipe">` + stages.map((s, i) => `
       ${i > 0 ? '<span class="arrow">→</span>' : ""}
       <div class="st ${s.key === "final" ? "final" : ""}">
@@ -918,7 +953,7 @@ const SLIDES = {
       <div class="tick thr" style="left:${pct(thr)}"></div>
       <div class="tick thr" style="left:${pct(-thr)}"></div>
       <div class="needle" style="left:${pct(sig.score)}"></div>
-      <div class="lab" style="left:${pct(sig.score)}">${Number(sig.score).toFixed(2)} · ${dirLabel}</div>
+      <div class="lab" style="left:${pct(sig.score)}">${Number(sig.score).toFixed(2)}   ${dirLabel}</div>
     </div>
     <div class="slide-note" style="display:flex;justify-content:space-between">
       <span>-1 (강한 매도)</span><span>진입 임계값 ±${thr}</span><span>+1 (강한 매수)</span>
@@ -938,7 +973,7 @@ const SLIDES = {
       const color = c > 0 ? "var(--up)" : c < 0 ? "var(--down)" : "var(--line)";
       return `<div class="row2">
         <span class="nm2" title="${A.esc(r.reason || "")}">${A.esc(r.label)}
-          <span class="muted" style="font-size:10px">${A.esc(r.value_text || "")}</span></span>
+          <span class="muted" style="font-size:13px">${A.esc(r.value_text || "")}</span></span>
         <span class="bar"><span class="mid"></span>
           <i style="left:${left}%;width:${w}%;background:${color}"></i></span>
         <span class="val ${A.sign(c)}">${(c >= 0 ? "+" : "") + c.toFixed(3)}</span>
@@ -989,7 +1024,7 @@ const SLIDES = {
     const cw = Math.max(1.5, Math.min(9, (W - pad.l - pad.r) / n * 0.62));
 
     // 가격 눈금 (오른쪽)
-    g.font = "10px Consolas, monospace";
+    g.font = "12px Pretendard, sans-serif";
     g.textAlign = "left"; g.textBaseline = "middle";
     const steps = 5;
     for (let i = 0; i <= steps; i++) {
@@ -1017,7 +1052,7 @@ const SLIDES = {
     }
     for (let i = n - 1; i >= 0; i--) if (bl[i] != null) g.lineTo(x(i), y(bl[i]));
     g.closePath();
-    g.fillStyle = "rgba(201,162,39,.05)"; g.fill();
+    g.fillStyle = "color-mix(in srgb, var(--gold) 10%, transparent)"; g.fill();
 
     // 이동평균
     const line = (arr, color, width) => {
@@ -1029,8 +1064,8 @@ const SLIDES = {
       }
       g.stroke();
     };
-    line(ch.ma20 || [], "rgba(201,162,39,.75)", 1.2);
-    line(ch.ma60 || [], "rgba(63,127,208,.75)", 1.2);
+    line(ch.ma20 || [], "color-mix(in srgb, var(--gold) 10%, transparent)", 1.2);
+    line(ch.ma60 || [], "color-mix(in srgb, var(--down) 12%, transparent)", 1.2);
 
     // 캔들 (한국 관례: 상승 빨강 · 하락 파랑)
     for (let i = 0; i < n; i++) {
@@ -1052,7 +1087,7 @@ const SLIDES = {
       g.strokeStyle = color; g.lineWidth = 1.2; g.setLineDash(dash || [5, 4]);
       g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(W - pad.r, y(v)); g.stroke();
       g.setLineDash([]);
-      g.fillStyle = color; g.font = "10px Consolas, monospace";
+      g.fillStyle = color; g.font = "12px Pretendard, sans-serif";
       g.textAlign = "right"; g.textBaseline = "bottom";
       g.fillText(label + " " + Number(v).toLocaleString("ko-KR", {maximumFractionDigits: 2}),
                  W - pad.r - 4, y(v) - 2);
@@ -1089,7 +1124,7 @@ const SLIDES = {
       const buys = fills.filter((f) => f.action === "buy" || f.action === "open_long").length;
       const sells = fills.length - buys;
       noteEl.textContent = fills.length
-        ? `최근 90일 체결 ${fills.length}건 (매수 ${buys} · 매도 ${sells}) — 실제 체결 기록만 표시합니다.`
+        ? `최근 90일 체결 ${fills.length}건 (매수 ${buys}   매도 ${sells}), 실제 체결 기록만 표시합니다.`
         : "최근 90일 안에 이 계좌의 체결 기록이 없습니다. 진입가 선은 증권사 평단 기준입니다.";
     }
   },

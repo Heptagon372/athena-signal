@@ -2,11 +2,11 @@
    자동매매 콘솔 공통 스크립트
    --------------------------------------------------------------------------
    모든 페이지가 이 파일 하나로 다음을 공유합니다.
-     · 로그인(토큰) 처리 + 로그인 오버레이
-     · 서버 호출 call() + 404/버전 불일치 감지 (서버 재시작 배너)
-     · 공통 헤더(부엉이·내비게이션·상태 배지·시작/중지·킬 스위치) 주입
-     · 계좌 정체 표시줄(가상/실제 자금) + 실전 모드 붉은 테두리
-     · 7초 주기 상태 새로고침 → 각 페이지의 PAGE.onSnapshot(snap) 호출
+       로그인(토큰) 처리 + 로그인 오버레이
+       서버 호출 call() + 404/버전 불일치 감지 (서버 재시작 배너)
+       공통 헤더(부엉이, 내비게이션, 상태 배지, 시작/중지, 킬 스위치) 주입
+       계좌 정체 표시줄(가상/실제 자금) + 실전 모드 붉은 테두리
+       7초 주기 상태 새로고침 → 각 페이지의 PAGE.onSnapshot(snap) 호출
 
    페이지 쪽 계약:
      window.PAGE = {
@@ -20,15 +20,16 @@
 (function () {
   const API = "/api";
   // api.py 의 CONSOLE_API_VERSION 과 짝 — 서버가 낮으면 재시작 배너를 띄웁니다
-  const REQUIRED_API = 9;
+  const REQUIRED_API = 10;      // 10: 포지션 고정 버튼이 쓰는 /position/{symbol}/pin
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
     (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-  const won = (v) => (v == null || isNaN(v)) ? "—" : Math.round(v).toLocaleString("ko-KR") + "원";
-  const num = (v, d = 2) => (v == null || isNaN(v)) ? "—"
+
+  const won = (v) => (v == null || isNaN(v)) ? "-" : Math.round(v).toLocaleString("ko-KR") + "원";
+  const num = (v, d = 2) => (v == null || isNaN(v)) ? "-"
     : Number(v).toLocaleString("ko-KR", {maximumFractionDigits: d});
-  const pct = (v) => (v == null || isNaN(v)) ? "—" : (v >= 0 ? "+" : "") + Number(v).toFixed(2) + "%";
+  const pct = (v) => (v == null || isNaN(v)) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(2) + "%";
   const sign = (v) => v > 0 ? "up" : v < 0 ? "down" : "muted";
 
   let TOKEN = "";
@@ -65,7 +66,7 @@
     // ({"detail":"Not Found"}) 만 재시작 배너를 띄웁니다.
     if (res.status === 404 && path.startsWith("/autotrade") && !(data && data.error)) {
       showStaleBanner();
-      throw new Error("서버가 이전 버전 코드로 실행 중입니다 — 서버를 재시작하세요.");
+      throw new Error("서버가 이전 버전 코드로 실행 중입니다. 서버를 재시작하세요.");
     }
     if (!res.ok) throw new Error(
       (data && (data.message || data.error || data.detail)) || `HTTP ${res.status}`);
@@ -117,10 +118,10 @@
   // ---- 공통 헤더 + 내비게이션 주입 ----
   const NAV = [
     ["main", "/autotrade", "메인"],
-    ["ai", "/autotrade/ai", "AI 추천·추적"],
+    ["ai", "/autotrade/ai", "AI 추천"],
     ["penny", "/autotrade/penny", "페니 초단타"],
-    ["deriv", "/autotrade/deriv", "선물·옵션"],
-    ["backtest", "/autotrade/backtest", "백테스트·기타"],
+    ["deriv", "/autotrade/deriv", "선물 옵션"],
+    ["backtest", "/autotrade/backtest", "백테스트"],
   ];
 
   function injectChrome(page) {
@@ -155,7 +156,7 @@
         <div><h1>${esc(page.title || "")}</h1><p>${esc(page.desc || "")}</p></div></div>
       <div id="moneyBar" class="moneybar"></div>
       <div id="liveWarn" class="warnbox hide"><b>실거래 모드입니다.</b>
-        이 화면의 모든 숫자와 주문은 실제 계좌·실제 자금입니다.</div>`);
+        이 화면의 모든 숫자와 주문은 실제 계좌, 실제 자금입니다.</div>`);
 
     $("btnRun").onclick = runOnce;
     $("btnKill").onclick = killSwitch;
@@ -175,7 +176,7 @@
     const st = snap.state;
     badge.className = "pill " + (st === "running" ? "on" : st === "halted" ? "halt" : "off");
     badge.lastElementChild.textContent =
-      (snap.state_label || "") + (snap.state_reason ? ` — ${snap.state_reason}` : "");
+      (snap.state_label || "") + (snap.state_reason ? `, ${snap.state_reason}` : "");
     $("btnToggle").textContent = snap.enabled ? "중지" : "시작";
     $("btnToggle").className = snap.enabled ? "danger" : "primary";
     $("btnKill").textContent = cfg.kill_switch ? "킬 해제" : "킬 스위치";
@@ -184,12 +185,12 @@
     const real = !!id.real_money;
     document.body.classList.toggle("live", real);
     $("modeBadge").className = "pill " + (real ? "live" : "");
-    $("modeBadge").textContent = (id.label || cfg.mode || "") + (cfg.dry_run ? " · 모의판단" : "");
+    $("modeBadge").textContent = (id.label || cfg.mode || "") + (cfg.dry_run ? "   모의판단" : "");
     $("liveWarn").classList.toggle("hide", !real);
     $("moneyBar").className = "moneybar" + (real ? " real" : "");
     $("moneyBar").innerHTML =
       `<span class="badge">${real ? "실제 자금" : "가상 자금"}</span>
-       <span>지금 보는 숫자는 <b>${esc(id.label || "")}</b> 계좌의 것입니다 ·
+       <span>지금 보는 숫자는 <b>${esc(id.label || "")}</b> 계좌의 것입니다 , 
        계좌 <b>${esc(id.account || "")}</b></span>
        <span class="muted" style="margin-left:auto">${esc(id.server || "")}</span>`;
   }
@@ -229,8 +230,8 @@
       renderCommon(data);
       const r = data.result || {};
       toast(r.skipped ? r.skipped
-        : `회전 완료 — 신호 ${(r.signals || []).length} · 진입 ${(r.entries || []).length} · `
-          + `청산 ${(r.exits || []).length} · 거부 ${(r.rejects || []).length}`);
+        : `회전 완료, 신호 ${(r.signals || []).length}   진입 ${(r.entries || []).length}   `
+          + `청산 ${(r.exits || []).length}   거부 ${(r.rejects || []).length}`);
       window.PAGE?.onSnapshot?.(SNAP);
     } catch (e) { toast(e.message, true); }
     finally { $("btnRun").disabled = false; $("btnRun").textContent = "지금 1회전"; }
@@ -240,7 +241,7 @@
     const on = SNAP?.config?.kill_switch;
     try {
       renderCommon(await call(on ? "/autotrade/resume" : "/autotrade/kill", {method: "POST"}));
-      toast(on ? "킬 스위치를 해제했습니다." : "킬 스위치 — 신규 진입을 차단했습니다.");
+      toast(on ? "킬 스위치를 해제했습니다." : "킬 스위치, 신규 진입을 차단했습니다.");
     } catch (e) { toast(e.message, true); }
   }
 
@@ -323,7 +324,7 @@
       ).join("") + "</optgroup>";
     };
     sel.innerHTML = `<option value="">시장 전체</option>`
-      + group("index", "지수 · ETF") + group("sector", "섹터");
+      + group("index", "지수   ETF") + group("sector", "섹터");
     // 시장을 바꿔서 선택지에서 사라진 범위는 '전체'로 되돌립니다 —
     // 남겨두면 화면에는 보이는데 결과가 0건인 상태가 됩니다.
     sel.value = fits.some((u) => u.key === selected) ? selected : "";

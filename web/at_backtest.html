@@ -3,25 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>백테스트·기타 — 아테나 시그널</title>
+<title>아테나 시그널 백테스트</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="/static/at_common.css">
 </head>
 <body>
 <main>
   <section>
-    <h2>백테스트 <span class="sub">라이브와 같은 신호·청산 규칙으로 과거를 돌립니다</span></h2>
+    <h2>백테스트 <span class="sub">라이브와 같은 신호, 청산 규칙으로 과거를 돌립니다</span></h2>
     <div class="row">
       <input id="btQuery" placeholder="종목 (예: 005930, FUT_FRONT)" style="flex:1;min-width:150px">
       <input id="btDays" type="number" value="250" style="width:110px" title="일봉 개수">
       <button id="btnBacktest" class="primary">실행</button>
       <label class="chk" style="margin:0" title="예측 가능한 순서를 없앤 가짜 가격에 같은 전략을 통과시켜 봅니다">
-        <input type="checkbox" id="btFalsify"> 위조검증 (20회 · 수십 초)</label>
+        <input type="checkbox" id="btFalsify"> 위조검증 (20회   수십 초)</label>
     </div>
     <div id="btResult" style="margin-top:12px"></div>
     <div class="note" style="margin-top:8px">
       <b>총수익률부터 보지 마세요.</b> 상승장에서는 아무 전략이나 총수익률이 올라갑니다.
       매매가 실제로 무엇을 보탰는지는 <b>초과수익</b>(그냥 사서 들고 있기 대비)에만 나옵니다.
-      <br>일봉 종가 기준이라 장중 손절 도달은 다음 날 종가로 처리됩니다. 분봉·뉴스는 과거
+      <br>일봉 종가 기준이라 장중 손절 도달은 다음 날 종가로 처리됩니다. 분봉, 뉴스는 과거
       데이터를 구할 수 없어 반영하지 않습니다. <b>수익 예측이 아니라 설정 점검용</b>입니다.
     </div>
   </section>
@@ -36,7 +41,7 @@
     </section>
 
     <section>
-      <h2>일자별 기록 <span class="sub">계좌 기준값 · 손실 한도 판정에 쓰이는 값</span></h2>
+      <h2>일자별 기록 <span class="sub">계좌 기준값   손실 한도 판정에 쓰이는 값</span></h2>
       <div class="scroll-x" style="max-height:420px"><table id="dailyTable">
         <thead><tr><th>날짜</th><th class="num">시작</th><th class="num">최고</th>
           <th class="num">종료</th><th class="num">실현손익</th><th class="num">매매</th></tr></thead>
@@ -48,8 +53,8 @@
 <script>
 window.PAGE = {
   nav: "backtest",
-  title: "백테스트 · 기타",
-  desc: "설정 검증과 기록 조회 — 여기서는 주문이 나가지 않습니다.",
+  title: "백테스트   기타",
+  desc: "설정 검증과 기록 조회, 여기서는 주문이 나가지 않습니다.",
   ACTION: {buy:"매수", sell:"매도", close:"청산", open_long:"롱진입", open_short:"숏진입"},
   STATUS: {filled:"체결", partial:"부분체결", pending:"대기", rejected:"거부",
            cancelled:"취소됨", cancel_requested:"취소요청", lost:"결말미상"},
@@ -88,7 +93,7 @@ window.PAGE = {
              ["최대낙폭", A.pct(r.max_drawdown_pct), "down"],
              ["매매 횟수", r.trade_count + "회", ""],
              ["승률", r.win_rate.toFixed(0) + "%", ""],
-             ["손익비", r.profit_factor || "—", ""],
+             ["손익비", r.profit_factor || "-", ""],
              ["최종 평가금", A.won(r.final_equity), ""]]
             .map(([k, v, c]) => `<div class="box"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join("")}
         </div>
@@ -118,7 +123,7 @@ window.PAGE = {
         ? `<b>그냥 보유하는 것보다 ${AT.pct(r.excess_return_pct)} 나았습니다.</b>
            매매가 실제로 무언가를 보탰습니다.`
         : `<b>그냥 사서 들고 있는 편이 ${Math.abs(r.excess_return_pct).toFixed(2)}%p 나았습니다.</b>
-           이 설정은 수수료를 내며 시장을 따라갔습니다 — 총수익률이 양수여도 마찬가지입니다.`}
+           이 설정은 수수료를 내며 시장을 따라갔습니다. 총수익률이 양수여도 마찬가지입니다.`}
     </div>`;
   },
 
@@ -129,7 +134,7 @@ window.PAGE = {
   rejectBox(rej) {
     if (!rej || !rej.total) return "";
     const rows = Object.entries(rej.by_reason || {})
-      .map(([, v]) => `${AT.esc(v.label)} ${v.count}건`).join(" · ");
+      .map(([, v]) => `${AT.esc(v.label)} ${v.count}건`).join("   ");
     return `<div class="warnbox" style="margin-bottom:10px;border-color:var(--up);color:#f0917f">
       <b>신호 ${rej.total}건이 체결되지 못했습니다.</b>
       아래 성과는 이 주문들을 뺀 나머지로 만든 것입니다.
@@ -141,7 +146,7 @@ window.PAGE = {
   executionNote(ex) {
     if (!ex) return "";
     return `<div class="note" style="margin-top:8px">
-      체결 모형 — ${AT.esc(ex.note || "")}
+      체결 모형, ${AT.esc(ex.note || "")}
       갭으로 손절선을 관통하면 손절값이 아니라 시가에 체결하고, 구간 끝에 남은
       포지션도 정산해 매매 통계에 포함합니다. 슬리피지 ${ex.slippage_bps}bp.
     </div>`;
@@ -155,19 +160,19 @@ window.PAGE = {
     if (!g) return "";
     if (!g.ok) return `<div class="note" style="margin-top:10px">${AT.esc(g.reason || "")}</div>`;
     const pass = String(g.verdict || "").startsWith("게이트 통과");
-    const num = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
+    const num = (v, d = 2) => (v == null ? "-" : Number(v).toFixed(d));
     const c = g.cpcv || {}, o = g.overfit || {}, l = g.lottery || {}, dsr = g.dsr || {};
     const rows = [
-      ["CPCV 최악 경로 샤프", c.sharpe_worst == null ? "—"
-        : `${num(c.sharpe_worst)} (양수 경로 ${c.share_positive == null ? "—"
+      ["CPCV 최악 경로 샤프", c.sharpe_worst == null ? "-"
+        : `${num(c.sharpe_worst)} (양수 경로 ${c.share_positive == null ? "-"
           : (c.share_positive * 100).toFixed(0) + "%"})`],
-      ["무작위 매매 대비", l.percentile == null ? "—"
+      ["무작위 매매 대비", l.percentile == null ? "-"
         : `${num(l.percentile, 1)} 백분위`],
-      ["요구 t통계", o.required_tstat == null ? "—"
+      ["요구 t통계", o.required_tstat == null ? "-"
         : `${num(o.t_stat)} / ${num(o.required_tstat)} 필요`],
-      ["시행 수 (DSR 보정)", g.registry?.effective_n == null ? "—"
-        : `${g.registry.effective_n}회${dsr.dsr == null ? "" : ` · DSR ${num(dsr.dsr)}`}`],
-      ["데이터 길이", o.have_years == null ? "—"
+      ["시행 수 (DSR 보정)", g.registry?.effective_n == null ? "-"
+        : `${g.registry.effective_n}회${dsr.dsr == null ? "" : `   DSR ${num(dsr.dsr)}`}`],
+      ["데이터 길이", o.have_years == null ? "-"
         : `${num(o.have_years)}년 / 최소 ${num(o.min_backtest_years)}년`],
     ];
     return `<div class="warnbox" style="margin-top:10px;${pass
@@ -175,7 +180,7 @@ window.PAGE = {
       <b>${pass ? "과최적화 게이트 통과" : "과최적화 게이트 경고"}</b>
       <div style="margin-top:4px">${AT.esc(g.verdict || "")}</div>
       <div class="note" style="margin-top:6px">
-        ${rows.map(([k, v]) => `${AT.esc(k)} <b>${AT.esc(String(v))}</b>`).join(" · ")}
+        ${rows.map(([k, v]) => `${AT.esc(k)} <b>${AT.esc(String(v))}</b>`).join("   ")}
       </div>
     </div>`;
   },
@@ -186,12 +191,12 @@ window.PAGE = {
     const ok = f.passed;
     return `<div class="warnbox" style="margin-top:10px;${ok
         ? "border-color:var(--olive);color:#b6c496" : "border-color:var(--up);color:#f0917f"}">
-      <b>위조검증 ${ok ? "통과" : "실패"}</b> — ${AT.esc(f.verdict)}
+      <b>위조검증 ${ok ? "통과" : "실패"}</b>, ${AT.esc(f.verdict)}
       <div class="note" style="margin-top:4px">
         예측 가능한 순서를 없앤 가짜 가격 ${f.n_trials}회에서 총수익률 평균
         ${AT.pct(f.null_mean)} (범위 ${AT.pct(f.null_min)} ~ ${AT.pct(f.null_max)}).
-        실제 성과 ${AT.pct(f.observed)} · p=${f.p_value}
-        ${ok ? "" : " — 즉 이 성과는 가짜 데이터에서도 비슷하게 나옵니다."}
+        실제 성과 ${AT.pct(f.observed)}   p=${f.p_value}
+        ${ok ? "" : ", 즉 이 성과는 가짜 데이터에서도 비슷하게 나옵니다."}
       </div>
     </div>`;
   },
@@ -201,15 +206,15 @@ window.PAGE = {
     try {
       const d = await A.call("/autotrade/orders?limit=40");
       const eq = d.execution_quality || {};
-      A.$("orderSub").textContent = `총 ${d.summary.orders}건 · 거부 ${d.summary.rejected}건`
-        + (eq.samples ? ` · 평균 슬리피지 ${eq.avg_slippage_bps}bp (${eq.samples}건)` : "");
+      A.$("orderSub").textContent = `총 ${d.summary.orders}건   거부 ${d.summary.rejected}건`
+        + (eq.samples ? `   평균 슬리피지 ${eq.avg_slippage_bps}bp (${eq.samples}건)` : "");
       A.$("ordTable").querySelector("tbody").innerHTML = (d.orders || []).map((o) => `<tr>
         <td class="muted mono">${o.created_at.slice(5, 16).replace("T", " ")}</td>
         <td>${A.esc(o.name || o.symbol)}</td>
         <td>${this.ACTION[o.action] || o.action}</td>
         <td class="num">${A.num(o.quantity, 4)}</td>
         <td class="num">${A.num(o.price)}</td>
-        <td class="num ${A.sign(o.realized_pnl)}">${o.realized_pnl == null ? "—" : A.won(o.realized_pnl)}</td>
+        <td class="num ${A.sign(o.realized_pnl)}">${o.realized_pnl == null ? "-" : A.won(o.realized_pnl)}</td>
         <td class="${o.status === "rejected" ? "up" : "muted"}" title="${A.esc(o.reason || "")}">
           ${this.STATUS[o.status] || o.status}${o.slippage_bps != null
             ? ` <span class="muted">${o.slippage_bps > 0 ? "+" : ""}${o.slippage_bps}bp</span>` : ""}</td>

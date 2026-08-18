@@ -6,7 +6,7 @@
 
 테이블
     at_config          사용자별 설정(JSON) + 가동 상태
-    at_position_state  포지션별 진입가·손절가·목표가·고점 (전략이 기억해야 하는 값)
+    at_position_state  포지션별 진입가·손절가·목표가·고점·고정 (전략이 기억해야 하는 값)
     at_events          판단 로그 (신호·거부·진입·청산·오류) — append-only
     at_orders          주문 원장 — client_order_id 로 중복 방지
     at_daily           일자별 시작/최고/종료 평가금액 (손실 한도 판정 기준)
@@ -283,6 +283,7 @@ def init():
             note TEXT,
             strategy TEXT,                        -- auto | scalp (누가 잡은 포지션인가)
             splits TEXT,                          -- 분할 차수 원장 (JSON, engine/split.py)
+            pinned INTEGER NOT NULL DEFAULT 0,    -- 고정 (목표가·손절가로만 매도)
             PRIMARY KEY (user_id, mode, symbol)
         )""")
         conn.execute("""
@@ -504,6 +505,11 @@ def _migrate_position_state(conn):
     # 분할을 켜기 전에 잡아둔 포지션이 갑자기 차수 매매로 넘어가면 안 됩니다.
     if "splits" not in existing:
         conn.execute("ALTER TABLE at_position_state ADD COLUMN splits TEXT")
+    # 고정 — 사용자가 "이 종목은 시간·신호·회전으로 팔지 마라"고 못박은 표시입니다.
+    # 기본값 0 이라서, 이 기능을 쓰기 전에 잡아둔 포지션은 예전과 똑같이 움직입니다.
+    if "pinned" not in existing:
+        conn.execute("ALTER TABLE at_position_state ADD COLUMN pinned "
+                     "INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +679,26 @@ def upsert_position_state(user_id: int, mode: str, symbol: str, **fields):
                 f"INSERT INTO at_position_state (user_id, mode, symbol, updated_at, {cols}) "
                 f"VALUES (?, ?, ?, ?, {marks})",
                 (user_id, mode, symbol, now, *data.values()))
+
+
+def set_position_pinned(user_id: int, mode: str, symbol: str,
+                        pinned: bool) -> bool:
+    """포지션 고정 켜기/끄기. 상태 줄이 없으면 False (아무것도 만들지 않습니다).
+
+    **일부러 UPDATE 만 합니다.** 여기서 없는 줄을 새로 만들면, 자동매매가
+    관여하지 않던 종목(사용자가 증권사 앱에서 직접 산 주식)이 상태 표에 들어와
+    `is_managed` 가 True 로 바뀝니다. 그 줄에는 손절·목표가 없으므로 다음
+    회전에서 설정의 고정 손절 %가 대신 걸리고 — 건드리지 않기로 한 주식이
+    자동으로 팔립니다. 고정은 자동매매가 이미 관리 중인 포지션에만 붙입니다.
+    """
+    init()
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE at_position_state SET pinned = ?, updated_at = ? "
+            "WHERE user_id = ? AND mode = ? AND symbol = ?",
+            (1 if pinned else 0, datetime.now().isoformat(),
+             user_id, mode, symbol))
+        return cur.rowcount > 0
 
 
 def clear_position_state(user_id: int, mode: str, symbol: str):

@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import CandleChart from "./components/CandleChart";
 import Owl from "./components/Owl";
-import { api, fmtBigWon, fmtMoney, fmtNum, HORIZON_LABEL, signColor, SymbolNotFound } from "./lib/api";
+import { api, fmtBigWon, fmtMoney, fmtNum, HORIZON_LABEL, safeUrl, signColor, SymbolNotFound } from "./lib/api";
 import { useSymbol } from "./providers";
 
 const TIMEFRAMES = [
@@ -76,7 +76,7 @@ function SaveFeed() {
         {state === "error" && <div className="row-sub">세이브 피드를 불러오지 못했습니다.</div>}
         {state === "ok" && feed?.requires_login && (
           <div className="row-sub">
-            리포트는 세이브 로그인이 필요합니다 — 세션 쿠키를 SAVETICKER_COOKIE 환경변수에 넣어주세요.
+            리포트는 세이브 로그인이 필요합니다. 세션 쿠키를 SAVETICKER_COOKIE 환경변수에 넣어주세요.
           </div>
         )}
         {state === "ok" && !feed?.requires_login && items.length === 0 && (
@@ -84,9 +84,12 @@ function SaveFeed() {
         )}
         {items.map((n, i) => {
           const stance = n.sentiment > 0.1 ? "bullish" : n.sentiment < -0.1 ? "bearish" : "neutral";
-          const Row = n.url ? "a" : "div";
-          const linkProps = n.url
-            ? { href: n.url, target: "_blank", rel: "noopener noreferrer" }
+          // 외부에서 온 링크는 safeUrl 을 통과한 것만 <a> 로 만듭니다.
+          // 걸러지면 링크 없이 제목만 보입니다 (api.js 의 safeUrl 주석 참고).
+          const href = safeUrl(n.url);
+          const Row = href ? "a" : "div";
+          const linkProps = href
+            ? { href, target: "_blank", rel: "noopener noreferrer" }
             : {};
           return (
             <Row className="feed-item" key={`${n.title}-${i}`} {...linkProps}>
@@ -104,7 +107,7 @@ function SaveFeed() {
                   {(n.tickers || []).slice(0, 3).map((t) => (
                     <span className="label-chip" style={{ color: "var(--gold)" }} key={t}>{t}</span>
                   ))}
-                  {" · "}
+                  {"   "}
                   {new Date(n.published_at).toLocaleString("ko-KR",
                     { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
                 </div>
@@ -243,7 +246,7 @@ export default function AnalysisPage() {
           <div className="eyebrow">밤에도 눈을 뜬다</div>
           <div className="film-title">ATHENA <em>SIGNAL</em></div>
           <p className="film-sub">
-            코스피 · 코스닥 · 미국 &nbsp;|&nbsp; 지표 11종 · 뉴스 감성 · 종목토론방 여론을 하나의 확률로
+            <span>코스피 코스닥 미국</span><span>지표 11종, 뉴스 감성, 종목토론방 여론을 하나의 확률로</span>
           </p>
         </div>
       </section>
@@ -260,7 +263,7 @@ export default function AnalysisPage() {
                   <button type="button" key={s.key} className="suggest-item"
                           onMouseDown={(e) => { e.preventDefault(); load(s.key); setInput(""); setSuggests([]); }}>
                     <span>{s.name}</span>
-                    <span className="mono suggest-meta">{s.key} · {s.market}</span>
+                    <span className="mono suggest-meta">{s.key}   {s.market}</span>
                   </button>
                 ))}
               </div>
@@ -277,20 +280,20 @@ export default function AnalysisPage() {
         <section className="section">
           <div className="card notfound-card">
             <div className="eyebrow">종목 조회 실패</div>
-            <h2>&lsquo;{notFound.query}&rsquo; — 존재하지 않는 종목입니다</h2>
+            <h2>&lsquo;{notFound.query}&rsquo; 종목을 찾을 수 없습니다</h2>
             <p>{notFound.message}</p>
             {notFound.suggestions?.length > 0 && (
               <div className="nf-chips">
                 {notFound.suggestions.map((s) => (
                   <button key={s.key} className="nf-chip" onClick={() => load(s.key)}>
-                    {s.name}<span className="mono">{s.key} · {s.market}</span>
+                    {s.name}<span className="mono">{s.key}   {s.market}</span>
                   </button>
                 ))}
               </div>
             )}
             <div className="nf-hint">
-              확인한 시장 · 코스피 · 코스닥 · 코넥스 · 미국(NYSE/NASDAQ)<br />
-              입력 예시 · 삼성전자 / 005930 / 에코프로비엠 / AAPL
+              <b>확인한 시장</b> 코스피, 코스닥, 코넥스, 미국(NYSE, NASDAQ)<br />
+              <b>입력 예시</b> 삼성전자, 005930, 에코프로비엠, AAPL
             </div>
           </div>
         </section>
@@ -311,7 +314,7 @@ export default function AnalysisPage() {
 
               {sym.leverage_warning && (
                 <div className="leverage-warning">
-                  ⚠ <b>{sym.long_name || sym.name}</b> — {sym.leverage_warning}
+                  <b>{sym.long_name || sym.name}</b><br />{sym.leverage_warning}
                 </div>
               )}
 
@@ -327,14 +330,14 @@ export default function AnalysisPage() {
                 <div className="lp-meta">
                   <span className={`market-state${marketOpen ? " open" : ""}`}>
                     <i />{(quote?.market_status || data.market_status)?.label}
-                    {marketOpen ? " · 실시간" : ` · ${(quote?.market_status || data.market_status)?.next_event || ""}`}
+                    {marketOpen ? "   실시간" : `   ${(quote?.market_status || data.market_status)?.next_event || ""}`}
                   </span>
                   <span>{quote?.source || snap?.source}</span>
                 </div>
               </div>
 
               <div className="verified">
-                종목 실존 확인 <b>{sym.verified_by}</b> · 코드 {sym.key}
+                종목 실존 확인 <b>{sym.verified_by}</b>   코드 {sym.key}
               </div>
             </div>
 
@@ -344,7 +347,7 @@ export default function AnalysisPage() {
                 <div className="open-eyebrow">장 시작 전 예측</div>
                 <OpenGauge pred={openPred} />
                 <div className="open-target">
-                  {(quote?.market_status || data.market_status)?.label} · 다음 개장{" "}
+                  {(quote?.market_status || data.market_status)?.label}   다음 개장{" "}
                   <b>{openPred.target_text}</b><br />
                   전일 종가 대비 <b>{openPred.direction === "up" ? "상승" : "하락"} 출발</b> 확률
                 </div>
@@ -403,7 +406,7 @@ export default function AnalysisPage() {
                     <i style={{ width: `${Math.max(0, Math.min(100, (p.probability - 50) * 2))}%`,
                                 background: p.direction === "up" ? "var(--up)" : "var(--down)" }} />
                   </div>
-                  <div className="hz-meta">분봉 {Math.round(p.intraday_share * 100)}% · 신뢰 {p.confidence}</div>
+                  <div className="hz-meta">분봉 {Math.round(p.intraday_share * 100)}%   신뢰 {p.confidence}</div>
                 </div>
               ))}
             </div>
@@ -431,8 +434,8 @@ export default function AnalysisPage() {
               <div>
                 <div className="eyebrow">차트</div>
                 <h2>가격이 실제로 그린 그림</h2>
-                <p>캔들·이동평균·볼린저밴드·거래량·RSI·MACD 모두 실제 수신한 데이터로 그립니다.
-                   차트 오른쪽 위 <b>[지표]</b>에서 CCI·스토캐스틱·MFI·ATR·OBV 를 켜고 끌 수 있습니다.</p>
+                <p>캔들, 이동평균, 볼린저밴드, 거래량, RSI, MACD 모두 실제 수신한 데이터로 그립니다.
+                   차트 오른쪽 위 <b>[지표]</b>에서 CCI, 스토캐스틱, MFI, ATR, OBV 를 켜고 끌 수 있습니다.</p>
               </div>
               <div className="tf-picker">
                 {TIMEFRAMES.map((tf) => (
@@ -468,7 +471,7 @@ export default function AnalysisPage() {
                   <div className="ind-reason">
                     {i.reason}
                     <div className="row-sub">점수 {i.score >= 0 ? "+" : ""}{i.score} × 비중 {i.weight}
-                      {i.formula ? ` | ${i.formula}` : ""}</div>
+                      {i.formula ? `   ${i.formula}` : ""}</div>
                   </div>
                   <div className="m" style={{ color: signColor(i.contribution), textAlign: "right" }}>
                     {i.contribution >= 0 ? "+" : ""}{i.contribution}
@@ -478,7 +481,7 @@ export default function AnalysisPage() {
             </div>
           </section>
 
-          {/* 뉴스 · 커뮤니티 */}
+          {/* 뉴스   커뮤니티 */}
           <section className="section">
             <div className="section-head">
               <div>
@@ -511,19 +514,19 @@ export default function AnalysisPage() {
 
                 <div className="feed-head" style={{ marginTop: 18 }}><span className="eyebrow">뉴스</span>
                   <span className="mono row-sub">
-                    {data.news_summary?.total}건 · 긍정 {data.news_summary?.positive} / 부정 {data.news_summary?.negative}
+                    {data.news_summary?.total}건   긍정 {data.news_summary?.positive} / 부정 {data.news_summary?.negative}
                   </span>
                 </div>
                 <div className="feed-list">
                   {data.news_sample?.slice(0, 6).map((nItem, i) => (
-                    <a className="feed-item" key={i} href={nItem.url} target="_blank" rel="noopener noreferrer">
+                    <a className="feed-item" key={i} href={safeUrl(nItem.url)} target="_blank" rel="noopener noreferrer">
                       <div className={`feed-stance ${nItem.sentiment > 0.1 ? "bullish" : nItem.sentiment < -0.1 ? "bearish" : "neutral"}`} />
                       <div>
                         <div className="feed-title">
                           {nItem.badge && <span className="terminal-chip">{nItem.badge}</span>}
                           {nItem.title}
                         </div>
-                        <div className="row-sub">{nItem.source} · {nItem.sentiment >= 0 ? "+" : ""}{nItem.sentiment.toFixed(2)}</div>
+                        <div className="row-sub">{nItem.source}   {nItem.sentiment >= 0 ? "+" : ""}{nItem.sentiment.toFixed(2)}</div>
                       </div>
                     </a>
                   ))}
@@ -532,7 +535,7 @@ export default function AnalysisPage() {
                 <div className="feed-head" style={{ marginTop: 18 }}>
                   <span className="eyebrow">커뮤니티</span>
                   <span className="mono row-sub">
-                    {data.community?.post_count}건 · 매수 {data.community?.bullish_count} / 매도 {data.community?.bearish_count}
+                    {data.community?.post_count}건   매수 {data.community?.bullish_count} / 매도 {data.community?.bearish_count}
                   </span>
                 </div>
                 <div className="feed-sources">
@@ -571,10 +574,11 @@ function OpenGauge({ pred }) {
       <circle cx="84" cy="84" r={r} fill="none" stroke={col} strokeWidth="8" strokeLinecap="round"
               strokeDasharray={circ} strokeDashoffset={off} transform="rotate(-90 84 84)" />
       <circle cx="84" cy="84" r={r * 0.42} fill={col} opacity="0.12" />
-      <text x="84" y="82" textAnchor="middle" fill="var(--text)" fontSize="34" fontWeight="600">
+      <text x="84" y="86" textAnchor="middle" fill="var(--text)" fontSize="41" fontWeight="800"
+            letterSpacing="-0.03em">
         {pred.probability}%
       </text>
-      <text x="84" y="104" textAnchor="middle" fill={col} fontFamily="monospace" fontSize="13">
+      <text x="84" y="110" textAnchor="middle" fill={col} fontSize="17" fontWeight="700">
         {pred.direction === "up" ? "▲ 상승 출발" : "▼ 하락 출발"}
       </text>
     </svg>
@@ -593,7 +597,7 @@ function Snapshot({ snap, currency }) {
   if (snap.high_52w) cells.push(["52주 최고", fmtMoney(snap.high_52w, currency)]);
   if (snap.low_52w) cells.push(["52주 최저", fmtMoney(snap.low_52w, currency)]);
   if (snap.market_cap_text) cells.push(["시가총액", snap.market_cap_text]);
-  if (snap.per) cells.push(["PER / PBR", `${snap.per} / ${snap.pbr || "—"}`]);
+  if (snap.per) cells.push(["PER / PBR", `${snap.per} / ${snap.pbr || "-"}`]);
 
   const flow = snap.investor_flow || {};
   return (
@@ -615,15 +619,15 @@ function Snapshot({ snap, currency }) {
           <div key={label}>
             <div className="stat-label">{label}</div>
             <div className="stat-value" style={{ fontSize: 14, color: signColor(qty) }}>
-              {qty == null ? "—" : `${qty > 0 ? "+" : ""}${fmtNum(qty)}주`}
+              {qty == null ? "-" : `${qty > 0 ? "+" : ""}${fmtNum(qty)}주`}
             </div>
             <div className="stat-sub">{val == null ? "" : fmtBigWon(val)}</div>
           </div>
         ))}
       </div>
       <div className="source-note">
-        시세 출처 · {snap.source}<br />
-        투자자별 순매매 · {flow.source || "데이터 없음"}
+        시세 출처   {snap.source}<br />
+        투자자별 순매매   {flow.source || "데이터 없음"}
         {flow.trade_date ? ` (${flow.trade_date} 기준)` : ""}
       </div>
     </>
@@ -640,9 +644,9 @@ function Regime({ regime }) {
         <span className="mono row-sub">추세점수 {regime.trend_score >= 0 ? "+" : ""}{regime.trend_score}</span>
       </div>
       <div className="regime-strategy">{regime.strategy}</div>
-      <div className="regime-evidence">{(regime.evidence || []).join(" · ")}</div>
+      <div className="regime-evidence">{(regime.evidence || []).join("   ")}</div>
       <div className="regime-evidence" style={{ marginTop: 8 }}>
-        적용 배수 — 추세추종 <b>×{m.trend}</b> &nbsp; 평균회귀 <b>×{m.meanrev}</b> &nbsp; 수급확인 <b>×{m.confirm}</b>
+        적용 배수   추세추종 <b>×{m.trend}</b> &nbsp; 평균회귀 <b>×{m.meanrev}</b> &nbsp; 수급확인 <b>×{m.confirm}</b>
       </div>
     </div>
   );

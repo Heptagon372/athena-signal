@@ -27,6 +27,7 @@ pymongo 를 최상단에서 import 하지 않는 이유
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import security
 from data_sources import credentials
 from storage import users as local_users
 
@@ -415,9 +416,17 @@ def upsert_google_account(profile: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def create_session(user_id: int, user_agent: str = "") -> str:
+    """세션 발급. 돌려주는 것은 원문, **저장하는 것은 지문**입니다.
+
+    Atlas 는 남의 컴퓨터입니다. 사용자 API 키를 굳이 암호화해 보내면서
+    (storage/user_credentials.py) 세션 토큰을 평문으로 두면, Atlas 쪽 사고 한
+    번에 모든 계정으로 로그인할 수 있는 30일짜리 열쇠 꾸러미가 넘어갑니다 —
+    암호화해 둔 키를 쓸 수 있는 상태의 계정으로 그대로 들어오는 셈이라
+    암호화의 의미가 사라집니다.
+    """
     token = secrets.token_urlsafe(32)
     _db().sessions.insert_one({
-        "token": token,
+        "token": security.token_digest(token),
         "user_id": user_id,
         "created_at": _now(),
         "expires_at": _now() + timedelta(days=SESSION_DAYS),
@@ -431,12 +440,16 @@ def user_from_token(token: str) -> dict | None:
 
     Mongo 를 못 쓰는 상태여도 None 만 돌려줍니다 — 호출부(api.current_user)가
     이어서 SQLite 세션을 확인하므로, 로컬 로그인이 함께 죽으면 안 됩니다.
+
+    지문·원문 두 형태를 모두 찾아보는 이유는 storage/users.py 와 같습니다 —
+    지문 저장 이전에 발급된 세션을 로그아웃시키지 않고 이전하기 위해서입니다.
     """
     if not token:
         return None
+    keys = security.token_lookup_keys(token)
     try:
         database = _db()
-        session = database.sessions.find_one({"token": token})
+        session = database.sessions.find_one({"token": {"$in": keys}})
         if not session:
             return None
 
@@ -447,8 +460,13 @@ def user_from_token(token: str) -> dict | None:
             if expires.tzinfo is None:
                 expires = expires.replace(tzinfo=timezone.utc)
             if expires < _now():
-                database.sessions.delete_one({"token": token})
+                database.sessions.delete_one({"_id": session["_id"]})
                 return None
+
+        # 원문으로 저장돼 있던 옛 세션이면 지금 지문으로 바꿔 둡니다
+        if session.get("token") != keys[0]:
+            database.sessions.update_one({"_id": session["_id"]},
+                                         {"$set": {"token": keys[0]}})
 
         doc = database.accounts.find_one({"user_id": session["user_id"]})
         return _as_user(doc) if doc else None
@@ -463,7 +481,9 @@ def delete_session(token: str) -> bool:
     if not token:
         return False
     try:
-        return _db().sessions.delete_one({"token": token}).deleted_count > 0
+        deleted = _db().sessions.delete_many(
+            {"token": {"$in": security.token_lookup_keys(token)}})
+        return deleted.deleted_count > 0
     except Exception:
         return False
 
@@ -511,10 +531,15 @@ def consume_oauth_state(state: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def create_handoff(token: str) -> str:
-    """세션 토큰을 URL 에 싣지 않기 위한 60초·1회용 교환 코드."""
+    """세션 토큰을 URL 에 싣지 않기 위한 60초·1회용 교환 코드.
+
+    코드도 지문으로 저장합니다. 이 코드는 URL 에 실려 브라우저 히스토리와
+    (프록시를 탈 경우) 접속 로그에 남는 값이라, 저장소에서까지 원문으로
+    주울 수 있게 둘 이유가 없습니다.
+    """
     code = secrets.token_urlsafe(24)
     _db().handoffs.insert_one({
-        "code": code,
+        "code": security.token_digest(code),
         "token": token,
         "created_at": _now(),
         "expires_at": _now() + timedelta(seconds=HANDOFF_TTL_SECONDS),
@@ -526,7 +551,8 @@ def consume_handoff(code: str) -> str | None:
     """코드를 소비하고 세션 토큰을 돌려줍니다. 두 번째 호출은 None."""
     if not code:
         return None
-    doc = _db().handoffs.find_one_and_delete({"code": code})
+    doc = _db().handoffs.find_one_and_delete(
+        {"code": {"$in": security.token_lookup_keys(code)}})
     if not doc:
         return None
 
