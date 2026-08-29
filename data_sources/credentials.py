@@ -71,7 +71,8 @@ def _overlay_allowed(name: str) -> bool:
     # (mongo/firebase/google/공개 오리진)을 뺀 제공자 필드 + KIS 거래 설정.
     if name in ("KIS_ACCOUNT", "KIS_DERIV_ACCOUNT", "KIS_MOCK", "KIS_LIVE_TRADING"):
         return True
-    for provider in ("toss", "kis", "reddit", "naver", "krx", "datago"):
+    for provider in ("toss", "kis", "reddit", "naver", "krx", "datago",
+                     "anthropic"):
         if name in PROVIDERS[provider]["fields"]:
             return True
     return False
@@ -144,6 +145,13 @@ PROVIDERS = {
         "fields": ["DATAGO_SERVICE_KEY"],
         "portal": "https://www.data.go.kr (금융위원회_주식시세정보 활용신청)",
         "gives": "금융위 주식시세 (KRX 일별 시세 공식 경로)",
+    },
+    "anthropic": {
+        "label": "앤트로픽 (AI 에이전트 분석)",
+        "fields": ["ANTHROPIC_API_KEY"],
+        "portal": "https://console.anthropic.com (API keys)",
+        "gives": "LLM 멀티에이전트 종목 분석 (AI 에이전트 화면). 호출마다 요금이 "
+                 "나갑니다 — 없어도 나머지 기능은 그대로 동작합니다",
     },
     "firebase": {
         "label": "구글 로그인 (Firebase)",

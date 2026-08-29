@@ -16,7 +16,9 @@
   <section>
     <h2>AI 자동 추적
       <span id="trackBadge" class="pill off"><span class="dot"></span><span>꺼짐</span></span>
+      <span id="roundBadge" class="pill hide" title="순환 평가가 지금까지 몇 번 돌았는가. 자동 갱신과 [지금 추천 받기] 를 모두 셉니다"></span>
       <span class="sub" id="trackNote"></span></h2>
+    <div class="note" id="rotationNote" style="margin-bottom:8px"></div>
     <div class="row">
       <button id="btnTrack" class="primary">추적 시작</button>
       <button id="btnRecommend">지금 추천 받기</button>
@@ -40,10 +42,12 @@
       <label class="chk" style="margin:0"><input type="checkbox" id="cfg_auto_universe_keep_manual">
         손으로 넣은 종목은 유지</label>
     </div>
-    <div class="row" style="margin-top:8px;align-items:center">
-      <span class="muted" style="font-size:15px">탐색 범위</span>
-      <select id="poolSelect" style="width:auto;min-width:190px"></select>
-      <span class="note" id="poolSelectNote" style="margin:0"></span>
+    <div style="margin-top:10px">
+      <div class="row" style="align-items:baseline">
+        <span class="muted" style="font-size:15px">탐색 범위</span>
+        <span class="note" id="poolNote" style="margin:0;flex:1"></span>
+      </div>
+      <div id="poolBox" style="margin-top:6px"></div>
     </div>
     <div class="note">
       추적은 <b>종목 선정까지만</b> 합니다. 실제 주문은 상단 [시작] 으로 자동매매를 켜야 나갑니다.
@@ -92,6 +96,9 @@ window.PAGE = {
   desc: "시장을 훑어 종목을 고르고 매매 대상을 자동 갱신합니다. 주문은 여기서 나가지 않습니다.",
   _dirty: false,
   _lastWouldPick: [],
+  _pollTimer: null,
+  _pollBase: "",       // updated_at 기준점 — 이보다 새로 저장되면 다시 그림
+  _pollAnnounce: false, // 이번 폴링이 끝날 때 토스트로 알릴 것인가
 
   init() {
     const A = AT;
@@ -106,10 +113,6 @@ window.PAGE = {
      "auto_universe_full_market"].forEach((k) => {
       const el = A.$("cfg_" + k); if (el) el.onchange = () => { this._dirty = true; };
     });
-    A.$("poolSelect").onchange = () => {
-      this._dirty = true;
-      this.renderPool(A.readSegments("segBox"), A.$("poolSelect").value);
-    };
     this.loadSaved();
     setInterval(() => {
       if (AT.SNAP?.config?.auto_universe) this.loadSaved();
@@ -120,6 +123,24 @@ window.PAGE = {
     const A = AT, cfg = snap.config || {};
     const track = snap.ai_tracking || {};
     const tb = A.$("trackBadge");
+
+    // 몇 회전 돌았는가 — 추적을 꺼 놔도 지난 회전 수는 남아 있으므로 계속 띄웁니다
+    // (껐다 켜면 처음부터 도는 줄 알기 쉽습니다. 실제로는 팩터 캐시가 남아 이어집니다)
+    const rounds = Number(track.rounds || 0);
+    A.$("roundBadge").classList.toggle("hide", rounds <= 0);
+    A.$("roundBadge").textContent = `${rounds.toLocaleString("ko-KR")}회전`;
+
+    // 마지막 회전이 어디까지 훑었는가 (시장별)
+    const rot = track.rotation || {};
+    const cover = Object.entries(rot.markets || {});
+    A.$("rotationNote").innerHTML = cover.length
+      ? cover.map(([market, c]) =>
+          `<b>${A.esc(market)}</b> ${A.num(c.covered, 0)} / ${A.num(c.total, 0)}종목`
+          + (c.remaining ? ` (약 ${c.rounds_left}회전 남음)` : " 전체 커버")
+          + (c.skipped ? `   계산 불가 ${A.num(c.skipped, 0)}` : "")
+        ).join("   ")
+        + `<span class="muted">   ${rot.round}회전째 · 회전당 ${rot.scan_limit}종목</span>`
+      : "";
     if (track.enabled) {
       tb.className = "pill on";
       tb.lastElementChild.textContent = track.refreshing ? "새 종목 찾는 중…"
@@ -130,7 +151,7 @@ window.PAGE = {
       A.$("btnTrack").className = "danger";
       A.$("trackNote").textContent = track.last_refresh_at
         ? `마지막 갱신 ${track.last_refresh_at.slice(11, 16)}   ${track.period_min ?? 30}분 주기`
-        : "곧 첫 추천을 계산합니다 (30초~1분)";
+        : "곧 첫 추천을 계산합니다 — 캐시 순위가 먼저, 전체 계산은 몇 분 걸립니다";
     } else {
       tb.className = "pill off";
       tb.lastElementChild.textContent = "꺼짐";
@@ -147,23 +168,36 @@ window.PAGE = {
       A.$("cfg_auto_universe_full_market").checked = cfg.auto_universe_full_market !== false;
       // 서버가 정규화한 값을 씁니다 — 예전 설정("KR")도 코스피·코스닥으로 풀려서 옵니다
       const scope = snap.search_scope || {};
-      this.renderScope(scope.segments || ["KOSPI", "KOSDAQ"], scope.universe || "");
+      this.renderScope(scope.segments || ["KOSPI", "KOSDAQ"], scope.universes || []);
     }
     this.renderUniverse(cfg.universe || [], snap.universe_detail || []);
   },
 
-  /** 시장 체크박스 + 탐색 범위 드롭다운. 시장을 바꾸면 범위 목록도 따라 바뀝니다. */
-  async renderScope(segments, pool) {
+  /** 시장 체크박스 + 탐색 범위 칩. 시장을 바꾸면 범위 목록도 따라 바뀝니다. */
+  async renderScope(segments, pools) {
     const A = AT;
     await A.renderSegments("segBox", segments, (next) => {
       this._dirty = true;
-      this.renderPool(next, A.$("poolSelect").value);
+      // 시장을 바꾸면 겹치지 않게 된 범위는 빠집니다 — 지금 켜져 있는 것을
+      // 그대로 넘겨서, 남는 것만 다시 그립니다.
+      this.renderPool(next, A.readPools("poolBox"));
     });
-    await this.renderPool(segments, pool);
+    await this.renderPool(segments, pools);
   },
 
-  async renderPool(segments, pool) {
-    await AT.renderUniverse("poolSelect", segments, pool);
+  async renderPool(segments, pools) {
+    const kept = await AT.renderPools("poolBox", segments, pools,
+                                      () => { this._dirty = true; this.poolNote(); });
+    this.poolNote();
+    return kept;
+  },
+
+  /** 고른 범위를 한 줄로 — 아무것도 안 고르면 시장 전체입니다. */
+  poolNote() {
+    const A = AT, keys = A.readPools("poolBox");
+    A.$("poolNote").innerHTML = keys.length
+      ? `고른 ${keys.length}개 범위의 <b>합집합</b>에서 찾습니다`
+      : "아무것도 고르지 않으면 <b>시장 전체</b>에서 찾습니다";
   },
 
   renderUniverse(list, detail) {
@@ -196,14 +230,14 @@ window.PAGE = {
     A.$("recTable").querySelector("tbody").innerHTML = list.map((r) => `<tr>
       <td class="muted">${r.rank}</td>
       <td>${A.esc(r.name)}${r.picked ? ' <span class="gold" title="AI가 매매 대상에 편입">★편입</span>' : ""}
-        <div class="muted mono" style="font-size:13.5px">${r.key}   ${r.market}</div></td>
+        <div class="muted mono" style="font-size:13.5px">${A.esc(r.key)}   ${A.esc(r.market || "")}</div></td>
       <td class="num ${r.score >= (threshold ?? 0.55) ? "up" : "muted"}">${(r.score ?? 0).toFixed(3)}</td>
       <td class="muted" style="font-size:14.5px">${(r.reasons || []).map(A.esc).join("<br>") || "-"}
         ${(r.warnings || []).length ? `<div class="up">${r.warnings.map(A.esc).join("   ")}</div>` : ""}</td>
       <td class="num">${r.max_quantity == null ? '<span class="muted">-</span>'
         : (r.tradable ? (r.max_quantity || 0).toLocaleString() + "주"
                       : '<span class="muted">자금 부족</span>')}</td>
-      <td>${r.tradable && !r.picked ? `<button class="sm" data-adopt="${r.key}">대상 추가</button>` : ""}</td>
+      <td>${r.tradable && !r.picked ? `<button class="sm" data-adopt="${A.esc(r.key)}">대상 추가</button>` : ""}</td>
     </tr>`).join("");
     document.querySelectorAll("[data-adopt]").forEach((b) => b.onclick = () => this.adopt(b.dataset.adopt));
     if (factors) A.$("recFactors").innerHTML = "팩터: " + factors.map((f) =>
@@ -220,34 +254,104 @@ window.PAGE = {
     } catch (e) { AT.toast(e.message, true); }
   },
 
+  /** [지금 추천 받기] — 계산은 서버 백그라운드로 돌고, 여기서는 폴링만 합니다.
+      한국 시장을 처음 훑는 계산은 10분을 넘길 수 있어 동기로 기다리면
+      브라우저가 타임아웃됩니다. 캐시 순위가 몇 초 안에 먼저 오고,
+      정식 계산이 끝나면 표가 한 번 더 갱신됩니다. */
   async runRecommend() {
     const A = AT;
     A.$("btnRecommend").disabled = true;
-    A.$("recSub").textContent = "시장을 훑고 팩터를 계산하는 중… (30초~1분)";
-    A.$("recEmpty").classList.add("hide");
     try {
       const d = await A.call("/autotrade/recommend", {method: "POST"});
-      this.renderRecs(d.recommendations || [], d.factors, d.threshold);
-      A.$("recSub").textContent = d.regime ? `시장 국면: ${d.regime}` : "";
-      this._lastWouldPick = d.would_pick || [];
-      A.$("btnApplyPicks").classList.toggle("hide", !this._lastWouldPick.length);
-      A.toast(this._lastWouldPick.length
-        ? `추천 ${d.recommendations.length}종목   편입 후보 ${this._lastWouldPick.join(", ")}`
-        : "기준 점수를 넘는 종목이 없습니다.");
-    } catch (e) { A.$("recSub").textContent = ""; A.toast(e.message, true); }
+      this._pollBase = d.updated_at || "";
+      this.renderSaved(d);
+      A.toast(d.started
+        ? "추천 계산을 시작했습니다 — 캐시 순위가 먼저 뜨고, 새 계산이 끝나면 갱신됩니다."
+        : "이미 계산 중입니다 — 끝나는 대로 자동으로 갱신됩니다.");
+      this.startPolling(true);
+    } catch (e) { A.toast(e.message, true); }
     finally { A.$("btnRecommend").disabled = false; }
+  },
+
+  /** 저장된 순위 응답(GET/POST 공용 모양) → 표. 그린 행 수를 돌려줍니다. */
+  renderSaved(d) {
+    const rows = (d.recommendations || []).map((r) => ({
+      key: r.symbol || r.key, name: r.name, market: r.market,
+      rank: r.rank, score: r.score, reasons: r.reasons || [],
+      warnings: r.warnings || [],
+      // 이관 전 행은 컬럼이 없어 null — 예전 화면과 같은 '편입 가능' 취급
+      tradable: r.tradable !== false && r.tradable !== 0,
+      max_quantity: r.max_quantity ?? null,
+      // 추적이 꺼진 채 손으로 돌린 결과의 picked 는 '편입 후보'일 뿐 실제
+      // 편입이 아닙니다 — ★편입 배지를 달면 화면이 거짓말을 합니다
+      picked: d.auto_universe ? r.picked : false,
+    }));
+    if (rows.length) this.renderRecs(rows, d.factors, d.threshold);
+    this._lastWouldPick = d.would_pick || [];
+    // 추적이 켜져 있으면 엔진이 이미 편입하므로 [추천대로 편입]은 숨깁니다
+    AT.$("btnApplyPicks").classList.toggle(
+      "hide", !this._lastWouldPick.length || !!d.auto_universe);
+    AT.$("recSub").textContent = d.refreshing
+      ? "새 종목을 계산하는 중… 끝나는 대로 이 표가 갱신됩니다"
+      : (d.updated_at ? `마지막 계산 ${d.updated_at.slice(11, 16)}` : "");
+    return rows.length;
+  },
+
+  /** announce=true 면 (사용자가 직접 돌린 경우) 끝날 때 토스트로 알립니다.
+      자동 추적의 주기 갱신을 따라가는 폴링까지 알리면 5분마다 시끄럽습니다. */
+  /** announce=true 면 (사용자가 직접 돌린 경우) 끝날 때 토스트로 알립니다.
+      자동 추적의 주기 갱신을 따라가는 폴링까지 알리면 5분마다 시끄럽습니다.
+      비공지 폴링이 이미 도는 중에 버튼을 누르면 공지로 승격만 합니다. */
+  startPolling(announce) {
+    this._pollAnnounce = this._pollAnnounce || !!announce;
+    if (this._pollTimer) return;
+    const startedAt = Date.now();
+    let sawFresh = false;                     // 폴링 전체에서 한 번이라도 갱신됐는가
+    this._pollTimer = setInterval(async () => {
+      // 25분이 지나면 자동 갱신을 멈춥니다 — 서버 쪽 계산이 죽었어도 폴링이
+      // 영원히 남지 않게. 멈추기 전에 마지막 상태를 한 번 더 그립니다.
+      if (Date.now() - startedAt > 25 * 60 * 1000) {
+        const announced = this._pollAnnounce;
+        this.stopPolling();
+        try {
+          const d = await AT.call("/autotrade/recommend");
+          this._pollBase = d.updated_at || this._pollBase;
+          this.renderSaved(d);
+        } catch {}
+        if (announced)
+          AT.toast("25분이 지나 화면 자동 갱신을 멈춥니다 — 계산이 아직 서버에서 돌고 있으면 끝난 뒤 새로고침하면 반영됩니다.", true);
+        return;
+      }
+      try {
+        const d = await AT.call("/autotrade/recommend");
+        const fresh = (d.updated_at || "") > (this._pollBase || "");
+        if (fresh) { sawFresh = true; this._pollBase = d.updated_at; }
+        if (fresh || !d.refreshing)
+          this.renderSaved(d);                // 종료 시점 상태도 반드시 다시 그림
+        if (!d.refreshing) {
+          const announced = this._pollAnnounce;
+          this.stopPolling();
+          if (announced)
+            AT.toast(sawFresh ? "추천 계산이 끝났습니다."
+                              : "계산이 끝났지만 새 결과가 없습니다 — 이벤트 로그를 확인하세요. 서버가 재시작됐다면 다시 눌러 주세요.");
+          AT.refresh();                       // 편입(매매 대상) 변화를 반영
+        }
+      } catch {}
+    }, 5000);
+  },
+
+  stopPolling() {
+    clearInterval(this._pollTimer);
+    this._pollTimer = null;
+    this._pollAnnounce = false;
   },
 
   async loadSaved() {
     try {
       const d = await AT.call("/autotrade/recommend");
-      const rows = (d.recommendations || []).map((r) => ({
-        key: r.symbol || r.key, name: r.name, market: r.market,
-        rank: r.rank, score: r.score, reasons: r.reasons || [], warnings: [],
-        tradable: true, max_quantity: null, picked: r.picked,
-      }));
-      if (rows.length)
-        this.renderRecs(rows, d.factors, AT.SNAP?.config?.auto_universe_min_score);
+      this._pollBase = this._pollBase || d.updated_at || "";
+      this.renderSaved(d);
+      if (d.refreshing) this.startPolling();  // 서버가 계산 중이면 따라갑니다
     } catch {}
   },
 
@@ -273,11 +377,12 @@ window.PAGE = {
       // 시장을 하나도 안 고르면 훑을 데가 없습니다. 조용히 코스피로 되돌립니다.
       markets = ["KOSPI"];
       await A.renderSegments("segBox", markets, (next) => {
-        this._dirty = true; this.renderPool(next, A.$("poolSelect").value);
+        this._dirty = true; this.renderPool(next, A.readPools("poolBox"));
       });
+      await this.renderPool(markets, A.readPools("poolBox"));
     }
     patch.auto_universe_markets = markets;
-    patch.auto_universe_pool = A.$("poolSelect").value || "";
+    patch.auto_universe_pool = A.readPools("poolBox");
     try {
       await A.call("/autotrade/config", {method: "POST", body: {config: patch}});
       this._dirty = false; await A.refresh();

@@ -1,5 +1,16 @@
 ﻿# 변경 이력
 
+## v2.2.7 - 2026-08-29 14:51
+
+수정 26 · 추가 12
+- data_sources: credentials.py, kis_client.py 외 3개 수정
+- engine: autotrade.py, broker.py 외 6개 수정 · agent_review.py, agent_trader.py 외 2개 추가
+- storage: autotrade.py, trial_registry.json, user_credentials.py 수정 · agents.py 추가
+- tests: test_algo.py, test_autotrade.py 수정 · test_agents.py, test_allocation.py 외 2개 추가
+- web: at_ai.html, at_common.css 외 2개 수정 · at_agents.html, at_market.html, at_unified.html 추가
+- 루트: api.py, config.py, requirements.txt 수정
+- 문서: AUTOTRADE.md 수정
+
 ## v2.2.5 - 2026-08-19 07:35
 
 수정 45 · 삭제 2
@@ -49,6 +60,7 @@
 - web: at_ai.html, at_common.js 외 2개 수정
 - 루트: api.py, requirements.txt 외 2개 수정 · VERSION, athena.py 외 2개 추가 · build_exe.bat, setup_api.bat 외 8개 삭제
 - 문서: ACCOUNTS.md, AUTOTRADE.md, README.md 수정
+
 
 
 

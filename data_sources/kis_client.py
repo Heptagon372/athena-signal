@@ -48,6 +48,15 @@ REAL_BASE = "https://openapi.koreainvestment.com:9443"
 MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
 
 _token_lock = threading.Lock()
+
+# 토큰 발급 실패의 쿨다운 — KIS 는 토큰을 1분에 한 번만 내주므로(EGW00133)
+# 실패 직후의 재시도는 어차피 또 실패합니다. 그런데 추천 팩터 계산은 국내
+# 종목마다 KIS 를 부르니, 키가 서버와 맞지 않는 환경(예: 구글 계정 오버레이의
+# 모의서버 주소 + 서버의 실전용 앱키)에서는 **종목 수만큼** 실패 왕복이 쌓여
+# 계산이 몇 배로 느려졌습니다. 실패를 잠깐 기억해 두고, 쿨다운 동안은 시도
+# 없이 바로 폴백(네이버 등)으로 넘어가게 합니다.
+TOKEN_FAIL_COOLDOWN = 60.0
+_token_fail_until: dict[str, float] = {}
 # 앱키별 토큰 캐시 — {캐시키: (토큰, 만료시각)}.
 #
 # 예전엔 프로세스에 토큰이 하나였습니다. 사용자별 API 키가 생기면서 한 프로세스가
@@ -55,7 +64,10 @@ _token_lock = threading.Lock()
 # 사용자가 바뀔 때마다 재발급하다 1분 제한(EGW00133)에 걸려 **모두의 계좌가
 # 번갈아 안 읽히는** 상태가 됩니다. 그래서 앱키(해시)별로 따로 캐시합니다.
 _tokens: dict[str, tuple[str, float]] = {}
-_token_error: str = ""
+# 실패 사유는 자격증명(실패 키)별로 남깁니다 — 전역 문자열 하나면 다른
+# 사용자 컨텍스트의 실패 문구가 섞여, 쿨다운 중의 진단 화면이 남의 실패
+# 사유를 보여줍니다 (비밀값은 없지만 진단을 오독하게 합니다).
+_token_errors: dict[str, str] = {}
 
 # 발급받은 토큰을 프로세스 밖에도 남겨 둡니다 (.cache 는 .gitignore 대상).
 # 토큰은 계좌 조회 권한 그 자체이므로 이 파일은 공유하면 안 됩니다.
@@ -153,6 +165,14 @@ def _token_cache_key() -> str:
     return hashlib.sha256(f"{app_key()}|{_base_url()}".encode()).hexdigest()[:16]
 
 
+def _token_fail_key() -> str:
+    """실패 쿨다운의 키 — 성공 캐시(_token_cache_key)와 달리 **시크릿까지**
+    구분합니다. 같은 앱키를 틀린 시크릿과 저장한 컨텍스트의 실패가, 올바른
+    시크릿을 가진 컨텍스트의 발급까지 60초씩 막으면 안 됩니다."""
+    return hashlib.sha256(
+        f"{app_key()}|{app_secret()}|{_base_url()}".encode()).hexdigest()[:16]
+
+
 def _load_saved_token(cache_key: str) -> tuple[str, float]:
     for path in (_token_file(cache_key), TOKEN_FILE):     # 새 경로 → 옛 파일 순
         try:
@@ -209,8 +229,8 @@ def _token_failure(status: int, body, raw: str) -> str:
 
 
 def token_error() -> str:
-    """마지막 토큰 발급 실패 사유 (성공했으면 빈 문자열)."""
-    return _token_error
+    """마지막 토큰 발급 실패 사유 (성공했으면 빈 문자열) — 현재 자격증명 기준."""
+    return _token_errors.get(_token_fail_key(), "")
 
 
 def _get_token() -> str | None:
@@ -221,14 +241,14 @@ def _get_token() -> str | None:
     받으려다 이 제한에 걸려 **키가 멀쩡한데도 계좌가 통째로 안 읽히는** 상태로
     뜹니다. 그래서 파일에도 남겨 재시작 후 그대로 씁니다.
     """
-    global _token_error
+    # 키를 잠금 밖에서 계산합니다 — app_key() 는 사용자 오버레이를 보므로
+    # 지금 컨텍스트의 사용자에 맞는 키가 나옵니다
+    fail_key = _token_fail_key()
 
     if not is_configured():
-        _token_error = "APP KEY / SECRET 이 설정되지 않았습니다."
+        _token_errors[fail_key] = "APP KEY / SECRET 이 설정되지 않았습니다."
         return None
 
-    # 캐시 키를 잠금 밖에서 계산합니다 — app_key() 는 사용자 오버레이를 보므로
-    # 지금 컨텍스트의 사용자에 맞는 키가 나옵니다.
     cache_key = _token_cache_key()
 
     with _token_lock:
@@ -239,8 +259,11 @@ def _get_token() -> str | None:
         saved, saved_expires = _load_saved_token(cache_key)
         if saved and time.time() < saved_expires - 300:
             _tokens[cache_key] = (saved, saved_expires)
-            _token_error = ""
+            _token_errors.pop(fail_key, None)
             return saved
+
+        if time.time() < _token_fail_until.get(fail_key, 0):
+            return None       # 직전 실패의 쿨다운 — 사유는 token_error() 로 조회됩니다
 
         status, body, raw = http_client.post_full(
             _base_url() + "/oauth2/tokenP",
@@ -253,14 +276,20 @@ def _get_token() -> str | None:
             timeout=15,
         )
         if not isinstance(body, dict) or not body.get("access_token"):
-            _token_error = _token_failure(status, body, raw)
+            _token_errors[fail_key] = _token_failure(status, body, raw)
+            # 서버가 명시적으로 거절했을 때만(4xx/5xx) 쿨다운을 겁니다.
+            # status 0 은 네트워크 계층 실패 — 몇 초 만에 복구될 수 있는데
+            # 60초를 걸면 실계좌의 손절 회전까지 그만큼 늦어집니다.
+            if status:
+                _token_fail_until[fail_key] = time.time() + TOKEN_FAIL_COOLDOWN
             return None
 
+        _token_fail_until.pop(fail_key, None)
         token = body["access_token"]
         # expires_in 이 없으면 보수적으로 12시간만 신뢰
         expires_at = time.time() + float(body.get("expires_in") or 43200)
         _tokens[cache_key] = (token, expires_at)
-        _token_error = ""
+        _token_errors.pop(fail_key, None)
         _save_token(cache_key, token, expires_at)
         return token
 

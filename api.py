@@ -55,9 +55,9 @@ from data_sources import (community_crawler, credentials, firebase_auth, fx,
                           screener, symbol_registry, toss_api, universe)
 from data_sources import price_provider
 from data_sources.price_provider import get_provider
-from engine import (autotrade, backtest, broker, ensemble, feed, indicators,
-                    instruments, lessons, mlsignal, protections, recommender,
-                    risk, scalping, scoring, split, strategy)
+from engine import (allocation, autotrade, backtest, broker, ensemble, feed,
+                    indicators, instruments, lessons, mlsignal, protections,
+                    recommender, risk, scalping, scoring, split, strategy)
 from models import Prediction, SymbolNotFoundError
 from storage import autotrade as at_store
 from storage import accounts, db, derivatives, paper, user_credentials, users
@@ -189,6 +189,19 @@ def _auto_resolve_loop():
                 backtest.adjust_weights()
         except Exception as exc:
             print(f"[auto] 자동 채점 실패: {type(exc).__name__}: {exc}")
+
+        # AI 에이전트 판단의 전진 검증 채점. 예측 채점과 같은 성격의 일이라
+        # 같은 루프에 둡니다 — 만기 도래분만 다루므로 자주 돌아도 안전합니다.
+        # 이게 돌지 않으면 성적표가 비고, 성적표가 비면 집행 게이트가 영원히
+        # 잠깁니다 (engine/agent_trader.influence_allowed).
+        try:
+            from engine import agent_review
+            scored = agent_review.resolve_due()
+            if scored["scored"] or scored["voided"]:
+                print(f"[auto] 에이전트 판단 채점 {scored['scored']}건, "
+                      f"무효 {scored['voided']}건")
+        except Exception as exc:                                 # noqa: BLE001
+            print(f"[auto] 에이전트 채점 실패: {type(exc).__name__}: {exc}")
         time.sleep(AUTO_RESOLVE_INTERVAL)
 
 
@@ -2091,7 +2104,7 @@ def _account_identity(mode: str) -> dict:
 # 서버가 옛 코드면 스스로 "재시작하세요"를 띄우게 합니다.
 # 콘솔이 쓰는 엔드포인트를 추가/변경할 때마다 1씩 올리세요 (autotrade.html 의
 # REQUIRED_API 와 짝).
-CONSOLE_API_VERSION = 10       # 10: 포지션 고정 (/api/autotrade/position/{symbol}/pin)
+CONSOLE_API_VERSION = 13       # 13: AI 에이전트 분석 화면 (/api/agents/...)
 
 
 # 포지션·계좌 블록 캐시 — 스냅샷의 유일하게 비싼 부분입니다 (시세·잔고 실호출).
@@ -2130,6 +2143,22 @@ def _positions_block(user_id: int, mode: str, cfg: dict) -> dict:
         return _build_positions_block(key, user_id, mode, cfg)
 
 
+def _split_shown(cfg: dict, key: str, state: dict) -> bool:
+    """이 포지션을 화면에 '분할'로 표시하는가 — 엔진의 split_applies 와 같은 답.
+
+    화면이 자기 나름의 기준으로 판단하면 기준이 두 곳에 생기고, 둘이 갈리는
+    순간 사람은 화면을 믿을 수 없게 됩니다. 종목을 못 찾으면 표시하지
+    않습니다 — 못 찾는 종목은 엔진도 분할을 돌리지 않습니다.
+    """
+    if not split.enabled(cfg):
+        return False
+    inst = instruments.try_resolve(key)
+    if inst is None:
+        return False
+    return autotrade.split_applies(cfg, inst,
+                                   autotrade.position_owner(cfg, key, state))
+
+
 def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> dict:
     now = time.time()
     block: dict = {}
@@ -2150,8 +2179,15 @@ def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> di
         # 분할 차수 원장을 화면이 읽을 수 있는 모양으로 붙입니다. DB 에는 JSON
         # 문자열로 들어 있어서, 화면이 직접 파싱하면 파싱 규칙이 두 곳에 생깁니다.
         for row in block["positions"]:
-            ledger = split.load((states.get(row["key"]) or {}).get("splits"))
-            if ledger.tranches:
+            state = states.get(row["key"]) or {}
+            ledger = split.load(state.get("splits"))
+            # 원장이 남아 있어도 **지금 분할 규칙을 적용받는 포지션만** 분할로
+            # 표시합니다. 분할을 끄면 엔진(_handle_split)은 즉시 손을 떼지만
+            # 원장은 남습니다 — 다시 켰을 때 차수를 이어가려고 일부러 남깁니다.
+            # 그 원장을 그대로 그리면 화면은 "분할 1/5차 · 다음 매수 5.67 대기"
+            # 를 계속 보여주고, 끈 사람은 안 꺼졌다고 읽습니다. 실제로 그렇게
+            # 보였습니다. 엔진과 같은 조건(split_applies)으로 거릅니다.
+            if ledger.tranches and _split_shown(cfg, row["key"], state):
                 row["split"] = split.describe(
                     ledger, float(row.get("current_price") or 0))
                 # "다음 매수 가격은 이미 지났는데 왜 안 사는가"의 답. 엔진이
@@ -2170,6 +2206,9 @@ def _build_positions_block(key: tuple, user_id: int, mode: str, cfg: dict) -> di
             user_id, mode, block["account"].get("total_value") or 0,
             unrealized=sum(p.unrealized_pnl or 0 for p in brk_positions),
             cash=block["account"].get("cash"))
+        # 수익률 표본. 엔진 회전만으로는 자동매매를 꺼 둔 동안 곡선이 끊깁니다
+        # — 화면을 보고 있으면 계속 이어집니다.
+        autotrade.sample_curve(user_id, cfg, block["account"], brk_positions)
     except Exception as exc:
         block["account_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -2187,6 +2226,10 @@ def _autotrade_snapshot(user_id: int, include_positions: bool = True) -> dict:
     # 옛 설정(초단타가 콘솔 대상을 덮어쓰던 시절) 한 번 갈라주기.
     # 엔진뿐 아니라 화면에서도 갈라진 목록이 보여야 해서 여기서도 부릅니다.
     cfg = autotrade.split_legacy_universe(user_id, at_store.get_config(user_id))
+    # 시장을 나눠 굴리는 동안 계좌 전체 종목 상한은 두 시장 상한의 합입니다.
+    # 엔진 회전(_tick)과 **같은 함수**를 통과시켜야 화면과 엔진이 같은 숫자를
+    # 말합니다 (한쪽만 통과시키면 "화면은 2종목인데 엔진은 1종목에서 막힘").
+    cfg = allocation.global_cfg(cfg)
     mode = cfg.get("mode", "paper")
     payload = {
         "api_version": CONSOLE_API_VERSION,
@@ -2197,6 +2240,11 @@ def _autotrade_snapshot(user_id: int, include_positions: bool = True) -> dict:
         "enabled": bool(cfg.get("enabled")),
         "modes": broker.available_modes(),
         "limits": risk.describe_limits(cfg),
+        # 시장 분리 (engine/allocation.py) — 배분·상한 요약. 포지션을 읽는
+        # 페이지에는 실제 예산·사용액이 담긴 markets 가 아래에서 더해집니다.
+        "market_split": allocation.enabled(cfg),
+        "market_limits": allocation.describe(cfg),
+        "market_alloc": allocation.alloc_pcts(cfg),
         # 앙상블·보호장치 (engine/ensemble.py, engine/protections.py).
         # 잠금 조회는 equity=0 으로 부릅니다 — 낙폭·부진 판정(자산 필요)은
         # 엔진 회전이 실제 계좌값으로 하고, 여기는 쿨다운·손절 잠금만 보입니다.
@@ -2234,15 +2282,24 @@ def _autotrade_snapshot(user_id: int, include_positions: bool = True) -> dict:
     # 탐색 범위 — 화면이 "지금 어디에서 찾고 있는지"를 그대로 말할 수 있게
     # 정규화된 시장 목록과 범위 설명을 같이 내려보냅니다.
     tracked = universe.normalize_segments(cfg.get("auto_universe_markets"))
+    # 탐색 범위는 여러 개를 고를 수 있습니다. 예전 설정(문자열 하나)도
+    # normalize_pools 를 지나면 같은 모양이 되므로 화면은 목록만 보면 됩니다.
+    pools = universe.normalize_pools(cfg.get("auto_universe_pool"))
     payload["search_scope"] = {
         "segments": tracked,
         "segment_labels": [universe.segment_label(s) for s in tracked],
-        "universe": cfg.get("auto_universe_pool") or "",
-        "universe_detail": universe.describe(cfg.get("auto_universe_pool") or ""),
+        "universes": pools,
+        "universe_details": universe.describe_many(pools),
     }
 
     if include_positions:
         payload.update(_positions_block(user_id, mode, cfg))
+        # 시장별 예산·보유는 **캐시 밖에서** 계산합니다. 계좌·시세는 20초 캐시가
+        # 맞지만(비싼 실호출), 배분을 바꾼 사람은 그 20초 동안 옛 예산을 보게
+        # 됩니다 — 슬라이더를 옮겼는데 카드가 안 바뀌면 저장이 안 된 줄 압니다.
+        # 여기서 다시 계산하면 계좌 조회 없이 설정 변경이 즉시 반영됩니다.
+        payload["markets"] = allocation.overview(
+            cfg, payload.get("account"), payload.get("positions"))
     return payload
 
 
@@ -2395,6 +2452,49 @@ def autotrade_events(request: Request, limit: int = 80, after_id: int = 0,
                                           kinds=kinds, after_id=after_id)}
 
 
+@app.get("/api/autotrade/candidates")
+def autotrade_candidates(request: Request, days: int = 7, limit: int = 1000,
+                         symbol: str = "", raw: int = 0):
+    """진입 후보 기록 — **문턱을 못 넘은 것까지** 남긴 표(at_candidates).
+
+    이벤트 로그에는 문턱을 통과한 신호만 남아서, "분봉 점수가 진입을 막은
+    경우"를 셀 수 없었습니다. 여기서는 각 후보의 일봉·분봉 점수와, 분봉을
+    빼고 같은 파이프라인을 태웠다면 나왔을 점수(score_wo_intraday)를 함께
+    돌려주므로 분봉의 기여도를 사후 계산 없이 셀 수 있습니다.
+
+    raw=1 이면 개별 행까지, 기본은 집계만 돌려줍니다.
+    """
+    user = require_user(request)
+    mode = at_store.get_config(user["id"]).get("mode", "paper")
+    days = max(1, min(int(days), 365))
+    out = {"ok": True, "mode": mode,
+           "summary": at_store.candidate_summary(user["id"], days=days, mode=mode)}
+    if raw:
+        out["candidates"] = at_store.get_candidates(
+            user["id"], days=days, limit=max(1, min(int(limit), 20_000)),
+            symbol=symbol, mode=mode)
+    return out
+
+
+@app.get("/api/autotrade/curve")
+def autotrade_curve(request: Request, days: int = 1):
+    """순수익률 곡선 — 전체 · 한국 · 미국.
+
+    days=1 이면 **오늘 기점**입니다(첫 표본이 0%). 그 이상이면 지난 날들의
+    마감 수익률을 복리로 이어 붙인 cum_pct 가 함께 옵니다.
+
+    수수료·거래세는 이미 빠져 있습니다. 실현손익은 왕복 비용을 뺀 순액이고
+    (engine/autotrade._exit_realized_krw), 아직 안 판 종목은 "지금 다 팔면 더
+    낼 비용"을 평가손익에서 빼고 그립니다(engine/autotrade._exit_cost_krw).
+    """
+    user = require_user(request)
+    cfg = at_store.get_config(user["id"])
+    mode = cfg.get("mode", "paper")
+    curve = at_store.get_curve(user["id"], mode, days=days)
+    return {"ok": True, "market_split": allocation.enabled(cfg),
+            "labels": allocation.LABELS, **curve}
+
+
 @app.get("/api/autotrade/orders")
 def autotrade_orders(request: Request, limit: int = 50):
     user = require_user(request)
@@ -2433,38 +2533,41 @@ def autotrade_cancel_order(order_id: int, request: Request):
     return {"ok": True, **_autotrade_snapshot(user["id"], include_positions=False)}
 
 
+def _saved_recommendations(user_id: int) -> dict:
+    """저장된 마지막 추천 + 폴링에 필요한 상태 — GET/POST recommend 공용."""
+    cfg = at_store.get_config(user_id)
+    rows = at_store.get_recommendations(user_id)
+    return {
+        "recommendations": rows,
+        "would_pick": [r["symbol"] for r in rows if r.get("picked")],
+        "threshold": float(cfg.get("auto_universe_min_score", 0.55)),
+        "auto_universe": bool(cfg.get("auto_universe")),
+        "factors": recommender.describe_factors(),
+        # 화면 폴링의 기준점 — 이 값이 바뀌면 새 계산이 저장된 것입니다
+        "updated_at": max((r.get("created_at") or "" for r in rows), default=""),
+        "refreshing": autotrade.is_refreshing(user_id),
+        "session": market_clock.status_for("KOSPI").get("label", ""),
+    }
+
+
 @app.post("/api/autotrade/recommend")
 def autotrade_recommend(request: Request):
-    """AI 다중 팩터 추천 — 지금 시장에서 무엇을 매매 대상으로 삼을지 계산합니다.
+    """AI 다중 팩터 추천 — 계산을 백그라운드로 시작하고 즉시 돌아옵니다.
 
-    편입은 하지 않습니다. 결과만 돌려주고, 넣을지는 사용자가 정하거나
-    `auto_universe` 가 켜져 있으면 엔진이 주기적으로 자동 편입합니다.
+    예전에는 이 요청 안에서 동기로 계산했는데, 한국 시장을 처음 훑는 계산은
+    10분을 넘겨 브라우저가 타임아웃되고, 기다리다 또 누르면 같은 계산이 겹쳐
+    쌓였습니다. 이제 시작만 하고, 화면은 GET /autotrade/recommend 를 폴링해
+    저장된 순위를 그립니다 (캐시 순위가 몇 초 안에 먼저, 정식 계산이 끝나면
+    그 결과로 갱신 — engine.autotrade._tracking_refresh 의 2단계 갱신 참고).
+
+    편입 여부는 기존과 같습니다 — 추적(auto_universe)이 켜져 있을 때만
+    엔진이 편입하고, 꺼져 있으면 순위와 편입 후보만 저장합니다.
     """
     user = require_user(request)
-    cfg = at_store.get_config(user["id"])
-    try:
-        brk = broker.get_broker(user["id"], cfg.get("mode", "paper"), cfg)
-        account = brk.account()
-    except Exception as exc:
-        account = {"available_cash": 0, "total_value": 0, "error": str(exc)}
-
-    ranked = autotrade.recommend_universe(user["id"], cfg, account)
-    threshold = float(cfg.get("auto_universe_min_score", 0.55))
-    picked = [r.key for r in ranked if r.tradable and r.score >= threshold][
-        :int(cfg.get("auto_universe_size", 5))]
-    at_store.save_recommendations(user["id"], ranked, picked)
-
-    session = market_clock.status_for("KOSPI")
-    return {
-        "recommendations": [r.to_dict() for r in ranked],
-        "would_pick": picked,
-        "threshold": threshold,
-        "factors": recommender.describe_factors(),
-        "regime": ranked[0].regime if ranked else "",
-        "session": session.get("label", ""),
-        "account": {"available_cash": account.get("available_cash"),
-                    "total_value": account.get("total_value")},
-    }
+    started = autotrade.start_recommend_refresh(user["id"])
+    payload = _saved_recommendations(user["id"])
+    payload.update({"ok": True, "started": started})
+    return payload
 
 
 class TrackToggle(BaseModel):
@@ -2496,8 +2599,7 @@ def autotrade_track(req: TrackToggle, request: Request):
 def autotrade_recommend_saved(request: Request):
     """마지막 추천 결과 (새로고침 후에도 근거를 볼 수 있게 저장해 둡니다)."""
     user = require_user(request)
-    return {"recommendations": at_store.get_recommendations(user["id"]),
-            "factors": recommender.describe_factors()}
+    return _saved_recommendations(user["id"])
 
 
 class ScreenerRequest(BaseModel):
@@ -3023,9 +3125,191 @@ def autotrade_instrument(query: str, request: Request):
 # (돌고 있는 자동매매를 멈추려는데 화면이 안 열리면 그게 사고입니다).
 # 한 페이지에 전부 몰아넣지 않고 역할별로 나눴습니다. 공통 스타일·헤더는
 # /static/at_common.{css,js} 로 공유합니다.
+# ---------------------------------------------------------------------------
+# AI 에이전트 분석 (engine/agents.py · engine/agent_trader.py)
+# ---------------------------------------------------------------------------
+# 자동매매 API 와 경로를 나눕니다 (/api/agents/...). 화면도 테이블도 따로이고,
+# 이쪽은 **호출마다 요금이 나가는** 기능이라 섞어두면 사고가 납니다.
+#
+# 주문을 내는 엔드포인트는 여기 없습니다. 에이전트의 판단은 자동매매 회전의
+# 신호 오버레이로만 매매에 닿습니다 (engine/autotrade._handle_entry).
+
+class AgentConfigRequest(BaseModel):
+    config: dict = {}
+
+
+class AgentAnalyzeRequest(BaseModel):
+    symbol: str
+    force: bool = False
+
+
+class AgentBacktestRequest(BaseModel):
+    symbol: str
+    days: int = 250
+
+
+def _agent_store():
+    from storage import agents as agent_store
+    return agent_store
+
+
+@app.get("/api/agents/status")
+def agents_status(request: Request):
+    """화면 첫 로딩과 폴링이 함께 쓰는 상태. 판단·비용·게이트를 한 번에 줍니다."""
+    from engine import agent_review, agent_trader, agents as agent_engine
+
+    user = require_user(request)
+    store = _agent_store()
+    cfg = store.get_config(user["id"])
+    gate = agent_review.gate(user["id"])
+    return {
+        "readiness": agent_engine.readiness(),
+        "config": cfg,
+        "models": agent_engine.pricing_table(),
+        "exec_modes": [{"key": k, "label": v}
+                       for k, v in agent_trader.EXEC_LABELS.items()],
+        "cost": store.cost_summary(user["id"], days=30),
+        "gate": {"passed": gate["passed"], "stage": gate["stage"],
+                 "reason": gate["reason"]},
+        "jobs": agent_engine.jobs_for(user["id"]),
+        "latest": store.latest_by_symbol(user["id"], limit=30),
+        "universe": sorted(autotrade.universe_keys(at_store.get_config(user["id"]))),
+        "disclaimer": "이 화면의 판단은 연구 참고용이며 투자자문이 아닙니다.",
+    }
+
+
+@app.post("/api/agents/config")
+def agents_save_config(req: AgentConfigRequest, request: Request):
+    from engine import agent_trader
+
+    user = require_user(request)
+    cfg = _agent_store().save_config(user["id"], dict(req.config or {}))
+    # 엔진 쪽 20초 캐시를 즉시 비웁니다. 안 그러면 저장 직후의 회전이 옛 설정으로
+    # 돌아 "저장했는데 안 먹는다"가 됩니다.
+    agent_trader.invalidate_config(user["id"])
+    at_store.log_event(user["id"], "agent", "AI 에이전트 설정을 변경했습니다.",
+                       detail={"patch": dict(req.config or {})})
+    return {"ok": True, "config": cfg}
+
+
+@app.post("/api/agents/analyze")
+def agents_analyze(req: AgentAnalyzeRequest, request: Request):
+    """분석을 백그라운드로 시작합니다. 완료는 /api/agents/status 로 확인합니다.
+
+    요청 안에서 끝내지 않는 이유: 호출 11회에 수십 초에서 수 분이 걸립니다.
+    브라우저와 프록시가 먼저 끊고, 그러면 요금은 나갔는데 결과는 못 받습니다.
+    """
+    from engine import agent_trader, agents as agent_engine
+
+    user = require_user(request)
+    store = _agent_store()
+
+    ready = agent_engine.readiness()
+    if not ready["ready"]:
+        return JSONResponse(status_code=400, content={
+            "error": "AGENT_NOT_READY", "message": ready["reason"]})
+
+    cfg = store.get_config(user["id"])
+    acfg = agent_trader.clamp_config(cfg)
+    if not req.force and agent_trader.budget_left(user["id"], acfg) <= 0:
+        return JSONResponse(status_code=400, content={
+            "error": "COST_CAP",
+            "message": f"오늘 LLM 예산 {acfg['daily_cost_cap_usd']} 달러를 "
+                       f"다 썼습니다. 설정에서 상한을 올리거나 내일 다시 하세요."})
+
+    symbol = (req.symbol or "").strip()
+    if not symbol:
+        return JSONResponse(status_code=400, content={
+            "error": "SYMBOL_REQUIRED", "message": "종목을 입력해 주세요."})
+
+    job = agent_engine.start_job(
+        user["id"], symbol, cfg,
+        on_done=lambda result, uid=user["id"]: store.save_analysis(uid, result))
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/agents/analyses")
+def agents_analyses(request: Request, limit: int = 50, symbol: str = "",
+                    decision: str = ""):
+    user = require_user(request)
+    rows = _agent_store().get_analyses(user["id"], limit=min(limit, 200),
+                                       symbol=symbol, decision=decision)
+    return {"analyses": rows}
+
+
+@app.get("/api/agents/analysis/{analysis_id}")
+def agents_analysis(analysis_id: int, request: Request):
+    """리포트 전문. 사용자 확인은 SQL 에서 합니다 (남의 판단은 열리지 않습니다)."""
+    from engine import agents as agent_engine
+
+    user = require_user(request)
+    row = _agent_store().get_analysis(user["id"], analysis_id)
+    if not row:
+        return JSONResponse(status_code=404, content={
+            "error": "NOT_FOUND", "message": "그런 분석 기록이 없습니다."})
+    return {"analysis": row, "groups": agent_engine.STAGE_GROUPS}
+
+
+@app.get("/api/agents/scorecard")
+def agents_scorecard(request: Request):
+    """전진 검증 성적표 + 게이트 판정."""
+    from engine import agent_review
+
+    user = require_user(request)
+    verdict = agent_review.gate(user["id"])
+    return {
+        "scorecard": verdict["scorecard"],
+        "gate": {"passed": verdict["passed"], "stage": verdict["stage"],
+                 "reason": verdict["reason"]},
+        "criteria": {"min_samples": agent_review.MIN_SAMPLES,
+                     "min_t_stat": agent_review.MIN_T_STAT,
+                     "hold_band_pct": agent_review.HOLD_BAND_PCT},
+    }
+
+
+@app.post("/api/agents/resolve")
+def agents_resolve(request: Request):
+    """만기가 지난 판단을 지금 채점합니다 (자동으로도 10분마다 돕니다)."""
+    from engine import agent_review
+
+    require_user(request)
+    return {"ok": True, "result": agent_review.resolve_due()}
+
+
+@app.post("/api/agents/backtest")
+def agents_backtest(req: AgentBacktestRequest, request: Request):
+    """룰 층 과거 검증. 에이전트를 끈 상태로 기존 하네스를 그대로 돌립니다.
+
+    에이전트 층을 과거로 되돌릴 수 없는 이유는 engine/agent_review.py 의
+    첫 주석에 적어 두었습니다 (뉴스 크롤러가 '지금' 글을 주므로 미래 정보가
+    섞입니다). 그래서 이 버튼은 **룰 층만** 검증합니다.
+    """
+    from engine import agent_review
+
+    user = require_user(request)
+    cfg = at_store.get_config(user["id"])
+    try:
+        result = agent_review.rule_backtest(req.symbol, cfg,
+                                            days=max(60, min(1000, req.days)))
+    except Exception as exc:                                     # noqa: BLE001
+        return JSONResponse(status_code=400, content={
+            "error": "BACKTEST_FAILED",
+            "message": f"{type(exc).__name__}: {exc}"})
+    return {"ok": True, "result": result}
+
+
 AUTOTRADE_PAGES = {
     "": "autotrade.html",           # 메인 — 계좌·포지션·설정·안전장치·연결상태
+    "unified": "at_unified.html",   # 통합 — 배분·시장별 성적·순수익률 곡선
+    # 한국·미국은 **같은 파일**이 그립니다. 두 화면의 구조가 같은데 파일을
+    # 나누면, 한쪽만 고쳐진 채로 "미국 화면에는 있는 버튼이 한국에는 없는"
+    # 상태가 반드시 생깁니다. 어느 시장인지는 주소로 갈립니다.
+    "kr": "at_market.html",         # 한국 주식
+    "us": "at_market.html",         # 미국 주식
     "ai": "at_ai.html",             # AI 추천·자동 추적·매매 대상
+    # AI 추천(at_ai) 과 다른 화면입니다. 저쪽은 팩터 점수로 종목을 고르고,
+    # 이쪽은 LLM 에이전트들이 토론해 매수/매도/보유를 정합니다.
+    "agents": "at_agents.html",     # AI 에이전트 — 멀티에이전트 판단·성적·검증
     "penny": "at_penny.html",       # 페니주식 초단타
     "deriv": "at_deriv.html",       # 선물·옵션 (전용 화면은 준비 중)
     "backtest": "at_backtest.html", # 백테스트·주문 원장·기타

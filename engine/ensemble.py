@@ -89,6 +89,10 @@ class EnsembleState:
     base_score: float = 0.0        # 들어온 점수 (일봉·분봉 혼합 전 기준)
     score: float = 0.0             # 조정 후 점수
     vol_factor: float = 1.0
+    # 시평선 합치 **뒤에** 점수에 곱해진 감쇠(난기류·시장 방향)의 누적곱.
+    # 이걸 따로 들고 있는 이유는 "분봉을 빼면 점수가 얼마였을까"를 나눗셈 없이
+    # 정확히 계산하기 위해서입니다 — base_score 가 0 근처면 비율로는 못 구합니다.
+    damping: float = 1.0
     block: bool = False            # gate 모드에서 신규 진입을 막아야 하는가
     mtf: dict = field(default_factory=dict)
     turbulence: dict = field(default_factory=dict)
@@ -103,6 +107,7 @@ class EnsembleState:
                 "base_score": round(self.base_score, 4),
                 "score": round(self.score, 4),
                 "vol_factor": round(self.vol_factor, 3),
+                "damping": round(self.damping, 4),
                 "block": self.block, "mtf": self.mtf,
                 "turbulence": self.turbulence, "volatility": self.volatility,
                 "pulse": self.pulse,
@@ -509,7 +514,9 @@ def compute(bars_daily: pd.DataFrame, daily_score: float,
             f"난기류 {turb['label']} (상위 {100 - turb['percentile']:.0f}%) — "
             f"신호 확신 {1 - damping:.0%} 감산")
         if state.mode in (SOFT, GATE):
-            score *= max(0.0, min(1.0, damping))
+            factor = max(0.0, min(1.0, damping))
+            score *= factor
+            state.damping *= factor
         if state.mode == GATE and turb.get("level") == "extreme":
             state.block = True
             state.blocked_by.append(
@@ -550,7 +557,9 @@ def compute(bars_daily: pd.DataFrame, daily_score: float,
                        else "")
                     + f") — 신호 확신 {1 - damping:.0%} 감산")
                 if state.mode in (SOFT, GATE):
-                    score *= max(0.0, min(1.0, damping))
+                    factor = max(0.0, min(1.0, damping))
+                    score *= factor
+                    state.damping *= factor
 
     state.score = float(max(-1.0, min(1.0, score))) if state.mode in (SOFT, GATE) \
         else state.base_score

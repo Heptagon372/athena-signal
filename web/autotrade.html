@@ -11,6 +11,9 @@
       href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
 <link rel="stylesheet" href="/static/at_common.css">
 <style>
+/* 계좌 숫자는 10~12개입니다. 폭에 맞춰 자동 배치하면 9 + 1 처럼 어정쩡하게
+   끊기니, 넓은 화면에서는 여섯 칸 두 줄로 못 박습니다. */
+@media(min-width:1180px){#accStat{grid-template-columns:repeat(6,1fr)}}
 /* ---- 포지션 상세 슬라이드 (오른쪽에서 왼쪽으로) ---- */
 #posTable tbody tr.clickable{cursor:pointer}
 #posTable tbody tr.clickable:hover td{background:color-mix(in srgb, var(--gold) 10%, transparent)}
@@ -92,6 +95,40 @@
     <div class="stat" id="accStat"></div>
   </section>
 
+  <section>
+    <h2>자동매매 수익률 <span class="sub">수수료, 거래세, 지금 다 팔 때 낼 비용까지 뺀 순수익률</span></h2>
+    <div id="curveHost"></div>
+  </section>
+
+  <section>
+      <h2>한국   미국 <span class="sub">시장마다 자기 몫의 돈으로 삽니다</span></h2>
+      <label class="chk"><input type="checkbox" id="cfg_market_split"> <b>나눠서 굴리기</b>
+        <span class="muted" style="font-size:15px">   끄면 한 지갑을 선착순으로 씁니다</span>
+      </label>
+      <div id="marketCards" class="mcards two" style="margin-top:10px"></div>
+
+      <div class="split" style="margin-top:12px">
+        <div class="field"><label>한국 배분 (%)</label>
+          <input id="cfg_kr_alloc_pct" type="number" min="0" max="100" step="5"></div>
+        <div class="field"><label>한국 최대 보유 종목</label>
+          <input id="cfg_kr_max_positions" type="number" min="0" step="1"></div>
+        <div class="field"><label>미국 배분 (%)</label>
+          <input id="cfg_us_alloc_pct" type="number" min="0" max="100" step="5"></div>
+        <div class="field"><label>미국 최대 보유 종목</label>
+          <input id="cfg_us_max_positions" type="number" min="0" step="1"></div>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <label class="chk" style="margin:0"><input type="checkbox" id="cfg_kr_enabled"> 한국 신규 매수</label>
+        <label class="chk" style="margin:0"><input type="checkbox" id="cfg_us_enabled"> 미국 신규 매수</label>
+      </div>
+      <div class="note" id="splitSummary" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px">
+        <a href="/autotrade/kr"><button>한국 주식 페이지 가기</button></a>
+        <a href="/autotrade/us"><button>미국 주식 페이지 가기</button></a>
+        <a href="/autotrade/unified"><button class="primary">통합 화면</button></a>
+      </div>
+  </section>
+
   <div class="grid side">
     <section>
       <h2>보유 포지션 <span class="sub">자동 손절, 익절이 걸려 있습니다   고정하면 목표가와 손절가에서만 팝니다   행을 누르면 상세 슬라이드</span>
@@ -141,10 +178,12 @@
       </div>
       <label class="chk"><input type="checkbox" id="cfg_dry_run"> 모의 판단만 (주문 안 냄)</label>
       <label class="chk"><input type="checkbox" id="cfg_manage_only_universe">
-        매매 대상 종목만 관리 <span class="muted" style="font-size:17.5px">   내 다른 보유분 보호</span></label>
+        매매 대상 종목만 관리 <span class="muted" style="font-size:15px">   내 다른 보유분 보호</span></label>
       <label class="chk"><input type="checkbox" id="cfg_regular_session_only"> 정규장에만 매매</label>
       <label class="chk"><input type="checkbox" id="cfg_us_extended_hours">
-        미국 프리, 애프터마켓 허용 <span class="muted" style="font-size:17.5px">   미국 종목만, 한국 시간외와 별개</span></label>
+        미국 프리, 애프터마켓 허용 <span class="muted" style="font-size:15px">   미국 종목만, 한국 시간외와 별개</span></label>
+      <label class="chk"><input type="checkbox" id="cfg_us_day_session">
+        미국 주간거래 허용 <span class="muted" style="font-size:15px">   한국 낮 09시~16시 30분, 겨울 10시~17시 30분. 대체거래소라 호가가 얇습니다</span></label>
       <div class="field" style="margin-top:10px">
         <label>미국 주문 결제 재원</label>
         <select id="usFundingSelect">
@@ -158,23 +197,44 @@
         </div>
       </div>
       <label class="chk"><input type="checkbox" id="cfg_min_one_unit">
-        최소 1주 허용 <span class="muted" style="font-size:17.5px">   소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
+        최소 1주 허용 <span class="muted" style="font-size:15px">   소액 계좌: 리스크 예산 미달이어도 현금이 되면 1주 매수</span></label>
+      <label class="chk"><input type="checkbox" id="cfg_overheat_gate">
+        과열 자리 진입 금지 <span class="muted" style="font-size:15px">   
+        점수가 임계값을 넘어도 RSI·볼린저 상단·이평 이격이 동시에 과열이면 신규 진입을
+        막습니다. 지표 점수는 급등 고점에서 오히려 강한 매수로 나오기 때문입니다.
+        청산은 막지 않습니다</span></label>
+      <label class="chk"><input type="checkbox" id="cfg_pullback_entry">
+        눌림목 재진입 <span class="muted" style="font-size:15px">
+        위 게이트의 나머지 절반. 급등 뒤 20일선까지 되돌아왔는데 추세는 아직 살아
+        있으면, 진입 문턱을 낮춰 그 자리에서 들어갑니다. 끄면 고점을 피한 종목을
+        영영 못 삽니다</span></label>
       <label class="chk"><input type="checkbox" id="cfg_allow_short"> 숏 진입 허용 (파생만)</label>
       <label class="chk"><input type="checkbox" id="cfg_use_news"> 뉴스 감성 반영 (느림)</label>
       <label class="chk"><input type="checkbox" id="cfg_rotation_enabled">
-        수익 회전(갈아타기) 허용 <span class="muted" style="font-size:17.5px">   
+        수익 회전(갈아타기) 허용 <span class="muted" style="font-size:15px">   
         더 좋은 신호가 떴는데 현금, 슬롯이 없으면, 수수료 빼고도 이익인 보유 종목을
         목표가 전에 팔아 재원 확보. 조건은 아래 [회전] 항목들</span></label>
     </section>
 
-    <section>
-      <h2>안전장치 현황 <span class="sub">주문이 나가기 전에 강제됩니다</span></h2>
-      <div class="stat" id="limitStat"></div>
-      <div class="note" style="margin-top:10px">
-        하나라도 걸리면 신규 진입이 막히고 청산(손절)만 계속 동작합니다.
-        킬 스위치는 즉시 신규 진입을 전면 차단합니다.
-      </div>
-    </section>
+    <div class="grid">
+      <section>
+        <h2>안전장치 현황 <span class="sub">주문이 나가기 전에 강제됩니다</span></h2>
+        <div class="stat" id="limitStat"></div>
+        <div class="note" style="margin-top:10px">
+          하나라도 걸리면 신규 진입이 막히고 청산(손절)만 계속 동작합니다.
+          킬 스위치는 즉시 신규 진입을 전면 차단합니다.
+        </div>
+      </section>
+      <section>
+        <h2>연결 상태 <span class="sub">실계좌를 붙이기 전에 여기서 먼저 확인하세요</span></h2>
+        <div id="kisBox" class="note"></div>
+        <div class="row" style="margin-top:10px">
+          <button id="btnDiagnose">증권사 연결 진단</button>
+          <span class="note">주문은 내지 않고 조회만 실제로 호출해 봅니다.</span>
+        </div>
+        <div id="diagBox" style="margin-top:10px"></div>
+      </section>
+    </div>
   </div>
 
   <section>
@@ -244,6 +304,22 @@
     <div class="split">
       <div class="field"><label>진입 점수 임계값 (0~1)</label><input id="cfg_entry_score" type="number" step="0.05"></div>
       <div class="field"><label>청산 점수 임계값</label><input id="cfg_exit_score" type="number" step="0.05"></div>
+      <div class="field"><label>과열: RSI 기준</label><input id="cfg_overheat_rsi" type="number" step="1"
+        title="RSI(14)가 이 값 이상이면 과열 1표. 숏은 (100-이 값) 이하일 때 1표"></div>
+      <div class="field"><label>과열: 볼린저 %B 기준</label><input id="cfg_overheat_bb" type="number" step="0.01"
+        title="%B 가 이 값 이상이면 과열 1표"></div>
+      <div class="field"><label>과열: 20일선 이격 (ATR 배수)</label><input id="cfg_overheat_ext_atr" type="number" step="0.5"
+        title="현재가가 20일선에서 이 배수(ATR)만큼 벌어지면 과열 1표"></div>
+      <div class="field"><label>과열: 차단 표수 (1~3)</label><input id="cfg_overheat_min_hits" type="number" step="1"
+        title="몇 표부터 막을지. 1로 두면 정상 추세까지 많이 막힙니다"></div>
+      <div class="field"><label>눌림목: 강세 판정 이격 (ATR)</label><input id="cfg_pullback_surge_atr" type="number" step="0.5"
+        title="최근에 20일선 위 이만큼 떴어야 '강했다'로 봅니다"></div>
+      <div class="field"><label>눌림목: 되돌림 이격 (ATR)</label><input id="cfg_pullback_max_atr" type="number" step="0.1"
+        title="지금은 20일선에서 이 안으로 들어와 있어야 '눌렸다'로 봅니다"></div>
+      <div class="field"><label>눌림목: 문턱 완화 비율</label><input id="cfg_pullback_entry_ratio" type="number" step="0.05"
+        title="눌림목일 때 진입 임계값에 곱할 값. 0.7 이면 0.35 → 0.245"></div>
+      <div class="field"><label>눌림목: 강세 탐색 봉수</label><input id="cfg_pullback_lookback" type="number" step="1"
+        title="최근 몇 봉 안의 강세를 볼지"></div>
       <div class="field"><label>분봉 비중 (0~1)</label><input id="cfg_intraday_weight" type="number" step="0.05"></div>
       <div class="field"><label>1회 위험 예산 (총자산 %)</label><input id="cfg_risk_per_trade_pct" type="number" step="0.1"></div>
       <div class="field"><label>종목당 최대 비중 (%)</label><input id="cfg_position_pct" type="number" step="1"></div>
@@ -260,6 +336,7 @@
       <div class="field"><label>총 노출 한도 (%)</label><input id="cfg_max_gross_exposure_pct" type="number" step="10"></div>
       <div class="field"><label>시세 허용 지연 (초)</label><input id="cfg_max_quote_age_sec" type="number" step="10"></div>
       <div class="field"><label>미체결 자동취소 (초)</label><input id="cfg_order_timeout_sec" type="number" step="30"></div>
+      <div class="field"><label>상태 확인 불가 강제 종료 (분)</label><input id="cfg_order_stuck_min" type="number" step="10"></div>
       <div class="field"><label>모의계좌 슬리피지 (bp)</label><input id="cfg_paper_slippage_bps" type="number" step="1"></div>
       <div class="field"><label>파생 만기 최소 잔여일</label><input id="cfg_deriv_min_days_to_expiry" type="number" step="1"></div>
       <div class="field"><label>회전: 목표/왕복비용 최소 배수</label><input id="cfg_rotation_cost_edge_multiple" type="number" step="0.5"></div>
@@ -276,15 +353,6 @@
     </div>
   </section>
 
-  <section>
-    <h2>연결 상태 <span class="sub">실계좌를 붙이기 전에 여기서 먼저 확인하세요</span></h2>
-    <div id="kisBox" class="note"></div>
-    <div class="row" style="margin-top:10px">
-      <button id="btnDiagnose">증권사 연결 진단</button>
-      <span class="note">주문은 내지 않고 조회만 실제로 호출해 봅니다.</span>
-    </div>
-    <div id="diagBox" style="margin-top:10px"></div>
-  </section>
 </main>
 
 <!-- 포지션 상세 슬라이드, 오른쪽에서 왼쪽으로 넘어가며 1번부터 차례로 봅니다 -->
@@ -380,28 +448,39 @@ window.PAGE = {
     };
     A.$("cfg_nnfx_soft_weight").onchange = () =>
       this.queueSave({nnfx_soft_weight: Number(A.$("cfg_nnfx_soft_weight").value) || 0});
+    // 수익률 곡선 — 전체 · 한국 · 미국 세 줄을 한 그림에 겹쳐 그립니다.
+    // 옆에서 부엉이가 걷습니다(벌면 빨라지고 잃으면 느려집니다).
+    this.curve = A.curveCard("curveHost", {scopes: ["ALL", "KR", "US"], days: 1,
+                                           title: "오늘 순수익률", height: 300});
     this.pollEvents();
     setInterval(() => this.pollEvents(), 7000);
+    setInterval(() => this.curve?.reload(), 30000);
   },
 
   FIELDS: ["interval_sec","guard_interval_sec",
            "entry_score","exit_score","intraday_weight","risk_per_trade_pct",
+           "overheat_rsi","overheat_bb","overheat_ext_atr","overheat_min_hits",
+           "pullback_surge_atr","pullback_max_atr","pullback_entry_ratio","pullback_lookback",
            "position_pct","max_positions","atr_stop_mult","stop_loss_pct","take_profit_pct",
            "trailing_stop_pct","max_hold_days","max_order_krw","min_order_krw",
            "daily_loss_limit_pct","max_drawdown_pct","max_gross_exposure_pct",
-           "max_quote_age_sec","order_timeout_sec","paper_slippage_bps",
+           "max_quote_age_sec","order_timeout_sec","order_stuck_min","paper_slippage_bps",
            "deriv_min_days_to_expiry",
            "rotation_cost_edge_multiple","rotation_min_gap_pct","rotation_score_margin",
            "rotation_min_hold_min","rotation_max_per_day","rotation_reentry_min",
            "split_tranches","split_buy_drop_pct","split_sell_gain_pct",
            "split_oversold_rsi","split_overbought_rsi","split_min_gap_min",
            "split_max_adds_per_day","split_final_stop_pct","split_cost_multiple",
-           "split_pyramid_ratio"],
+           "split_pyramid_ratio",
+           // 시장 분리 (engine/allocation.py)
+           "kr_alloc_pct","us_alloc_pct","kr_max_positions","us_max_positions"],
   // 쉼표로 적는 차수별 값 — 비우면 위의 균등 값을 씁니다
   LISTS: ["split_buy_drop_steps","split_sell_gain_steps"],
-  BOOLS: ["dry_run","manage_only_universe","regular_session_only","us_extended_hours",
-          "min_one_unit","allow_short","use_news","rotation_enabled",
-          "split_enabled","split_require_oversold","split_overbought_sell"],
+  BOOLS: ["dry_run","manage_only_universe","regular_session_only","us_extended_hours","us_day_session",
+          "min_one_unit","overheat_gate","pullback_entry","allow_short","use_news",
+          "rotation_enabled",
+          "split_enabled","split_require_oversold","split_overbought_sell",
+          "market_split","kr_enabled","us_enabled"],
   // 모드별 근거 — 켜기 전에 무엇을 감수하는지 화면에서 바로 보이게 합니다
   NNFX_NOTE: {
     off:  "기존 지표 점수만 씁니다.",
@@ -527,9 +606,10 @@ window.PAGE = {
     // 기준이라 입출금과 무관합니다 — storage/autotrade.touch_daily 참고.
     const dayPnl = day.pnl != null ? day.pnl : null;
     const dayPct = day.pnl_pct != null ? day.pnl_pct : null;
-    // 미결제 매수대금은 결제일까지 예수금에 남아 있습니다. 이 줄을 안 보여주면
-    // "예수금 13만원인데 주문가능이 3천원"이 화면 오류로 보입니다 — 오류가 아니라
-    // 그 차액이 이미 산 주식값입니다.
+    // 아래 총자산·총예수금·평가금액은 전부 체결기준입니다 — 결제 대기 중인
+    // 매매까지 반영한, 지금 실제로 가진 돈 (engine/broker.py 참고).
+    // 미결제 두 줄은 그 안에서 아직 오가는 중인 금액입니다. 이 줄이 없으면
+    // 증권사 앱의 결제기준 총자산과 왜 다른지 화면에서 답할 수 없습니다.
     const settle = [];
     if (acc.unsettled_buy) settle.push(["미결제 매수", A.won(acc.unsettled_buy), ""]);
     if (acc.unsettled_sell) settle.push(["미결제 매도", A.won(acc.unsettled_sell), ""]);
@@ -567,6 +647,10 @@ window.PAGE = {
     A.$("posTable").querySelector("tbody").innerHTML = positions.map((p, i) => {
       const s = states[p.key] || {};
       const off = p.managed === false;
+      // 금액만 보면 3만원 손실이 큰지 작은지 알 수 없습니다. 상세 슬라이드와
+      // 같은 식(진입가 대비, 숏은 부호 반전)으로 수익률을 옆에 같이 적습니다.
+      const pnlPct = p.avg_price && p.current_price
+        ? ((p.current_price - p.avg_price) / p.avg_price * 100 * (p.side === "short" ? -1 : 1)) : null;
       // 초단타가 잡은 포지션은 청산 규칙이 다릅니다(틱·초). 같은 표에 섞여
       // 있으면서 표시가 없으면, 왜 이 종목만 3분 만에 팔렸는지 알 수 없습니다.
       const scalp = s.strategy === "scalp";
@@ -588,7 +672,7 @@ window.PAGE = {
         <td class="num">${A.num(p.quantity, 4)}</td>
         <td class="num">${A.num(p.avg_price)}</td>
         <td class="num">${A.num(p.current_price)}</td>
-        <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}</td>
+        <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}${pnlPct == null ? "" : ` (${A.pct(pnlPct)})`}</td>
         <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "-"}</td>
         <td class="num muted">${sp
             ? (sp.tranches.map((t) => A.num(t.target_price)).join(" / ")
@@ -646,10 +730,20 @@ window.PAGE = {
         + `${m.label}${m.available ? "" : " (사용 불가)"}</option>`).join("");
       A.$("assetBoxes").innerHTML = this.ASSETS.map(([key, label, desc]) =>
         `<label class="chk"><input type="checkbox" data-asset="${key}" ${cfg.asset_classes?.[key] ? "checked" : ""}>
-          ${label} <span class="muted" style="font-size:17.5px">   ${desc}</span></label>`).join("");
+          ${label} <span class="muted" style="font-size:15px">   ${desc}</span></label>`).join("");
       document.querySelectorAll("[data-asset]").forEach((el) =>
         el.onchange = () => this.queueSave({asset_classes: {[el.dataset.asset]: el.checked}}));
     }
+
+    // 시장 분리 — 카드와 요약. 설정 폼은 위 FIELDS·BOOLS 가 함께 채웁니다.
+    A.marketCards("marketCards", snap, {link: true});
+    A.$("splitSummary").innerHTML = cfg.market_split
+      ? (snap.market_limits || []).map((l) =>
+          `${A.esc(l.label)} <b>${A.esc(l.value)}</b>`).join("<br>")
+        + `<br><span class="muted">배분한 돈 안에서만 삽니다. 꺼진 시장의 몫은 `
+        + `남는 쪽으로 넘어가지 않습니다.</span>`
+      : "지금은 한국과 미국이 한 지갑을 함께 씁니다. 먼저 신호가 뜬 종목이 현금을 "
+        + "다 쓰면, 뒤에 오는 종목은 남은 자투리로만 살 수 있습니다.";
 
     // 한도
     A.$("limitStat").innerHTML = (snap.limits || []).map((l) =>

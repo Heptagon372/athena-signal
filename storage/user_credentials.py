@@ -45,7 +45,9 @@ from storage import accounts
 
 # 사용자가 자기 계정에 저장할 수 있는 키. credentials.PROVIDERS 의 필드 중
 # "서버 부트스트랩"(mongo/firebase/google)을 뺀 전부 + KIS 거래 설정.
-USER_PROVIDERS = ("toss", "kis", "reddit", "naver", "krx", "datago")
+# anthropic 이 여기 있는 이유: LLM 호출은 **누가 눌렀든 그 사람 요금**이어야
+# 합니다. 서버 키 하나로 두면 공개 모드에서 남의 분석 비용을 서버 주인이 냅니다.
+USER_PROVIDERS = ("toss", "kis", "reddit", "naver", "krx", "datago", "anthropic")
 
 # PROVIDERS 필드 밖에 있지만 사용자별이어야 말이 되는 값들.
 # KIS_ACCOUNT     주문이 나가는 계좌 — 계정마다 달라야 하는 값의 대표

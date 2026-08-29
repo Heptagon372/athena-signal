@@ -10,6 +10,7 @@
     at_events          판단 로그 (신호·거부·진입·청산·오류) — append-only
     at_orders          주문 원장 — client_order_id 로 중복 방지
     at_daily           일자별 시작/최고/종료 평가금액 (손실 한도 판정 기준)
+    at_curve           순수익률 곡선 표본 (오늘 기점 그래프 — 수수료·세금 차감)
 
 왜 포지션 상태를 따로 저장하는가
     브로커 잔고에는 "얼마에 샀나"만 있고 "손절을 어디에 걸었나"는 없습니다.
@@ -19,9 +20,12 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from config import DB_PATH
+# 시장별 배분 기본값은 engine/allocation.py 가 정의합니다. 기본값이 두 곳에
+# 있으면 한쪽만 고쳐졌을 때 화면과 엔진이 서로 다른 값을 믿게 됩니다.
+from engine.allocation import DEFAULTS as _ALLOCATION_DEFAULTS
 
 # ---------------------------------------------------------------------------
 # 기본 설정 — 보수적인 값에서 시작합니다 (자동매매의 기본값은 안전이어야 합니다)
@@ -53,6 +57,29 @@ DEFAULT_CONFIG = {
     "news_weight": 0.25,
     "allow_short": False,             # 숏 진입 (파생만 가능)
     "allow_pyramiding": False,        # 보유 종목 추가 진입
+
+    # 과열 진입 게이트 (engine/strategy.overheat_check) — 점수가 임계값을 넘었어도
+    # '이미 많이 간 자리'면 신규 진입만 막습니다. 청산은 건드리지 않습니다.
+    # 지표 점수는 급등 고점에서 오히려 강한 매수로 나옵니다(추세지표 9개가
+    # 동시 포화 + 국면 판정이 되돌림 지표를 ×0.55 로 깎음). 그 편향을 여기서 막습니다.
+    "overheat_gate": True,
+    "overheat_rsi": 75.0,             # RSI(14) 이 값 이상이면 과열 1표
+    "overheat_bb": 0.95,              # 볼린저 %B 이 값 이상이면 과열 1표
+    "overheat_ext_atr": 3.0,          # 20일선에서 이 배수(ATR)만큼 벌어지면 과열 1표
+    "overheat_min_hits": 2,           # 이 표수부터 차단 (1~3). 1은 정상 추세도 많이 막습니다
+    "overheat_ma": 20,                # 이격을 재는 기준 이동평균
+
+    # 눌림목 재진입 (engine/strategy.pullback_ready) — 과열 게이트의 나머지 절반.
+    # 게이트만 있으면 고점은 피하지만 그 종목을 영영 못 삽니다. 급등 뒤 첫 정상
+    # 눌림(추세는 살아 있고 이격만 줄어든 자리)에서만 진입 문턱을 낮춥니다.
+    # 기본 꺼짐 — 검증 하네스가 수익 개선을 기각했습니다. 켜면 진입 문턱이
+    # 낮아지므로, 모의계좌 로그로 직접 확인한 뒤 켜세요.
+    "pullback_entry": False,
+    "pullback_lookback": 10,          # 최근 몇 봉 안의 강세를 볼지
+    "pullback_surge_atr": 2.5,        # 그 구간에 20일선 위 이만큼(ATR) 떴어야 '강했다'
+    "pullback_max_atr": 1.5,          # 지금은 이 안으로 되돌아왔어야 '눌렸다'
+    "pullback_entry_ratio": 0.70,     # 진입 임계값을 이 비율로 낮춤 (0.35 → 0.245)
+    "pullback_ma": 20,
 
     # NNFX 규칙 오버레이 (engine/nnfx.py). 기본은 꺼짐 — 신호 생성 방식을
     # 바꾸는 스위치라, 돌고 있는 계정에서 조용히 켜지면 안 됩니다.
@@ -100,6 +127,10 @@ DEFAULT_CONFIG = {
     "protect_lowprofit_lookback_min": 1440,
     "protect_lowprofit_min_trades": 3,
     "protect_lowprofit_stop_min": 120,
+    # 추격 재매수 차단 — 마지막 매도가보다 이만큼 위면 되사지 않습니다(%).
+    # 위 protect_* 와 달리 protect_enabled 와 무관하게 동작합니다 (기본 켜짐).
+    "protect_chase_pct": 3.0,               # 0 이면 끔
+    "protect_chase_lookback_min": 1440,     # 매도가를 기억하는 시간(분)
 
     # 손실 학습 (engine/lessons.py) — 청산된 매매를 복기해 손실 원인을 추론하고,
     # 같은 컨텍스트(태그)의 다음 신호를 감쇠합니다.
@@ -138,7 +169,12 @@ DEFAULT_CONFIG = {
     "auto_universe_markets": ["KOSPI", "KOSDAQ"],
     # 탐색 범위 — 비우면 시장 전체. 지수·ETF·섹터 키를 넣으면 그 안에서만 찾습니다
     # (KOSPI200 · KOSDAQ150 · NASDAQ100 · SP500 · KR_SEMI · US_TECHNOLOGY …)
-    "auto_universe_pool": "",
+    #
+    # **여러 개를 고를 수 있습니다.** 고른 범위들의 합집합에서 찾습니다
+    # (코스피200 + 나스닥100 이면 두 지수의 구성종목 전부).
+    # 예전에 문자열 하나로 저장된 설정도 그대로 동작합니다 —
+    # data_sources/universe.py 의 normalize_pools 가 목록으로 풀어 줍니다.
+    "auto_universe_pool": [],
     "auto_universe_min_score": 0.55,   # 이 점수 미만은 편입하지 않습니다
     "auto_universe_keep_manual": True,  # 손으로 넣은 종목은 유지
     # 사람이 직접 넣은 종목 — AI 갱신에서 지키기 위해 **명시적으로** 기록합니다.
@@ -149,7 +185,11 @@ DEFAULT_CONFIG = {
     # 사이징
     "risk_per_trade_pct": 1.0,        # 1회 손절 시 잃을 총자산 비율
     "position_pct": 20.0,             # 종목당 최대 비중
-    "max_positions": 5,
+    # 동시에 들고 갈 종목 수. 기본 1 입니다 — 소액 계좌에서 이 값을 올리면
+    # 종목당 돌아가는 돈이 1주 값 밑으로 떨어져 "전부 1주씩"이 됩니다.
+    # 시장을 나눠 굴리는 중이라면 시장별 상한(kr_max_positions ·
+    # us_max_positions, engine/allocation.py)이 이 값보다 먼저 걸립니다.
+    "max_positions": 1,
     "max_order_krw": 3_000_000,
     "min_order_krw": 100_000,
     # 소액 계좌 — 리스크 예산으로 1주 미만이 나와도, 현금·비중 한도 안이면
@@ -165,9 +205,22 @@ DEFAULT_CONFIG = {
     "reward_risk": 2.0,
     "max_hold_days": 15,
     # 승자 보유 (오닐 — prism-insight 이식): 50일선 +3% 위 + 진입 후 고점의
-    # 97% 이내면 목표가 익절을 보류하고 추세가 꺾일 때까지 들고 갑니다.
-    # 손절·트레일링·시간 청산은 그대로 작동합니다. 기본 꺼짐 — 익절 방식을
-    # 바꾸는 스위치라 사람이 켜는 것이 맞습니다.
+    # 97% 이내면 목표가 익절을 보류합니다. 손절·트레일링·시간 청산은 그대로
+    # 작동합니다. 기본 꺼짐 — 익절 방식을 바꾸는 스위치라 사람이 켜는 것이
+    # 맞습니다.
+    #
+    # ★ 이것은 "추세가 꺾이면 고점 근처에서 판다"가 **아닙니다.** 이 값이 하는
+    #   일은 strategy.check_exit 의 skip_take 하나뿐이라, 게이트가 닫혀도 다시
+    #   살아나는 것은 **진입 때 정해진 고정 목표가와 take_profit_pct** 입니다.
+    #   고점이 그 목표가를 넘어서지 못한 채 추세가 꺾이면 아무 청산도 걸리지
+    #   않고 손실 한도·신호 반전·max_hold_days 까지 흘러갑니다.
+    #   즉 단독으로 켜면 "추세가 살아 있는 동안 익절을 지우는" 장치입니다.
+    #   고점 되돌림에서 나가게 하려면 trailing_stop_pct 를 함께 켜야 합니다.
+    #
+    #   실측(2026-08, KOSPI200·KOSDAQ150에서 기계적으로 뽑은 27종목 × 250봉
+    #   두 구간): 수익률 차이는 두 구간 모두 0과 구별되지 않았고(t=+1.32 /
+    #   +0.30, 합계 이득의 대부분이 한 종목), 최대낙폭은 두 구간 모두 유의하게
+    #   나빠졌습니다(-1.64→-1.80 t=-2.59 · -1.47→-1.77 t=-3.23).
     "hold_winners": False,
 
     # 회전(갈아타기) — 더 좋은 신호가 떴는데 현금·슬롯이 없을 때, 수수료·거래세를
@@ -209,6 +262,9 @@ DEFAULT_CONFIG = {
 
     # 주문 집행
     "order_timeout_sec": 180,         # 이 시간 안에 안 체결되면 주문을 취소합니다
+    # 조회로 결말을 못 짓는 상태가 이만큼 이어지면 버그로 보고 강제로 거둬들입니다
+    # (취소 요청 → 추적 종료). 0 이면 24시간까지 기다리던 예전 동작.
+    "order_stuck_min": 100,
     "paper_slippage_bps": 5.0,        # 모의 계좌 체결에 적용할 불리한 스프레드
 
     # 페니주식 초단타 (engine/scalping.py — 하드 한도가 따로 있습니다)
@@ -231,9 +287,18 @@ DEFAULT_CONFIG = {
     # regular_session_only 를 통째로 끄면 한국 시간외 단일가까지 풀려버리므로
     # 미국 확장 시간만 따로 열 수 있게 분리했습니다.
     "us_extended_hours": False,
+    # 미국 주간거래(데이마켓, 한국 낮). 확장시간과 스위치를 나눈 이유는
+    # engine/feed.py 의 _day_entry_allowed 주석 참고 — ATS 라 성격이 다릅니다.
+    "us_day_session": False,
     "max_quote_age_sec": 120,
     "deriv_min_days_to_expiry": 2,
     "dry_run": False,                 # True 면 판단만 하고 주문을 내지 않습니다
+
+    # 한국·미국 분리 운용 (engine/allocation.py).
+    # 시장마다 자기 몫의 돈(총자산 × 배분%)과 자기 종목 상한을 갖습니다.
+    # 한 지갑을 선착순으로 쓰던 예전 방식에서는, 먼저 온 미국 종목이 현금을
+    # 다 쓰면 그 뒤의 모든 주문이 "주문가능금액" 한도에 걸려 1주씩만 나갔습니다.
+    **_ALLOCATION_DEFAULTS,
 }
 
 # 상태 기계 — 자본을 움직이는 스위치라 상태를 명시적으로 둡니다
@@ -327,7 +392,11 @@ def init():
             avg_fill_price REAL,           -- 실제 평균 체결가
             slippage_bps REAL,             -- (체결가 - 의도가) / 의도가 × 10000
             settled_at TEXT,               -- 체결·취소가 확정된 시각
-            poll_count INTEGER DEFAULT 0   -- 체결 확인을 몇 번 시도했는지
+            poll_count INTEGER DEFAULT 0,  -- 체결 확인을 몇 번 시도했는지
+            -- 어느 창구로 접수했는가. '' = 평소 경로, 'US_DAY' = 미국 주간거래.
+            -- 취소 API 가 창구별로 달라서, 이걸 안 남기면 주간거래 주문을
+            -- 정규장 취소로 보내 "찾지 못함"으로 끝나고 미체결이 원장에 박힙니다.
+            venue TEXT DEFAULT ''
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_at_orders_user "
                      "ON at_orders(user_id, id DESC)")
@@ -348,8 +417,12 @@ def init():
             reasons TEXT,                        -- 추천 근거 (JSON)
             factors TEXT,                        -- 팩터 원값 (JSON)
             created_at TEXT NOT NULL,
+            tradable INTEGER NOT NULL DEFAULT 1, -- 편입 자격 (자금·유동성)
+            max_quantity INTEGER,                -- 지금 자금으로 살 수 있는 수량
+            warnings TEXT,                       -- 경고문 (JSON)
             PRIMARY KEY (user_id, symbol)
         )""")
+        _migrate_recommend(conn)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS at_daily (
             user_id INTEGER NOT NULL,
@@ -386,6 +459,38 @@ def init():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_at_lessons_user "
                      "ON at_lessons(user_id, mode, status, id DESC)")
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS at_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            mode TEXT NOT NULL,           -- paper | mock | live
+            source TEXT NOT NULL,         -- auto | scalp (어느 경로가 평가했나)
+            symbol TEXT NOT NULL,
+            name TEXT DEFAULT '',
+            market TEXT DEFAULT '',
+            price REAL,                   -- 호가 통화 기준 현재가 (전방 수익률 계산용)
+            price_krw REAL,
+            daily_score REAL,
+            intraday_score REAL,          -- NULL = 분봉을 못 받음
+            news_score REAL,
+            nnfx_score REAL,
+            ml_score REAL,
+            score REAL NOT NULL,          -- 최종 점수
+            score_wo_intraday REAL,       -- 분봉 비중 0 이었다면 나왔을 점수
+            entry_threshold REAL,         -- 그 회전에 적용된 진입 문턱
+            passed INTEGER NOT NULL,      -- 점수가 문턱을 넘었나 (1/0)
+            passed_wo_intraday INTEGER,   -- 분봉이 없었다면 넘었을까 (1/0)
+            direction TEXT DEFAULT '',    -- long | short | flat (게이트 반영 후)
+            gated INTEGER NOT NULL DEFAULT 0,  -- 문턱은 넘었지만 게이트가 막았나
+            held INTEGER NOT NULL DEFAULT 0,   -- 이미 보유 중인 종목인가
+            regime TEXT DEFAULT '',
+            vol_factor REAL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_at_candidates_user "
+                     "ON at_candidates(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_at_candidates_symbol "
+                     "ON at_candidates(user_id, symbol, created_at)")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS at_account (
             user_id INTEGER NOT NULL,
             mode TEXT NOT NULL,
@@ -393,10 +498,30 @@ def init():
             reset_at TEXT NOT NULL,       -- 이 계좌로 성적을 세기 시작한 시각
             PRIMARY KEY (user_id, mode)
         )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS at_curve (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            scope TEXT NOT NULL,           -- ALL | KR | US
+            trade_date TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            -- 원재료만 저장하고 수익률은 읽을 때 계산합니다. 비율을 그대로
+            -- 저장하면 계산식을 고치는 순간 과거 곡선과 현재 곡선이 서로 다른
+            -- 정의로 그려집니다 (그래프 한 장에 두 규칙이 섞입니다).
+            base_krw REAL NOT NULL DEFAULT 0,       -- 이 시장이 굴리는 돈
+            realized_krw REAL NOT NULL DEFAULT 0,   -- 오늘 실현손익 누계(수수료·세금 차감 완료)
+            unreal_krw REAL NOT NULL DEFAULT 0,     -- 현재 평가손익
+            exit_cost_krw REAL NOT NULL DEFAULT 0,  -- 지금 다 팔면 더 낼 비용(추정)
+            equity_krw REAL NOT NULL DEFAULT 0      -- 그 시장 보유 평가금액
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_at_curve "
+                     "ON at_curve(user_id, mode, trade_date, scope, id)")
         _migrate_scope(conn)
         # 모드 분리로 테이블을 새로 만드는 경우가 있어서, 컬럼 추가는 그 뒤입니다
         _migrate_position_state(conn)
         _migrate_daily(conn)
+        _migrate_config(conn)
 
 
 def _migrate_daily(conn):
@@ -415,6 +540,23 @@ def _migrate_daily(conn):
                         ("peak_pnl", "REAL NOT NULL DEFAULT 0")):
         if column not in existing:
             conn.execute(f"ALTER TABLE at_daily ADD COLUMN {column} {ddl}")
+
+
+def _migrate_config(conn):
+    """AI 순환 평가가 지금까지 몇 번 돌았는가.
+
+    설정(config JSON)이 아니라 **컬럼**입니다. state · state_reason 과 같은
+    성격의 실행 상태라, 설정 저장(save_config)이 통째로 덮어쓰는 자리에 두면
+    설정을 한 번 고칠 때마다 세던 수가 사라집니다.
+
+    메모리에 두지 않는 이유: 서버를 재시작하면 0으로 돌아가는데, 화면에는
+    "3회전"이라고 적혀 있으니 사람은 순환이 처음부터 다시 시작한 줄 압니다.
+    실제로는 팩터 캐시가 남아 있어 이어서 도는 중입니다.
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(at_config)")}
+    if "scan_rounds" not in existing:
+        conn.execute("ALTER TABLE at_config ADD COLUMN "
+                     "scan_rounds INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_scope(conn):
@@ -483,10 +625,28 @@ def _migrate_orders(conn):
         "slippage_bps": "REAL",
         "settled_at": "TEXT",
         "poll_count": "INTEGER DEFAULT 0",
+        "venue": "TEXT DEFAULT ''",
     }
     for column, spec in additions.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE at_orders ADD COLUMN {column} {spec}")
+
+
+def _migrate_recommend(conn):
+    """추천 표시용 컬럼 보강 — 화면이 저장본만으로 그리게 되면서 필요해졌습니다.
+
+    [지금 추천 받기]가 백그라운드 계산 + 저장본 폴링으로 바뀌어, '살 수 있는
+    수량'·'자금 부족'·경고문도 저장돼 있어야 화면에 나옵니다. 예전 행은
+    tradable 기본값 1(예전 화면과 같은 동작), 수량·경고는 비어 있습니다.
+    """
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(at_recommend)")}
+    if "tradable" not in existing:
+        conn.execute("ALTER TABLE at_recommend ADD COLUMN "
+                     "tradable INTEGER NOT NULL DEFAULT 1")
+    if "max_quantity" not in existing:
+        conn.execute("ALTER TABLE at_recommend ADD COLUMN max_quantity INTEGER")
+    if "warnings" not in existing:
+        conn.execute("ALTER TABLE at_recommend ADD COLUMN warnings TEXT")
 
 
 def _migrate_position_state(conn):
@@ -538,16 +698,18 @@ def get_config(user_id: int) -> dict:
         cfg["state"] = row["state"]
         cfg["state_reason"] = row["state_reason"] or ""
         cfg["updated_at"] = row["updated_at"]
+        cfg["scan_rounds"] = int(row["scan_rounds"] or 0)
     else:
         cfg["enabled"] = False
         cfg["state"] = STOPPED
         cfg["state_reason"] = ""
         cfg["updated_at"] = ""
+        cfg["scan_rounds"] = 0
     return cfg
 
 
 # get_config 가 붙여주는 실행 상태 — 별도 컬럼이라 config JSON 에 넣지 않습니다
-_RUNTIME_KEYS = ("enabled", "state", "state_reason", "updated_at")
+_RUNTIME_KEYS = ("enabled", "state", "state_reason", "updated_at", "scan_rounds")
 
 
 def save_config(user_id: int, patch: dict) -> dict:
@@ -597,6 +759,30 @@ def save_config(user_id: int, patch: dict) -> dict:
                 "VALUES (?, ?, ?, 0, 'stopped')",
                 (user_id, now, json.dumps(storable, ensure_ascii=False)))
     return get_config(user_id)
+
+
+def bump_scan_round(user_id: int) -> int:
+    """AI 순환 평가를 한 번 돌았다고 기록하고, 지금까지의 회전 수를 돌려줍니다.
+
+    자동 갱신뿐 아니라 [지금 추천 받기]도 셉니다 — 손으로 돌린 것도 실제로
+    순환을 한 칸 밀어내기 때문입니다. 세지 않으면 화면의 회전 수와 실제
+    커버 범위가 어긋납니다.
+
+    **save_config 를 쓰지 않습니다.** 그 함수는 설정 JSON 전체를 다시 직렬화해
+    쓰기 때문에, 30분마다 도는 회전이 마침 사용자가 설정을 저장하는 순간과
+    겹치면 둘 중 하나가 통째로 덮입니다. 여기서는 컬럼 하나만 올립니다
+    (행이 없으면 만들되 config 는 건드리지 않습니다).
+    """
+    init()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO at_config (user_id, updated_at, config, enabled, state, "
+            "scan_rounds) VALUES (?, ?, '{}', 0, ?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET scan_rounds = scan_rounds + 1",
+            (user_id, datetime.now().isoformat(), STOPPED))
+        row = conn.execute("SELECT scan_rounds FROM at_config WHERE user_id = ?",
+                           (user_id,)).fetchone()
+    return int((row["scan_rounds"] if row else 0) or 0)
 
 
 def set_enabled(user_id: int, enabled: bool, reason: str = "") -> dict:
@@ -760,6 +946,103 @@ def purge_events(user_id: int, keep: int = 2000):
 
 
 # ---------------------------------------------------------------------------
+# 진입 후보 기록 (at_candidates)
+# ---------------------------------------------------------------------------
+#
+# 왜 이벤트 로그(at_events)로 부족한가
+#   ① 이벤트에는 **문턱을 통과한 신호만** 남습니다. 그래서 "분봉 점수가 후보를
+#      문턱 아래로 끌어내려 진입을 막은 경우"는 어디에도 기록되지 않았고,
+#      분봉의 기여도를 사후에 측정할 방법이 없었습니다.
+#   ② purge_events 가 2,000행만 남기고 지웁니다 — 며칠이면 사라집니다.
+#
+# 그래서 평가한 **모든 후보**를, 판단을 바꿀 수 있는 값(일봉·분봉 점수, 반사실
+# 점수, 문턱, 통과 여부)과 함께 별도 표에 남깁니다. 가격을 같이 적는 이유는
+# 나중에 "그때 사지 않은 종목이 그 뒤 어떻게 됐나"를 이 표만으로 볼 수 있게
+# 하기 위해서입니다.
+
+def record_candidate(user_id: int, row: dict) -> int:
+    init()
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO at_candidates (user_id, created_at, mode, source, symbol, name, "
+            "market, price, price_krw, daily_score, intraday_score, news_score, nnfx_score, "
+            "ml_score, score, score_wo_intraday, entry_threshold, passed, passed_wo_intraday, "
+            "direction, gated, held, regime, vol_factor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, datetime.now().isoformat(), row.get("mode", "paper"),
+             row.get("source", "auto"), row.get("symbol", ""), row.get("name", ""),
+             row.get("market", ""), row.get("price"), row.get("price_krw"),
+             row.get("daily_score"), row.get("intraday_score"), row.get("news_score"),
+             row.get("nnfx_score"), row.get("ml_score"), float(row.get("score") or 0),
+             row.get("score_wo_intraday"), row.get("entry_threshold"),
+             1 if row.get("passed") else 0,
+             None if row.get("passed_wo_intraday") is None
+             else (1 if row.get("passed_wo_intraday") else 0),
+             row.get("direction", ""), 1 if row.get("gated") else 0,
+             1 if row.get("held") else 0, row.get("regime", ""), row.get("vol_factor")))
+        return cur.lastrowid
+
+
+def get_candidates(user_id: int, days: int = 7, limit: int = 5000,
+                   symbol: str = "", mode: str = "") -> list[dict]:
+    init()
+    sql = "SELECT * FROM at_candidates WHERE user_id = ?"
+    params: list = [user_id]
+    if days:
+        sql += " AND created_at >= ?"
+        params.append((datetime.now() - timedelta(days=days)).isoformat())
+    if symbol:
+        sql += " AND symbol = ?"
+        params.append(symbol)
+    if mode:
+        sql += " AND mode = ?"
+        params.append(mode)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(sql, params)]
+
+
+def candidate_summary(user_id: int, days: int = 7, mode: str = "") -> dict:
+    """분봉 점수가 실제로 판단을 바꿨는지 — 기록만으로 답하는 집계.
+
+    flipped_in   분봉 때문에 진입 판정이 난 건수 (일봉만이면 문턱 미달)
+    flipped_out  분봉 때문에 진입이 막힌 건수 (일봉만이면 통과)
+    두 값이 모두 0에 가까우면, 분봉은 판단을 바꾸지 않고 점수만 깎고 있다는 뜻입니다.
+    """
+    init()
+    sql = ("SELECT COUNT(*) n, "
+           "SUM(CASE WHEN intraday_score IS NOT NULL THEN 1 ELSE 0 END) with_intraday, "
+           "SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) passed, "
+           "SUM(CASE WHEN passed = 1 AND passed_wo_intraday = 0 THEN 1 ELSE 0 END) flipped_in, "
+           "SUM(CASE WHEN passed = 0 AND passed_wo_intraday = 1 THEN 1 ELSE 0 END) flipped_out, "
+           "SUM(CASE WHEN gated = 1 THEN 1 ELSE 0 END) gated, "
+           "AVG(ABS(daily_score)) abs_daily, AVG(ABS(intraday_score)) abs_intraday, "
+           "AVG(score - score_wo_intraday) mean_shift, "
+           "SUM(CASE WHEN ABS(score) < ABS(score_wo_intraday) THEN 1 ELSE 0 END) shrunk "
+           "FROM at_candidates WHERE user_id = ?")
+    params: list = [user_id]
+    if days:
+        sql += " AND created_at >= ?"
+        params.append((datetime.now() - timedelta(days=days)).isoformat())
+    if mode:
+        sql += " AND mode = ?"
+        params.append(mode)
+    with _conn() as conn:
+        row = dict(conn.execute(sql, params).fetchone() or {})
+    row["days"] = days
+    return row
+
+
+def purge_candidates(user_id: int, days: int = 90):
+    """분석용 기록이라 이벤트보다 오래 남깁니다 (기본 90일)."""
+    init()
+    with _conn() as conn:
+        conn.execute("DELETE FROM at_candidates WHERE user_id = ? AND created_at < ?",
+                     (user_id, (datetime.now() - timedelta(days=days)).isoformat()))
+
+
+# ---------------------------------------------------------------------------
 # 주문 원장
 # ---------------------------------------------------------------------------
 
@@ -783,8 +1066,8 @@ def record_order(user_id: int, order: dict) -> int | None:
                 "INSERT INTO at_orders (user_id, created_at, client_order_id, broker_mode, "
                 "broker_order_id, symbol, name, asset_class, action, side, quantity, price, "
                 "price_krw, fee, realized_pnl, status, reason, detail, intended_price, "
-                "filled_quantity, avg_fill_price, slippage_bps, settled_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "filled_quantity, avg_fill_price, slippage_bps, settled_at, venue) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (user_id, datetime.now().isoformat(), order.get("client_order_id", ""),
                  order.get("broker_mode", ""), order.get("broker_order_id", ""),
                  order.get("symbol", ""), order.get("name", ""),
@@ -798,7 +1081,8 @@ def record_order(user_id: int, order: dict) -> int | None:
                  order.get("intended_price"), float(filled or 0),
                  order.get("avg_fill_price"), order.get("slippage_bps"),
                  datetime.now().isoformat()
-                 if order.get("status") in ("filled", "rejected", "cancelled") else None))
+                 if order.get("status") in ("filled", "rejected", "cancelled") else None,
+                 order.get("venue", "")))
             return cur.lastrowid
         except sqlite3.IntegrityError:
             # 같은 client_order_id — 이미 기록된 주문입니다
@@ -1016,6 +1300,23 @@ def realized_today(user_id: int, mode: str, symbols: list = None) -> dict:
     return {"realized_pnl": float(row["pnl"] or 0), "closed_count": int(row["n"] or 0)}
 
 
+def realized_today_by_symbol(user_id: int, mode: str) -> dict:
+    """오늘 확정된 손익을 **종목별로**. 시장별 수익률을 가르는 재료입니다.
+
+    종목이 한국인지 미국인지는 엔진(engine/allocation.scope_of)이 압니다 —
+    저장소가 시장을 판단하면 규칙이 두 곳에 생깁니다.
+    """
+    init()
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT symbol, COALESCE(SUM(realized_pnl), 0) AS pnl FROM at_orders "
+            "WHERE user_id = ? AND broker_mode = ? AND realized_pnl IS NOT NULL "
+            "AND substr(created_at, 1, 10) = ? GROUP BY symbol",
+            (user_id, mode, today)).fetchall()
+    return {r["symbol"]: float(r["pnl"] or 0) for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # 일자별 기준값 (손실 한도 판정)
 # ---------------------------------------------------------------------------
@@ -1035,8 +1336,9 @@ def save_recommendations(user_id: int, recommendations: list, picked: list):
             data = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
             conn.execute(
                 "INSERT OR REPLACE INTO at_recommend (user_id, symbol, name, market, "
-                "rank, score, price, picked, regime, reasons, factors, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "rank, score, price, picked, regime, reasons, factors, created_at, "
+                "tradable, max_quantity, warnings) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (user_id, data.get("key", ""), data.get("name", ""),
                  data.get("market", ""), data.get("rank", 0), data.get("score", 0),
                  data.get("price_krw") or data.get("price") or 0,
@@ -1044,7 +1346,10 @@ def save_recommendations(user_id: int, recommendations: list, picked: list):
                  data.get("regime", ""),
                  json.dumps(data.get("reasons") or [], ensure_ascii=False),
                  json.dumps(data.get("factors") or {}, ensure_ascii=False, default=str),
-                 now))
+                 now,
+                 1 if data.get("tradable", True) else 0,
+                 int(data.get("max_quantity") or 0),
+                 json.dumps(data.get("warnings") or [], ensure_ascii=False)))
 
 
 def get_recommendations(user_id: int) -> list[dict]:
@@ -1053,13 +1358,15 @@ def get_recommendations(user_id: int) -> list[dict]:
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM at_recommend WHERE user_id = ? ORDER BY rank", (user_id,))]
     for r in rows:
-        for field_name in ("reasons", "factors"):
+        for field_name in ("reasons", "factors", "warnings"):
             if r.get(field_name):
                 try:
                     r[field_name] = json.loads(r[field_name])
                 except json.JSONDecodeError:
                     pass
         r["picked"] = bool(r["picked"])
+        # 이관 전 행은 컬럼이 None — 예전 화면과 같은 '편입 가능' 취급
+        r["tradable"] = bool(r.get("tradable", 1))
     return rows
 
 
@@ -1268,6 +1575,126 @@ def get_daily_history(user_id: int, limit: int = 30, mode: str = None) -> list[d
 
 
 # ---------------------------------------------------------------------------
+# 순수익률 곡선 — 오늘 기점으로 그려 나가는 그래프
+# ---------------------------------------------------------------------------
+# 표본을 남기는 이유
+#     at_daily 는 하루에 한 줄이라 "오늘 몇 시에 얼마였는지"를 복원할 수
+#     없습니다. 그래프는 시간축이 필요하므로 회전마다 한 점씩 남깁니다.
+#
+# 무엇을 남기는가 — **비율이 아니라 원재료**입니다
+#     실현손익 · 평가손익 · 청산비용 추정 · 기준 자본. 비율은 읽을 때
+#     계산합니다. 비율을 저장하면 계산식을 고치는 순간 옛 점과 새 점이 서로
+#     다른 정의로 한 그래프에 섞입니다.
+#
+# 순수익률의 정의
+#     (실현손익 − 오늘 첫 표본의 실현손익)      ← 수수료·거래세 이미 차감
+#   + (평가손익 − 오늘 첫 표본의 평가손익)
+#   − (청산비용 − 오늘 첫 표본의 청산비용)      ← 지금 다 팔면 더 낼 비용
+#     ÷ 오늘 첫 표본의 기준 자본 × 100
+#
+#     첫 표본에서 반드시 0% 가 됩니다. "오늘 기점"이라는 말 그대로입니다.
+
+_CURVE_KEEP_DAYS = 60
+
+
+def record_curve(user_id: int, mode: str, samples: list,
+                 min_gap_sec: float = 30.0) -> bool:
+    """수익률 표본 한 벌(전체·한국·미국)을 남깁니다. 남겼으면 True.
+
+    엔진 회전과 콘솔 새로고침이 둘 다 부릅니다 — 자동매매를 꺼 둔 채 화면만
+    보고 있어도 곡선이 이어져야 하기 때문입니다. 대신 `min_gap_sec` 안에
+    이미 표본이 있으면 건너뜁니다(초 단위 점을 쌓아봐야 그래프는 같습니다).
+    """
+    if not samples:
+        return False
+    init()
+    now = datetime.now()
+    today = now.date().isoformat()
+    with _conn() as conn:
+        last = conn.execute(
+            "SELECT ts FROM at_curve WHERE user_id = ? AND mode = ? "
+            "ORDER BY id DESC LIMIT 1", (user_id, mode)).fetchone()
+        if last and min_gap_sec > 0:
+            try:
+                if (now - datetime.fromisoformat(last["ts"])).total_seconds() < min_gap_sec:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        stamp = now.isoformat()
+        for row in samples:
+            conn.execute(
+                "INSERT INTO at_curve (user_id, mode, scope, trade_date, ts, "
+                "base_krw, realized_krw, unreal_krw, exit_cost_krw, equity_krw) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, mode, str(row.get("scope") or "ALL"), today, stamp,
+                 float(row.get("base_krw") or 0), float(row.get("realized_krw") or 0),
+                 float(row.get("unreal_krw") or 0), float(row.get("exit_cost_krw") or 0),
+                 float(row.get("equity_krw") or 0)))
+        cutoff = (now.date() - timedelta(days=_CURVE_KEEP_DAYS)).isoformat()
+        conn.execute("DELETE FROM at_curve WHERE user_id = ? AND trade_date < ?",
+                     (user_id, cutoff))
+    return True
+
+
+def get_curve(user_id: int, mode: str, days: int = 1) -> dict:
+    """시장별 순수익률 곡선.
+
+    days=1 이면 오늘치만. 그 이상이면 지난 날들의 마감 수익률을 복리로 이어
+    붙여(cum_pct) 오늘 점까지 한 줄로 그릴 수 있게 합니다 — 하루치 그래프가
+    매일 0% 로 리셋되기만 하면 "이 자동매매가 지금까지 얼마를 벌었나"에
+    답할 수 없습니다.
+    """
+    init()
+    days = max(1, min(int(days or 1), _CURVE_KEEP_DAYS))
+    since = (date.today() - timedelta(days=days - 1)).isoformat()
+    with _conn() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM at_curve WHERE user_id = ? AND mode = ? AND trade_date >= ? "
+            "ORDER BY id ASC", (user_id, mode, since))]
+
+    series: dict[str, list] = {}
+    base: dict[str, float] = {}
+    # scope → trade_date → 그 날의 첫 표본 (0% 기준선)
+    anchors: dict[tuple, dict] = {}
+    # scope → 이미 지나간 날들의 누적 배수 (복리)
+    carried: dict[str, float] = {}
+    seen_days: dict[str, str] = {}
+    last_pct: dict[str, float] = {}
+
+    for row in rows:
+        scope, day = row["scope"], row["trade_date"]
+        anchor = anchors.setdefault((scope, day), row)
+        if seen_days.get(scope) not in (None, day):
+            # 날이 바뀌었습니다 — 지난 날의 마지막 수익률을 누적에 곱해 넣습니다
+            carried[scope] = carried.get(scope, 1.0) * (1 + last_pct.get(scope, 0.0) / 100.0)
+        seen_days[scope] = day
+
+        net = ((row["realized_krw"] - anchor["realized_krw"])
+               + (row["unreal_krw"] - anchor["unreal_krw"])
+               - (row["exit_cost_krw"] - anchor["exit_cost_krw"]))
+        ground = anchor["base_krw"] or row["base_krw"] or 0.0
+        pct = (net / ground * 100.0) if ground > 0 else 0.0
+        last_pct[scope] = pct
+        base[scope] = ground
+        cum = (carried.get(scope, 1.0) * (1 + pct / 100.0) - 1) * 100.0
+        series.setdefault(scope, []).append({
+            "ts": row["ts"],
+            "sec": _sec_of_day_iso(row["ts"]),
+            "date": day,
+            "pnl": round(net, 2),
+            "pct": round(pct, 4),
+            "cum_pct": round(cum, 4),
+            "equity": round(row["equity_krw"], 2),
+            "base": round(ground, 2),
+        })
+
+    return {
+        "days": days, "mode": mode, "series": series, "base": base,
+        "now": {scope: points[-1] for scope, points in series.items() if points},
+    }
+
+
+# ---------------------------------------------------------------------------
 # 계좌 교체 — 성적 초기화
 # ---------------------------------------------------------------------------
 # 계좌번호를 바꾸면 화면의 '오늘 손익 · 누적 손익'은 **남의 계좌 성적**입니다.
@@ -1313,6 +1740,10 @@ def reset_pnl(user_id: int, mode: str, fingerprint: str = None,
         cleared = conn.execute(
             "DELETE FROM at_daily WHERE user_id = ? AND mode = ?",
             (user_id, mode)).rowcount
+        # 수익률 곡선도 그 계좌의 것입니다. 남겨두면 새 계좌의 첫 화면에
+        # 남의 계좌 그래프가 그려집니다.
+        conn.execute("DELETE FROM at_curve WHERE user_id = ? AND mode = ?",
+                     (user_id, mode))
         conn.execute(
             "INSERT OR REPLACE INTO at_account (user_id, mode, fingerprint, reset_at) "
             "VALUES (?, ?, ?, ?)", (user_id, mode, fingerprint or "", now))

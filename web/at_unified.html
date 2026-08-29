@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>아테나 시그널 통합</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="/static/at_common.css">
+<style>
+/* 배분 판 — 한 계좌를 두 시장이 나눠 쓰는 그림입니다. 막대 하나로 보여줘야
+   "내 돈이 어떻게 갈려 있는지"가 설명 없이 읽힙니다. */
+.pie{display:flex;height:44px;border-radius:var(--radius);overflow:hidden;
+  border:1px solid var(--line);font-size:15px;font-weight:700}
+.pie div{display:grid;place-items:center;color:var(--ink-text);white-space:nowrap;
+  transition:width .25s}
+.pie .kr{background:var(--gold)}
+.pie .us{background:var(--olive)}
+.pie .rest{background:var(--raised);color:var(--muted)}
+.example{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.example input{width:150px}
+.mtable td b{font-size:18px}
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h2>계좌 하나를 두 시장이 나눠 씁니다 <span class="sub" id="totalSub"></span></h2>
+    <div class="pie" id="pie"></div>
+
+    <div class="grid two" style="margin-top:14px">
+      <div>
+        <div class="alloc">
+          <div class="head"><b>한국 주식</b>
+            <span class="krw" id="krKrw"></span></div>
+          <input type="range" id="krRange" min="0" max="100" step="5">
+          <div class="left" id="krLeft"></div>
+        </div>
+        <div class="alloc">
+          <div class="head"><b>미국 주식</b>
+            <span class="krw" id="usKrw"></span></div>
+          <input type="range" id="usRange" min="0" max="100" step="5">
+          <div class="left" id="usLeft"></div>
+        </div>
+      </div>
+
+      <div>
+        <label class="chk"><input type="checkbox" id="splitOn"> 한국과 미국을 나눠서 굴리기
+          <span class="muted" style="font-size:15px">   끄면 한 지갑을 선착순으로 씁니다</span>
+        </label>
+        <div class="example">
+          <span>계좌에</span>
+          <input id="exampleKrw" type="number" step="100000" value="1000000">
+          <span>원이 있으면</span>
+        </div>
+        <div class="note" id="exampleNote" style="margin-top:8px"></div>
+        <div class="warnbox" id="allocWarn" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>순수익률 <span class="sub">수수료, 거래세, 지금 다 팔 때 낼 비용까지 뺀 순수익입니다</span></h2>
+    <div id="curveHost"></div>
+  </section>
+
+  <section>
+    <h2>시장별 지갑</h2>
+    <div id="marketCards" class="mcards two"></div>
+  </section>
+
+  <section>
+    <h2>시장별 성적 <span class="sub">오늘 기준</span></h2>
+    <div class="scroll-x"><table class="mtable">
+      <thead><tr><th>시장</th><th class="num">순수익률</th><th class="num">순손익</th>
+        <th class="num">기준 자본</th><th class="num">보유</th><th class="num">평가손익</th>
+        <th>상태</th></tr></thead>
+      <tbody id="scoreBody"></tbody>
+    </table></div>
+    <div class="note" style="margin-top:10px">
+      기준 자본은 그 시장에 배분한 금액입니다. 같은 5만원을 벌어도 배분이 작은 쪽의
+      수익률이 높게 나옵니다, 그것이 배분한 돈을 얼마나 잘 굴렸는지를 말해 줍니다.
+    </div>
+  </section>
+</main>
+
+<script>
+window.PAGE = {
+  nav: "unified",
+  lite: false,                        // 배분·예산은 실제 잔고가 있어야 계산됩니다
+  title: "통합",
+  desc: "한 계좌를 한국과 미국에 얼마씩 나눠 줄지 정하고, 두 시장의 성적을 한 화면에서 봅니다.",
+
+  init() {
+    const A = AT;
+    this.curve = A.curveCard("curveHost", {scopes: ["ALL", "KR", "US"], days: 1,
+                                           title: "오늘 전체 순수익률", height: 260});
+    A.$("splitOn").onchange = (e) => this.save({market_split: e.target.checked});
+    ["kr", "us"].forEach((p) => {
+      const el = A.$(p + "Range");
+      el.oninput = () => this.preview();
+      el.onchange = () => this.save({[`${p}_alloc_pct`]: Number(el.value)});
+    });
+    A.$("exampleKrw").oninput = () => this.preview();
+    setInterval(() => this.curve?.reload(), 30000);
+  },
+
+  async save(patch) {
+    this._dirty = true;
+    try {
+      await AT.call("/autotrade/config", {method: "POST", body: {config: patch}});
+      AT.toast("저장했습니다. 다음 회전부터 적용됩니다.");
+      this._dirty = false;
+      AT.refresh();
+    } catch (e) { AT.toast("저장 실패: " + e.message, true); this._dirty = false; }
+  },
+
+  // 슬라이더를 움직이는 동안, 저장을 기다리지 않고 지금 값으로 다시 그립니다.
+  // 저장 후에야 반영되면 "얼마가 되는지"를 보면서 정할 수가 없습니다.
+  preview() {
+    const A = AT;
+    let kr = Number(A.$("krRange").value) || 0;
+    let us = Number(A.$("usRange").value) || 0;
+    // 합이 100을 넘으면 엔진이 비례 축소합니다(engine/allocation.alloc_pcts).
+    // 화면도 같은 규칙으로 그려야, 저장한 순간 숫자가 달라지지 않습니다.
+    const sum = kr + us;
+    const over = sum > 100;
+    const shownKr = over ? kr * 100 / sum : kr;
+    const shownUs = over ? us * 100 / sum : us;
+    const rest = Math.max(0, 100 - shownKr - shownUs);
+
+    A.$("pie").innerHTML =
+      `<div class="kr" style="width:${shownKr}%">${shownKr >= 8 ? "한국 " + shownKr.toFixed(0) + "%" : ""}</div>
+       <div class="us" style="width:${shownUs}%">${shownUs >= 8 ? "미국 " + shownUs.toFixed(0) + "%" : ""}</div>
+       <div class="rest" style="width:${rest}%">${rest >= 8 ? "현금 " + rest.toFixed(0) + "%" : ""}</div>`;
+
+    const total = A.SNAP?.account?.total_value || 0;
+    A.$("krKrw").textContent = total ? A.won(total * shownKr / 100) : `${kr}%`;
+    A.$("usKrw").textContent = total ? A.won(total * shownUs / 100) : `${us}%`;
+    A.$("krLeft").textContent = `한국에 ${kr}% 배분`;
+    A.$("usLeft").textContent = `미국에 ${us}% 배분`;
+
+    const money = Number(A.$("exampleKrw").value) || 0;
+    A.$("exampleNote").innerHTML =
+      `한국 <b>${A.won(money * shownKr / 100)}</b>   `
+      + `미국 <b>${A.won(money * shownUs / 100)}</b>   `
+      + `어느 쪽도 쓰지 않는 현금 <b>${A.won(money * rest / 100)}</b>`;
+
+    A.$("allocWarn").classList.toggle("hide", !over && rest > 0);
+    A.$("allocWarn").innerHTML = over
+      ? `합이 ${sum}% 입니다. 계좌보다 큰 돈을 배분할 수는 없으므로 `
+        + `비율만 지켜서 <b>한국 ${shownKr.toFixed(0)}% , 미국 ${shownUs.toFixed(0)}%</b> 로 줄여서 씁니다.`
+      : (rest <= 0
+          ? `현금 여유가 0% 입니다. 수수료와 환전 손실 때문에 실제로는 계획한 만큼 `
+            + `다 사지 못할 수 있습니다, 5~10%는 남겨두는 편이 안전합니다.`
+          : "");
+  },
+
+  onSnapshot(snap) {
+    const A = AT, cfg = snap.config || {}, acc = snap.account || {};
+    A.$("totalSub").textContent =
+      `총자산 ${A.won(acc.total_value)}   주문가능 현금 ${A.won(acc.available_cash)}`;
+
+    if (!this._dirty) {
+      A.$("splitOn").checked = cfg.market_split !== false;
+      A.$("krRange").value = cfg.kr_alloc_pct ?? 50;
+      A.$("usRange").value = cfg.us_alloc_pct ?? 50;
+    }
+    this.preview();
+
+    A.marketCards("marketCards", snap, {link: true});
+
+    // 시장별 성적 — 곡선의 마지막 점을 그대로 씁니다(그래프와 표가 다른
+    // 계산을 하면 어느 쪽이 맞는지 사람이 판단해야 합니다).
+    const now = this.curve?.state?.data?.now || {};
+    const rows = snap.markets || [];
+    A.$("scoreBody").innerHTML = rows.map((m) => {
+      const p = now[m.scope];
+      return `<tr>
+        <td><a href="/autotrade/${m.scope.toLowerCase()}">${A.esc(m.label)} 주식</a></td>
+        <td class="num ${p ? A.sign(p.pct) : "muted"}"><b>${p ? A.pct(p.pct) : "-"}</b></td>
+        <td class="num ${p ? A.sign(p.pnl) : "muted"}">${p ? A.won(p.pnl) : "-"}</td>
+        <td class="num">${A.won(m.budget_krw)}</td>
+        <td class="num">${m.positions} / ${m.max_positions}종목</td>
+        <td class="num ${A.sign(m.unrealized_krw)}">${A.won(m.unrealized_krw)}</td>
+        <td>${m.blocked ? `<span class="muted">${A.esc(m.blocked)}</span>`
+                        : '<span class="pill on"><span class="dot"></span><span>매수 가능</span></span>'}</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="7" class="center">계좌를 읽는 중입니다.</td></tr>`;
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>

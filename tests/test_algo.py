@@ -417,6 +417,66 @@ def test_protections():
     check("prot", "손실 쿨다운 0 → 공통 30분만 적용 (60분 뒤 통과)",
           locks.for_symbol("005930", now) is None)
 
+    # ---------------------------------------------------------------------
+    # 13) 추격 재매수 차단 — 시간이 아니라 **가격**으로 막습니다.
+    #     증상: 쿨다운이 풀리기만 하면, 그 사이 종목이 얼마를 올랐든 같은
+    #     신호로 되삽니다. 급등 뒤에는 추세 지표가 전부 켜져서 신호가 오히려
+    #     더 좋아 보이므로, 시간 게이트만으로는 고점 추격을 못 막습니다.
+    # ---------------------------------------------------------------------
+    def _exit(symbol: str, minutes_ago: float, price: float) -> dict:
+        return {**_trade(symbol, minutes_ago, 50_000, "목표가 도달", now),
+                "avg_fill_price": price}
+
+    # 보호장치는 꺼 둡니다 — 추격 차단이 protect_enabled 와 **무관하게**
+    # 동작하는 것 자체가 이 검사의 요점입니다.
+    chase_cfg = {"protect_enabled": False, "protect_chase_pct": 3.0,
+                 "protect_chase_lookback_min": 1440}
+    sold = [_exit("005930", 120, 70_000)]
+    locks = protections.evaluate(1, "paper", chase_cfg, equity=10_000_000,
+                                 now=now, trades=sold)
+    check("prot", "보호장치가 꺼져 있어도 매도가 기준선은 남는다",
+          not locks.enabled and locks.chase_reason("005930", 74_000))
+    check("prot", "매도가 +5.7% 위에서 재매수 거부",
+          locks.chase_reason("005930", 74_000) is not None,
+          locks.chase_reason("005930", 74_000) or "")
+    check("prot", "매도가 +1.4% 는 통과 (문턱 +3%)",
+          locks.chase_reason("005930", 71_000) is None)
+    check("prot", "눌림목(매도가 아래)은 그대로 열려 있다",
+          locks.chase_reason("005930", 66_000) is None)
+    check("prot", "판 적 없는 종목은 무관",
+          locks.chase_reason("000660", 999_999) is None)
+
+    # 기준선은 lookback 밖으로 나가면 사라집니다 — 하루 지난 가격은 더 이상
+    # '방금 내가 판 가격'이 아닙니다.
+    stale = [_exit("005930", 2000, 70_000)]
+    locks = protections.evaluate(1, "paper", chase_cfg, equity=10_000_000,
+                                 now=now, trades=stale)
+    check("prot", "24시간 지난 매도가는 기준선에서 빠진다",
+          locks.chase_reason("005930", 90_000) is None)
+
+    # 기준선은 **마지막** 매도가 하나뿐입니다 (더 비쌌던 예전 매도가로
+    # 재면, 이미 갱신한 판단이 문턱으로 되살아납니다).
+    twice = [_exit("005930", 300, 90_000), _exit("005930", 60, 70_000)]
+    locks = protections.evaluate(1, "paper", chase_cfg, equity=10_000_000,
+                                 now=now, trades=twice)
+    check("prot", "기준선은 가장 최근 매도가",
+          locks.chase_reason("005930", 74_000) is not None
+          and "70,000" in locks.chase_reason("005930", 74_000),
+          locks.chase_reason("005930", 74_000) or "")
+
+    # 0 이면 끕니다
+    locks = protections.evaluate(1, "paper", {**chase_cfg, "protect_chase_pct": 0},
+                                 equity=10_000_000, now=now, trades=sold)
+    check("prot", "protect_chase_pct 0 이면 끔",
+          locks.chase_reason("005930", 200_000) is None)
+
+    # 체결가가 없는 기록은 기준선이 되지 않습니다 (주문가 폴백까지만)
+    noprice = [{**_trade("005930", 60, 50_000, "목표가 도달", now)}]
+    locks = protections.evaluate(1, "paper", chase_cfg, equity=10_000_000,
+                                 now=now, trades=noprice)
+    check("prot", "가격 없는 기록은 문턱을 만들지 않는다",
+          locks.chase_reason("005930", 200_000) is None)
+
 
 # ---------------------------------------------------------------------------
 # 운영 사고 회귀 검사 — 실계좌에서 실제로 났던 문제들
@@ -817,13 +877,189 @@ def test_strategy_integration():
     check("integ", "hold_winners 켜져도 손절은 즉시 실행",
           stopped.should_exit and "손절" in stopped.reason)
 
+    # 백테스트의 봉 안 익절이 보류 게이트를 보는가.
+    #
+    # engine/autotrade._run_backtest 의 ② 는 fills.protective_fill 로 목표가를
+    # 바로 체결합니다 — check_exit 을 거치지 않는 경로입니다. 여기에 보류
+    # 플래그를 안 물리면 hold_winners 가 **백테스트에서만** 조용히 꺼져서,
+    # 이 설정을 켠 효과가 과거 데이터에서 항상 0으로 나옵니다. 그 상태로
+    # A/B 를 돌리면 "차이 없음" 이라는 가짜 결론이 나옵니다.
+    from engine import autotrade as at
+    from storage import autotrade as store
+
+    bt_bars = _bars(220, seed=31)
+    # 이 검사는 **배선**을 봅니다 (익절 게이트가 봉 안 체결까지 닿는가).
+    # 신호 품질과 무관하므로 ML·분봉·뉴스를 꺼서 봉당 비용을 줄입니다.
+    bt_cfg = {**store.DEFAULT_CONFIG, "ml_mode": "off", "learn_mode": "off",
+              "intraday_weight": 0.0, "use_news": False}
+    # 게이트를 흉내내지 말고 **진짜 게이트**를 태웁니다. lambda 로 갈아끼우면
+    # 플래그 아래쪽(skip_target -> protective_fill)만 검사하게 되어, 위쪽 배선이
+    # 끊겨도(state 에 peak_price 가 빠지거나 direction 이 뒤집혀도) 초록으로
+    # 통과합니다 — 원래 버그가 그대로 돌아와도 모릅니다.
+    held_run = at._run_backtest(inst, bt_bars,
+                                {**bt_cfg, "hold_winners": True},
+                                10_000_000)
+
+    took_profit = [t for t in held_run["trades"] if "목표가 도달" in t["reason"]]
+    check("integ", "백테스트: 보류 중이면 봉 안 익절도 안 나간다",
+          not took_profit, f"목표가 체결 {len(took_profit)}건")
+
+    plain_run = at._run_backtest(inst, bt_bars, dict(bt_cfg), 10_000_000)
+    check("integ", "백테스트: 보류가 없으면 목표가 익절은 그대로",
+          any("목표가 도달" in t["reason"] for t in plain_run["trades"]),
+          f"매매 {len(plain_run['trades'])}건")
+
+
+# ---------------------------------------------------------------------------
+# 진입 후보 기록 (at_candidates) + 분봉 반사실 점수
+# ---------------------------------------------------------------------------
+
+def test_candidate_log():
+    print("\n[기록] 진입 후보 로그 + 분봉 반사실 점수")
+    from engine import ensemble, instruments, strategy
+    from storage import autotrade as store
+
+    inst = instruments.try_resolve("005930")
+    if inst is None:
+        check("cand", "종목 해석 불가로 건너뜀", True, "offline")
+        return
+
+    bars = _bars(200, seed=11)
+    last = float(bars["close"].iloc[-1])
+    intra = _bars(240, seed=23, start_price=last)
+    quote = {"price": last, "price_krw": last, "age_sec": 1.0}
+
+    # 핵심 불변식 — "분봉을 빼고 같은 파이프라인을 태운 점수"가
+    # 실제로 intraday_weight=0 으로 다시 계산한 점수와 같아야 합니다.
+    # 이게 깨지면 로그의 반사실 점수는 그냥 다른 숫자일 뿐입니다.
+    for label, extra in (("observe", {"algo_mode": "observe"}),
+                         ("soft(앙상블)", {"algo_mode": "soft"}),
+                         ("soft+NNFX", {"algo_mode": "soft", "nnfx_mode": "soft"})):
+        base = {"entry_score": 0.35, "use_news": False, "ml_mode": "off", **extra}
+        with_i = strategy.evaluate(inst, {**base, "intraday_weight": 0.35},
+                                   bars_daily=bars, bars_intraday=intra,
+                                   quote=quote, allow_fetch=False)
+        without = strategy.evaluate(inst, {**base, "intraday_weight": 0.0},
+                                    bars_daily=bars, bars_intraday=intra,
+                                    quote=quote, allow_fetch=False)
+        gap = abs((with_i.score_wo_intraday or 0) - without.score)
+        check("cand", f"{label}: 반사실 점수 = 분봉 끄고 재계산한 점수",
+              with_i.ok and without.ok and gap < 1e-9,
+              f"{with_i.score_wo_intraday:+.4f} vs {without.score:+.4f} (차 {gap:.2e})")
+        check("cand", f"{label}: 분봉 점수가 실제로 붙었는가",
+              with_i.intraday_score is not None and without.intraday_score is None)
+
+    # 난기류 감쇠가 실제로 점수에 곱해지는 경우 — 반사실 점수도 같은 감쇠를
+    # 받아야 합니다 (EnsembleState.damping 을 따로 들고 있는 이유가 이것입니다).
+    rough = _bars(260, seed=5)
+    shock = rough["close"].to_numpy(copy=True)
+    shock[-3:] = shock[-4] * np.array([1.16, 1.00, 1.13])
+    rough = rough.assign(close=shock, open=shock,
+                         high=shock * 1.03, low=shock * 0.97)
+    rough_quote = {"price": float(shock[-1]), "price_krw": float(shock[-1]),
+                   "age_sec": 1.0}
+    turb = ensemble.turbulence(rough, {}) or {}
+    base = {"entry_score": 0.35, "use_news": False, "ml_mode": "off",
+            "algo_mode": "soft"}
+    with_i = strategy.evaluate(inst, {**base, "intraday_weight": 0.35},
+                               bars_daily=rough, bars_intraday=intra,
+                               quote=rough_quote, allow_fetch=False)
+    without = strategy.evaluate(inst, {**base, "intraday_weight": 0.0},
+                                bars_daily=rough, bars_intraday=intra,
+                                quote=rough_quote, allow_fetch=False)
+    gap = abs((with_i.score_wo_intraday or 0) - without.score)
+    check("cand", "난기류 감쇠가 걸린 회전에서도 반사실 점수가 일치",
+          bool(turb.get("elevated")) and gap < 1e-9,
+          f"난기류 {turb.get('label')} · 차 {gap:.2e}")
+
+    sig = strategy.evaluate(inst, {"entry_score": 0.35, "intraday_weight": 0.35,
+                                   "use_news": False, "ml_mode": "off"},
+                            bars_daily=bars, bars_intraday=intra,
+                            quote=quote, allow_fetch=False)
+    check("cand", "적용된 진입 문턱이 신호에 남는가", sig.entry_threshold == 0.35,
+          f"{sig.entry_threshold}")
+
+    # 저장 → 집계 왕복. flipped_in/out 은 "분봉이 판단을 바꾼 횟수"라서
+    # 이 값이 틀리면 나중에 분봉의 기여도를 잘못 읽게 됩니다.
+    user = 999911
+    store.init()
+    with store._conn() as conn:
+        conn.execute("DELETE FROM at_candidates WHERE user_id = ?", (user,))
+
+    rows = [
+        # 분봉이 밀어 올려 진입 — flipped_in
+        {"symbol": "AAA", "score": 0.40, "score_wo_intraday": 0.30,
+         "daily_score": 0.30, "intraday_score": 0.60, "passed": True,
+         "passed_wo_intraday": False, "entry_threshold": 0.35, "direction": "long"},
+        # 분봉이 끌어내려 보류 — flipped_out (이벤트 로그에는 남지 않던 경우)
+        {"symbol": "BBB", "score": 0.31, "score_wo_intraday": 0.38,
+         "daily_score": 0.38, "intraday_score": -0.20, "passed": False,
+         "passed_wo_intraday": True, "entry_threshold": 0.35, "direction": "flat"},
+        # 분봉이 있으나 판단은 그대로
+        {"symbol": "CCC", "score": 0.52, "score_wo_intraday": 0.55,
+         "daily_score": 0.55, "intraday_score": 0.05, "passed": True,
+         "passed_wo_intraday": True, "entry_threshold": 0.35, "direction": "long"},
+    ]
+    for row in rows:
+        store.record_candidate(user, {"mode": "paper", "source": "auto",
+                                      "price": 100.0, **row})
+
+    saved = store.get_candidates(user, days=1)
+    check("cand", "후보 3건이 그대로 저장되는가", len(saved) == 3, f"{len(saved)}건")
+    check("cand", "문턱 미달 후보도 남는가 (이벤트 로그에는 없던 것)",
+          any(r["symbol"] == "BBB" and r["passed"] == 0 for r in saved))
+
+    summary = store.candidate_summary(user, days=1)
+    check("cand", "집계: 분봉이 만든 진입 1건", summary.get("flipped_in") == 1,
+          str(summary.get("flipped_in")))
+    check("cand", "집계: 분봉이 막은 진입 1건", summary.get("flipped_out") == 1,
+          str(summary.get("flipped_out")))
+    check("cand", "집계: 분봉 점수 평균 크기가 일봉보다 작은가",
+          (summary.get("abs_intraday") or 0) < (summary.get("abs_daily") or 0),
+          f"분봉 {summary.get('abs_intraday'):.3f} vs 일봉 {summary.get('abs_daily'):.3f}")
+
+    with store._conn() as conn:
+        conn.execute("DELETE FROM at_candidates WHERE user_id = ?", (user,))
+
+    # 스로틀 — 회전마다 전 종목을 적으면 하루 수만 행이 됩니다. 그렇다고 너무
+    # 아끼면 **판단이 바뀐 순간**을 놓칩니다. 그 순간만은 반드시 남아야 합니다.
+    from engine import autotrade
+
+    user2 = 999912
+    with store._conn() as conn:
+        conn.execute("DELETE FROM at_candidates WHERE user_id = ?", (user2,))
+    autotrade._last_candidate.clear()
+
+    def _sig(score, wo):
+        s = strategy.Signal(key=inst.key, ok=True, score=score, direction="flat",
+                            price=70_000.0, price_krw=70_000.0, daily_score=wo,
+                            intraday_score=0.1, entry_threshold=0.35)
+        s.score_wo_intraday = wo
+        return s
+
+    cfg = {"mode": "paper", "entry_score": 0.35}
+    autotrade._record_candidate(user2, cfg, inst, _sig(0.30, 0.40), held=False)
+    autotrade._record_candidate(user2, cfg, inst, _sig(0.31, 0.41), held=False)
+    autotrade._record_candidate(user2, cfg, inst, _sig(0.40, 0.30), held=False)
+    throttled = store.get_candidates(user2, days=1)
+    check("cand", "같은 판단·비슷한 점수는 스로틀로 생략", len(throttled) == 2,
+          f"{len(throttled)}건")
+    check("cand", "판단이 바뀐 회전은 간격과 무관하게 기록",
+          any(r["passed"] == 1 for r in throttled)
+          and any(r["passed"] == 0 for r in throttled))
+
+    with store._conn() as conn:
+        conn.execute("DELETE FROM at_candidates WHERE user_id = ?", (user2,))
+    autotrade._last_candidate.clear()
+
 
 # ---------------------------------------------------------------------------
 
 def report() -> bool:
     print("\n" + "=" * 60)
     names = {"prep": "전처리", "ens": "앙상블", "prot": "보호장치",
-             "pulse": "Market Pulse", "ops": "운영", "integ": "통합"}
+             "pulse": "Market Pulse", "ops": "운영", "integ": "통합",
+             "cand": "후보기록"}
     by_cat: dict = {}
     for cat, _, ok, _ in results:
         n, p = by_cat.get(cat, (0, 0))
@@ -853,5 +1089,6 @@ if __name__ == "__main__":
     test_operations()
     test_marketpulse()
     test_strategy_integration()
+    test_candidate_log()
     ok = report()
     sys.exit(0 if ok else 1)

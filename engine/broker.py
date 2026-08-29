@@ -61,6 +61,9 @@ class OrderResult:
     intended_price: float = 0.0      # 주문을 낼 때 보고 있던 가격
     filled_quantity: float = 0.0
     avg_fill_price: float | None = None
+    # 어느 창구로 접수했는가 ('' = 평소 경로, 'US_DAY' = 미국 주간거래).
+    # 취소 API 가 창구별로 다릅니다 — 원장에 남겨야 나중에 제대로 걷습니다.
+    venue: str = ""
     raw: dict = field(default_factory=dict)
 
     @property
@@ -84,6 +87,7 @@ class OrderResult:
             "filled_quantity": self.filled_quantity,
             "avg_fill_price": self.avg_fill_price,
             "slippage_bps": self.slippage_bps,
+            "venue": self.venue,
             "error": self.error, "message": self.message,
         }
 
@@ -152,7 +156,11 @@ class Broker(ABC):
 
     @abstractmethod
     def account(self) -> dict:
-        """{cash, available_cash, equity_value, margin_locked, total_value, ...}"""
+        """{cash, available_cash, equity_value, margin_locked, total_value, ...}
+
+        실계좌에서 cash·equity_value·total_value 는 **체결기준**입니다 —
+        결제 대기 중인 매매까지 반영한, 지금 실제로 가진 돈입니다.
+        """
 
     @abstractmethod
     def positions(self) -> list[Position]:
@@ -585,22 +593,49 @@ class KISBroker(Broker):
             out["errors"] += snap.get("errors", [])
             return out
 
+        # 화면의 세 숫자(총자산·총예수금·평가금액)는 전부 **체결기준**입니다.
+        #
+        # 결제기준(자산현황 TR)은 오늘 판 종목을 아직 들고 있는 것으로,
+        # 오늘 산 종목의 대금을 아직 예수금에 있는 것으로 셉니다. 매매가 잦으면
+        # 그 둘이 겹쳐 총자산이 통째로 부풉니다 — 실측 2026-08-29:
+        #     결제기준 1,308,704원  vs  체결기준 531,892원 (77만원 차이)
+        # 그 부푼 값이 총자산이 되면 1회 위험 예산·종목당 비중·시장 배분이
+        # 전부 없는 돈 위에서 계산됩니다. 결제기준 값은 진단용으로만 남깁니다.
+        # 체결기준 총자산은 **해외분까지만** 옵니다 (체결기준잔고 TR 은 해외주식
+        # 전용입니다). 국내 종목을 들고 있으면 그 평가금액이 통째로 빠지므로
+        # 여기서 더합니다 — 안 더하면 국내·미국을 같이 굴리는 계좌에서
+        # 총자산이 국내 보유액만큼 작게 나오고, '총자산 = 총예수금 + 평가금액'
+        # 이 화면에서 어긋납니다 (실측 1002****-01: 국내 6종목 235,080원 누락).
+        settled_total = snap["settled_asset"]
+        if settled_total:
+            settled_total += equity_value              # 국내 체결기준 평가금액
+        else:
+            settled_total = snap["total_asset"]        # 해외 TR 을 못 읽은 경우
+        settled_cash = snap.get("settled_deposit")
+        if settled_cash is None:                       # 옛 스냅샷 모양 방어
+            settled_cash = (snap.get("cash_total") or snap["deposit"]) \
+                - snap["unsettled_buy"] + snap["unsettled_sell"]
         out.update({
-            "cash": snap["deposit"],
+            "cash": settled_cash,
             # 예수금이 아니라 **주문가능현금**입니다. 미결제 매수대금이 결제일까지
             # 예수금에 남아 있어서, 예수금을 쓸 수 있는 돈으로 읽으면 이미 써버린
             # 돈으로 또 주문을 냅니다 (실측 예수금 132,226 / 주문가능 3,325).
             "available_cash": snap["available_cash"],
-            "reserved_cash": max(snap["deposit"] - snap["available_cash"], 0.0),
-            "total_value": snap["total_asset"],
+            "reserved_cash": max(settled_cash - snap["available_cash"], 0.0),
+            "gross_deposit": snap["deposit"],          # 미결제 포함 예수금 (진단용)
+            "total_value": settled_total,
             "settled_total_value": snap["settled_asset"],
+            "gross_total_value": snap["total_asset"],  # 결제기준 총자산 (진단용)
+            # 평가금액도 체결기준입니다 (snap["eval_amount"] = 체결기준잔고 TR).
+            # 이 세 값이 같은 기준이라 화면에서 아귀가 맞습니다:
+            #     총자산 = 총예수금 + 평가금액
             "equity_value": equity_value + snap["eval_amount"],
             "purchase_amount": snap["purchase_amount"] + (
                 stock.get("purchase_amount", 0.0) if stock.get("ok") else 0.0),
             "unrealized_pnl": snap["unrealized_pnl"] + (
                 stock.get("total_pnl", 0.0) if stock.get("ok") else 0.0),
             "notional_exposure": equity_value + snap["eval_amount"],
-            "initial_cash": snap["total_asset"],
+            "initial_cash": settled_total,
             "overseas_pnl": snap["unrealized_pnl"],
             "unsettled_buy": snap["unsettled_buy"],
             "unsettled_sell": snap["unsettled_sell"],
@@ -685,6 +720,7 @@ class KISBroker(Broker):
             return OrderResult(ok=False, error="주문 수량이 0입니다.",
                                client_order_id=client_order_id)
 
+        venue = ""
         quote = feed.quote(inst)
         if not quote:
             return OrderResult(ok=False, error="현재가를 조회할 수 없어 주문하지 않았습니다.",
@@ -707,8 +743,23 @@ class KISBroker(Broker):
                 if blocked:
                     return OrderResult(ok=False, error=blocked,
                                        client_order_id=client_order_id)
-            res = kis_trading.place_overseas_order(
-                inst.key, side, quantity, price=limit, exchange=exchange)
+            # 주간거래 구간이면 **접수 창구가 다릅니다.** 여기서 안 가르면
+            # 정규장 창구로 들어가 몇 시간 뒤 개장 때 낡은 가격에 체결됩니다.
+            if feed.market_status(inst).get("session") == "DAY":
+                if quote.get("price_session") != "DAY":
+                    # 주간 시세를 못 받은 상태입니다. 정규장 종가로 ATS 에
+                    # 지정가를 걸면 시장과 동떨어진 주문이 되고, 정규장 창구로
+                    # 돌리면 원치 않는 시각에 체결됩니다. 둘 다 하지 않습니다.
+                    return OrderResult(
+                        ok=False, client_order_id=client_order_id,
+                        error="주간거래 시세를 받지 못해 주문하지 않았습니다 "
+                              "(KIS 키·미국주식 주간거래 서비스 신청을 확인하세요).")
+                venue = "US_DAY"
+                res = kis_trading.place_overseas_day_order(
+                    inst.key, side, quantity, price=limit, exchange=exchange)
+            else:
+                res = kis_trading.place_overseas_order(
+                    inst.key, side, quantity, price=limit, exchange=exchange)
         else:
             res = kis_trading.place_stock_order(
                 inst.key, side, quantity,
@@ -726,6 +777,7 @@ class KISBroker(Broker):
             broker_order_id=res.get("broker_order_id", ""),
             error=res.get("error", ""), message=res.get("message", ""),
             client_order_id=client_order_id, intended_price=ref_price,
+            venue=venue,
             raw=res.get("raw") or {},
         )
         _remember_order(client_order_id, result)
@@ -753,9 +805,14 @@ class KISBroker(Broker):
                 age_days = max((datetime.now() - created).days, 0)
             except (TypeError, ValueError):
                 age_days = 0
-            res = kis_trading.overseas_executions(days_back=age_days + 3)
+            # 종목으로 좁혀 조회합니다 — 이 API 는 20건만 돌려주므로 좁히지
+            # 않으면 하루치 주문에 밀려 방금 낸 주문도 못 찾습니다.
+            res = kis_trading.overseas_executions(
+                days_back=age_days + 3, symbol=(inst.key if inst else
+                                                str(record.get("symbol") or "")))
         else:
-            res = kis_trading.stock_executions()
+            res = kis_trading.stock_executions(
+                symbol=(inst.key if inst else str(record.get("symbol") or "")))
         if not res.get("ok"):
             return OrderStatus(known=False, detail=res.get("error", "조회 실패"))
 
@@ -799,9 +856,18 @@ class KISBroker(Broker):
             quote = feed.quote(inst) or {}
             remaining = max(float(record.get("quantity") or 0)
                             - float(record.get("filled_quantity") or 0), 0)
-            res = kis_trading.cancel_overseas_order(
-                inst.key, broker_order_id, quantity=remaining,
-                exchange=kis_trading.overseas_exchange_code(quote.get("exchange")))
+            exchange = kis_trading.overseas_exchange_code(quote.get("exchange"))
+            # 주간거래로 낸 주문은 주간거래 취소로만 걷힙니다. 원장에 남겨둔
+            # venue 로 가릅니다 — '지금 주간거래 시간인가'로 판단하면, 주간거래
+            # 시간에 살아 있는 정규장 미체결까지 주간 창구로 보내게 됩니다.
+            if str(record.get("venue") or "") == "US_DAY":
+                res = kis_trading.cancel_overseas_day_order(
+                    inst.key, broker_order_id, quantity=remaining,
+                    exchange=exchange)
+            else:
+                res = kis_trading.cancel_overseas_order(
+                    inst.key, broker_order_id, quantity=remaining,
+                    exchange=exchange)
         else:
             org_no = ""
             open_orders = kis_trading.stock_open_orders()

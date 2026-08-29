@@ -35,8 +35,9 @@ import numpy as np
 
 from data_sources import credentials
 from engine import broker as broker_module
-from engine import (feed, fills, holding, instruments, lessons, portfolio,
-                    protections, risk, rotation, split, strategy, validation)
+from engine import (agent_trader, allocation, feed, fills, holding, instruments,
+                    lessons, portfolio, protections, risk, rotation, split,
+                    strategy, validation)
 from engine.broker import make_client_order_id
 from engine.instruments import Instrument
 from storage import autotrade as store
@@ -74,6 +75,18 @@ _skipped_notice: dict[int, set] = {}
 # 같은 주문을 계속 내서 실계좌 원장이 거부 기록으로 가득 찹니다.
 _BROKER_REJECT_COOLDOWN_SEC = 1800
 _broker_rejects: dict[tuple, tuple] = {}
+
+# 진입 후보 기록(at_candidates) 스로틀. 회전마다 전 종목을 적으면 하루 수만 행이
+# 쌓이고, 그렇다고 진입한 것만 적으면 **분봉이 막은 진입**이 다시 안 보입니다.
+# 그래서 "판단이 바뀌었거나 점수가 눈에 띄게 움직였거나 10분이 지났을 때"만 적습니다.
+_CANDIDATE_LOG_SEC = 600
+_CANDIDATE_SCORE_STEP = 0.05
+_last_candidate: dict[tuple, tuple] = {}
+
+# 후보 기록 정리는 하루 한 번이면 충분합니다 (회전마다 DELETE 를 돌릴 이유가 없습니다)
+_CANDIDATE_PURGE_SEC = 86400
+_CANDIDATE_KEEP_DAYS = 90
+_last_candidate_purge: dict[int, float] = {}
 
 # 분할 추가 매수를 **왜 지금 안 하는가**. 판단(split.plan_buy)은 회전마다 하면서
 # 결과를 버리면 "다음 매수 35,245 인데 34,000 인데도 왜 안 사지"를 화면에서
@@ -174,6 +187,82 @@ def _log_plan_reject(user_id: int, key: str, name: str, reason: str, detail: dic
     _last_signal_error[slot] = (now, reason)
     store.log_event(user_id, "reject", f"{name} 진입 불가 — {reason}",
                     symbol=key, name=name, detail=detail)
+
+
+def _record_candidate(user_id: int, cfg: dict, inst: Instrument, sig, held: bool,
+                      scalp: bool = False):
+    """평가한 진입 후보를 남깁니다 — **문턱을 못 넘은 것까지 전부**.
+
+    이 기록이 없으면 답할 수 없는 질문이 있습니다: "분봉 점수가 진입을 막은
+    적이 있는가". 이벤트 로그에는 문턱을 통과한 신호만 남기 때문에, 분봉이
+    후보를 문턱 아래로 끌어내린 경우는 흔적조차 남지 않았습니다.
+
+    strategy.evaluate 가 같은 파이프라인에 태워 만든 반사실 점수
+    (score_wo_intraday)를 함께 적으므로, 사후에 공식을 재현할 필요가 없습니다.
+    """
+    if not sig.ok:
+        return
+    mode = cfg.get("mode", "paper")
+    # 초단타 경로(engine/scalping.ScalpSignal)는 필드 구성이 다릅니다 — 없는 값은
+    # 비워 두고 기록만 남깁니다 (기록 때문에 매매 경로가 죽으면 안 됩니다).
+    def _field(name, default=None):
+        return getattr(sig, name, default)
+
+    threshold = float(_field("entry_threshold") or cfg.get("entry_score", 0.35))
+    short_ok = bool(cfg.get("allow_short")) and inst.shortable
+
+    def _passed(score) -> bool | None:
+        if score is None:
+            return None
+        return bool(score >= threshold or (short_ok and score <= -threshold))
+
+    passed = _passed(sig.score)
+    passed_wo = _passed(_field("score_wo_intraday"))
+
+    # 스로틀 — 판단(통과 여부)이 바뀌면 간격과 무관하게 남깁니다.
+    slot = (user_id, mode, inst.key)
+    previous = _last_candidate.get(slot)
+    now = time.time()
+    if previous:
+        last_at, last_score, last_passed = previous
+        if (passed == last_passed
+                and abs(float(sig.score) - last_score) < _CANDIDATE_SCORE_STEP
+                and now - last_at < _CANDIDATE_LOG_SEC):
+            return
+    _last_candidate[slot] = (now, float(sig.score), passed)
+
+    try:
+        store.record_candidate(user_id, {
+            "mode": mode, "source": OWNER_SCALP if scalp else OWNER_AUTO,
+            "symbol": inst.key, "name": inst.name, "market": inst.market,
+            "price": sig.price, "price_krw": _field("price_krw"),
+            "daily_score": _field("daily_score"),
+            "intraday_score": _field("intraday_score"),
+            "news_score": _field("news_score"),
+            "nnfx_score": (_field("nnfx") or {}).get("score"),
+            "ml_score": (_field("ml") or {}).get("score"),
+            "score": sig.score, "score_wo_intraday": _field("score_wo_intraday"),
+            "entry_threshold": threshold, "passed": passed,
+            "passed_wo_intraday": passed_wo, "direction": sig.direction,
+            # 문턱은 넘었는데 방향이 관망이면 게이트(NNFX·과열·앙상블)가 막은 것입니다
+            "gated": bool(passed and sig.direction == strategy.FLAT),
+            "held": bool(held), "regime": _field("regime", ""),
+            "vol_factor": _field("vol_factor"),
+        })
+    except Exception as exc:      # 기록 실패가 매매를 멈추면 안 됩니다
+        _log_signal_error(user_id, inst.key, inst.name,
+                          f"후보 기록에 실패했습니다 ({type(exc).__name__}: {exc})")
+
+
+def _maybe_purge_candidates(user_id: int):
+    now = time.time()
+    if now - _last_candidate_purge.get(user_id, 0) < _CANDIDATE_PURGE_SEC:
+        return
+    _last_candidate_purge[user_id] = now
+    try:
+        store.purge_candidates(user_id, days=_CANDIDATE_KEEP_DAYS)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +462,10 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
     if not cfg.get("enabled") and not force:
         return {"ok": False, "skipped": "자동매매가 꺼져 있습니다."}
 
+    # 시장을 나눠 굴리는 동안 계좌 전체 종목 상한은 두 시장 상한의 합입니다
+    # (engine/allocation.global_cfg). 화면도 같은 함수를 통과시킵니다.
+    cfg = allocation.global_cfg(cfg)
+
     mode = cfg.get("mode", "paper")
     # 손실 학습 — 이번 회전이 쓸 태그별 감쇠표를 cfg **사본**에 싣습니다.
     # 신호 계산(strategy.evaluate)이 이 키(_lesson_penalties)를 보고 감쇠합니다.
@@ -412,6 +505,7 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
     # -- 0단계: 지난 회전에 낸 주문부터 정리 -------------------------------
     # 이걸 먼저 하지 않으면 "체결됐는지도 모르는 주문"이 남은 채로 새 주문을 냅니다.
     _settle_open_orders(user_id, cfg, brk, result)
+    _maybe_purge_candidates(user_id)
 
     account = brk.account()
     positions = brk.positions()
@@ -431,6 +525,9 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
                partial=bool(getattr(brk, "position_errors", [])))
     result["account"] = account
     result["day"] = day
+    # 수익률 그래프가 읽을 점 하나 (수수료·거래세를 뺀 순손익 재료)
+    sample_curve(user_id, cfg, account, positions)
+    result["markets"] = allocation.overview(cfg, account, positions)
 
     engine_risk = risk.RiskEngine(cfg, account, positions, day)
     halts = engine_risk.halt_reasons()
@@ -521,6 +618,22 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
                                     f"{query} 초단타 진입 검사 실패: {exc}",
                                     level="error", symbol=str(query))
 
+    # -- AI 에이전트 자동 분석 -------------------------------------------
+    # 회전의 **맨 끝**입니다. 분석은 백그라운드 스레드로 띄우기만 하므로 이
+    # 호출 자체는 즉시 돌아오지만, 그래도 주문이 다 나간 뒤에 둡니다 —
+    # 요금이 나가는 일이 손절보다 앞줄에 설 이유가 없습니다.
+    # 주기·종목 수·하루 요금 상한은 agent_trader 가 스스로 지킵니다.
+    try:
+        scan = agent_trader.run_scan(user_id, sorted(universe_keys(cfg)), cfg)
+        if scan.get("started"):
+            result["agent_scan"] = scan
+            store.log_event(user_id, "agent",
+                            f"AI 에이전트 분석 시작 — {', '.join(scan['started'])}",
+                            detail=scan)
+    except Exception as exc:                                     # noqa: BLE001
+        # 분석 실패가 자동매매 회전을 죽이면 안 됩니다
+        result["errors"].append(f"에이전트 분석: {type(exc).__name__}: {exc}")
+
     result["elapsed_sec"] = round(time.time() - started, 2)
     result["account"] = brk.account()
     extra = ""
@@ -550,6 +663,20 @@ def _tick(user_id: int, force: bool, started: float) -> dict:
 # 이 조회로는 영영 못 찾습니다.
 _ORDER_LOST_SEC = 86_400.0
 
+# 조회로 결말을 못 짓는 상태가 이만큼 이어지면 **버그로 간주**하고 강제로
+# 거둬들입니다 (취소 요청 → 추적 종료).
+#
+# 정상 동작에서는 여기까지 올 일이 없습니다. 주문은 접수 즉시 브로커 내역에
+# 잡히고, 늦어도 몇 분 안에 체결·미체결이 정해집니다. 몇 시간씩 "확인하지
+# 못했습니다"만 반복된다면 그건 시장 상황이 아니라 **조회 경로가 고장난
+# 것**입니다 (실측 2026-08-20: 해외 체결내역 조회가 20건만 돌려주고 정렬이
+# 정순이라, 실제로는 전량 체결된 주문 9건이 하루 종일 '확인 불가'로 남았습니다).
+#
+# 주의: 여기서 닫는 것은 **주문 추적**뿐입니다. 체결이었다면 계좌에는 그
+# 포지션이 실제로 남아 있고, 다음 회전의 재동기화(_reconcile)가 계좌 기준으로
+# 상태를 맞춥니다. 원장을 지우는 것이 아닙니다.
+_ORDER_STUCK_SEC = 6_000.0        # 100분
+
 # 취소를 거부당한 사유가 '그런 주문이 없다' 인가.
 #
 # 브로커가 주문을 모른다는 것은 그 주문이 **더 이상 살아 있지 않다**는 확정적
@@ -570,6 +697,78 @@ _CANCEL_GONE_HINTS = ("주문내역이 존재하지 않", "주문이 존재하�
 def _cancel_says_gone(error: str) -> bool:
     text = str(error or "")
     return any(hint in text for hint in _CANCEL_GONE_HINTS)
+
+
+def _stuck_sec(cfg: dict) -> float:
+    """결말을 못 짓는 주문을 강제로 거둬들일 나이(초).
+
+    설정 order_stuck_min 으로 조절합니다. 0 이하면 강제 종료를 끄고 예전처럼
+    _ORDER_LOST_SEC(24시간)까지 기다립니다.
+    """
+    raw = cfg.get("order_stuck_min", None)
+    if raw is None:
+        return _ORDER_STUCK_SEC
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        return _ORDER_STUCK_SEC
+    return minutes * 60 if minutes > 0 else _ORDER_LOST_SEC
+
+
+def _force_close_stuck(user_id: int, brk, record: dict, status, age: float,
+                       result: dict):
+    """조회로 결말이 안 나는 주문을 강제로 정리합니다.
+
+    순서가 중요합니다.
+        1. 취소를 한 번 넣어봅니다 — 정말 미체결로 살아 있었다면 여기서
+           걷힙니다. 이걸 건너뛰고 원장만 닫으면 브로커에는 주문이 그대로
+           남아 원하지 않는 가격에 체결될 수 있습니다.
+        2. 취소 응답이 '이미 체결'이면 체결로 닫습니다.
+        3. 그 밖에는 결말 미상('lost')으로 추적을 끝냅니다.
+
+    어느 경우든 **실제 보유 수량은 다음 회전의 재동기화(_reconcile)가 계좌
+    기준으로 맞춥니다.** 여기서 하는 일은 "이 주문번호를 더 이상 쫓지 않는다"
+    까지입니다.
+    """
+    label = record["name"] or record["symbol"]
+    note = ""
+    try:
+        cancel = brk.cancel(record)
+    except Exception as exc:
+        cancel = None
+        note = f"취소 시도 실패: {exc}"
+
+    if cancel is not None and cancel.ok:
+        store.update_order(
+            record["id"], status="cancelled",
+            settled_at=datetime.now().isoformat(),
+            reason=f"{age / 60:.0f}분째 상태 확인 불가 — 강제 취소")
+        store.log_event(
+            user_id, "reject",
+            f"{label} 주문 상태를 {age / 60:.0f}분째 확인하지 못해 강제로 "
+            f"취소했습니다.",
+            level="warn", symbol=record["symbol"],
+            detail={"order": record["client_order_id"], "why": status.detail})
+        result["errors"].append(f"{record['symbol']} 상태 확인 불가 — 강제 취소")
+        return
+
+    if cancel is not None and cancel.status == "filled":
+        note = "취소하려 했으나 이미 체결된 주문"
+    elif cancel is not None and not note:
+        note = cancel.error or "취소 거부"
+
+    store.update_order(
+        record["id"], status="lost",
+        settled_at=datetime.now().isoformat(),
+        reason=f"{age / 60:.0f}분째 상태 확인 불가 — 강제 종료 ({note})")
+    store.log_event(
+        user_id, "error",
+        f"{label} 주문 상태를 {age / 60:.0f}분째 확인하지 못해 추적을 "
+        f"강제 종료했습니다 ({note}). 체결 여부는 증권사 화면에서 확인하세요 — "
+        f"실제 보유 수량은 다음 회전의 재동기화가 계좌 기준으로 맞춥니다.",
+        level="error", symbol=record["symbol"],
+        detail={"order": record["client_order_id"], "why": status.detail})
+    result["errors"].append(f"{record['symbol']} 상태 확인 불가 — 강제 종료")
 
 
 def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
@@ -621,6 +820,12 @@ def _settle_open_orders(user_id: int, cfg: dict, brk, result: dict):
                     f"다음 회전의 재동기화가 계좌 기준으로 맞춥니다.",
                     level="error", symbol=record["symbol"],
                     detail={"order": record["client_order_id"], "why": status.detail})
+            # 100분 넘게 결말을 못 지으면 조회 경로가 고장난 것으로 보고
+            # 강제로 거둬들입니다 — 취소를 한 번 넣어보고, 되든 안 되든
+            # 추적은 끝냅니다. 안 그러면 has_open_order 가 그 종목의 신규
+            # 주문을 영원히 막고 오류 로그만 매 회전 쌓입니다.
+            elif age > _stuck_sec(cfg):
+                _force_close_stuck(user_id, brk, record, status, age, result)
             # 조회가 안 되는 주문이 오래 남아 있으면 사람이 봐야 합니다
             elif timeout and age > timeout * 3:
                 store.log_event(
@@ -935,14 +1140,102 @@ def _age_seconds(created_at: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 순수익률 표본 — 그래프가 읽을 점 하나
+# ---------------------------------------------------------------------------
+# 회전마다, 그리고 콘솔이 새로 그릴 때마다 한 점씩 남깁니다(30초 간격 제한은
+# storage 가 겁니다). 엔진만 남기면 자동매매를 꺼 둔 동안 곡선이 끊기고,
+# 화면만 남기면 브라우저를 닫아 둔 동안 끊깁니다.
+
+def _exit_cost_krw(position) -> float:
+    """지금 이 포지션을 전부 팔면 **더 낼** 비용 (수수료 + 거래세, 원화).
+
+    실현손익은 이미 왕복 비용을 뺀 순액이지만(_exit_realized_krw), 아직 안 판
+    종목의 평가손익에는 앞으로 낼 매도 비용이 들어 있지 않습니다. "수수료 다
+    뺀 순수익률"을 말하려면 이 몫을 빼야 합니다.
+
+    **반드시 market_value 로 계산합니다** — 두 브로커가 유일하게 같은 단위로
+    채우는 값이기 때문입니다(원화 평가금액. 파생은 명목금액). position.price 계열은
+    브로커마다 통화가 다릅니다: PaperBroker 는 current_price 에 원화를 넣고
+    (feed.price_krw), KISBroker 는 해외 잔고의 달러 가격을 그대로 넣습니다.
+    그걸 모르고 가격 × 수량으로 계산했다가, 856,348원짜리 미국 포지션의 청산
+    비용이 2,964,634원으로 잡혔습니다 — 원화 명목금액에 미국 수수료율을 곱한
+    뒤 그 결과를 달러로 보고 환율을 한 번 더 곱했기 때문입니다.
+
+    Instrument.costs 는 명목금액에 비례할 뿐 통화를 가정하지 않으므로(최소
+    수수료도 없습니다), 원화 명목금액을 넣으면 원화 비용이 그대로 나옵니다.
+
+    평가금액을 모르면 0 을 돌려줍니다 — 모르는 값을 어림해서 넣는 것보다
+    빠뜨리는 쪽이 낫습니다(빠뜨리면 수익률이 아주 조금 낙관적일 뿐이고,
+    어림하면 왜 틀렸는지 아무도 모릅니다).
+    """
+    notional_krw = abs(float(getattr(position, "market_value", 0) or 0))
+    if notional_krw <= 0:
+        return 0.0
+    inst = instruments.try_resolve(position.key)
+    if inst is None:
+        return 0.0
+    side = "buy" if str(position.side) == "short" else "sell"
+    fee, tax = inst.costs(side, notional_krw)
+    return abs(float(fee)) + abs(float(tax))
+
+
+def sample_curve(user_id: int, cfg: dict, account: dict, positions: list,
+                 min_gap_sec: float = 30.0) -> bool:
+    """전체·한국·미국 세 곡선의 표본을 한 벌 남깁니다.
+
+    비율이 아니라 원재료(실현·평가·청산비용·기준자본)를 남깁니다 — 이유는
+    storage/autotrade.py 의 at_curve 머리말에 있습니다.
+    """
+    mode = cfg.get("mode", "paper")
+    try:
+        realized = store.realized_today_by_symbol(user_id, mode)
+        rows = []
+        for scope in (allocation.ALL,) + allocation.SCOPES:
+            if scope == allocation.ALL:
+                mine = list(positions or [])
+                gained = sum(realized.values())
+                base = float((account or {}).get("total_value") or 0)
+            else:
+                mine = [p for p in (positions or [])
+                        if allocation.scope_of(p) == scope]
+                gained = sum(v for k, v in realized.items()
+                             if allocation.scope_of(k) == scope)
+                base = allocation.budget(cfg, scope, account, positions)["budget_krw"]
+            rows.append({
+                "scope": scope,
+                "base_krw": base,
+                "realized_krw": gained,
+                "unreal_krw": sum(p.unrealized_pnl or 0 for p in mine),
+                "exit_cost_krw": sum(_exit_cost_krw(p) for p in mine),
+                "equity_krw": sum(abs(p.market_value or 0) for p in mine),
+            })
+        return store.record_curve(user_id, mode, rows, min_gap_sec=min_gap_sec)
+    except Exception as exc:                      # 그래프 때문에 매매가 멈추면 안 됩니다
+        store.log_event(user_id, "error", f"수익률 표본 기록 실패: {exc}",
+                        level="warn")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 0.5단계: 실계좌 ↔ 내부 상태 재동기화
 # ---------------------------------------------------------------------------
 
-# 사용자별 마지막 유니버스 갱신 시각
+# 사용자별 마지막 AI 추적 갱신 시각 (일반 추적 — 분 단위)
 _last_universe_refresh: dict[int, float] = {}
+# 초단타 대상 갱신 시각은 **따로** 둡니다 (초 단위).
+#
+# 예전에는 둘이 같은 dict 를 썼습니다. 그래서 페니 초단타와 AI 추적을 함께
+# 켜면 초단타가 15초마다 시각을 덮어써서, AI 추적은 `지금 − 마지막` 이 갱신
+# 주기(기본 30분)를 **영원히 넘지 못했습니다.** 추적은 켜져 있는데 한 번도
+# 돌지 않고, 화면에는 "다음 갱신 30분 후"만 계속 떴습니다.
+_last_scalp_refresh: dict[int, float] = {}
 # 지금 갱신 스레드가 돌고 있는 사용자 (중복 실행 방지)
 _refreshing_users: set = set()
 _refresh_guard = threading.Lock()
+# 마지막 순환 평가의 커버 상황 (시장별 총 종목 수 · 훑은 수 · 남은 회전).
+# 누적 회전 수는 DB(at_config.scan_rounds)에 있고, 이건 **이번 한 번**의
+# 진행 상황이라 메모리로 충분합니다 — 재시작하면 다음 갱신이 다시 채웁니다.
+_last_rotation: dict[int, dict] = {}
 
 # (사용자, 종목) 별 마지막 초단타 청산 시각 — 재진입 쿨다운의 기준입니다.
 # 프로세스 메모리에만 둡니다. 재시작하면 쿨다운이 풀리지만, 재시작 자체가
@@ -951,7 +1244,10 @@ _last_scalp_exit: dict[tuple, float] = {}
 
 
 def reset_universe_timer(user_id: int):
-    """다음 sweep 에서 즉시 갱신되도록 타이머를 지웁니다 (추적 시작 직후용)."""
+    """다음 sweep 에서 즉시 갱신되도록 타이머를 지웁니다 (추적 시작 직후용).
+
+    AI 추적 타이머만 지웁니다 — 초단타는 자기 주기(초 단위)로 따로 돕니다.
+    """
     _last_universe_refresh.pop(user_id, None)
 
 
@@ -970,32 +1266,113 @@ def tracking_status(user_id: int, cfg: dict) -> dict:
                             if last else None),
         "next_in_sec": remaining,
         "period_min": period / 60,
+        # 지금까지 순환 평가가 몇 번 돌았는가 (재시작해도 이어집니다).
+        # 자동 갱신뿐 아니라 [지금 추천 받기]도 셉니다 — 손으로 돌린 것도
+        # 순환을 한 칸 밀어내기 때문입니다.
+        "rounds": int(cfg.get("scan_rounds") or 0),
+        # 마지막 회전의 커버 상황 — 시장별 {total, covered, remaining, rounds_left}
+        "rotation": _last_rotation.get(user_id) or {},
     }
 
 
-def _tracking_refresh(user_id: int):
+def _tracking_refresh(user_id: int, manual: bool = False):
     """백그라운드 추적 1회 — 시장을 훑어 추천을 다시 계산하고 매매 대상을 갱신.
 
-    매매 회전과 별도 스레드로 돕니다. 추천 계산은 30~60초가 걸리는데,
+    매매 회전과 별도 스레드로 돕니다. 추천 계산은 몇 분씩 걸리는데,
     그동안 손절 검사(회전)가 멈추면 안 되기 때문입니다.
+
+    `manual` 은 [지금 추천 받기] — 추적(auto_universe)이 꺼져 있어도 돌고,
+    꺼져 있으면 **편입은 하지 않고** 순위와 편입 후보만 저장합니다
+    (버튼의 원래 의미: 결과만 보여주고, 넣을지는 사용자가 정합니다).
+
+    **두 단계로 저장합니다.** 한국 시장을 처음 추적하면 새 팩터 계산에만
+    10분을 넘게 걸리는데, 그동안 화면이 텅 비어 "안 찾아준다"로 보였습니다 —
+    1단계(팩터 캐시만으로 순위, 몇 초)가 먼저 화면과 매매 대상을 채우고,
+    2단계(정식 순환 계산)가 끝나면 같은 자리에 덮어씁니다.
     """
     try:
         cfg = store.get_config(user_id)
-        if not cfg.get("auto_universe"):
+        if not manual and not cfg.get("auto_universe"):
             return
+        adopt = bool(cfg.get("auto_universe"))
         # 별도 스레드라 요청·회전의 오버레이가 없습니다 — 여기서 직접 장착합니다
         with _user_credentials_scope(user_id):
             brk = broker_module.get_broker(user_id, cfg.get("mode", "paper"), cfg)
-            picked = refresh_recommended_universe(user_id, cfg, brk.account())
-        # 반환만 하고 저장을 안 하면 추천 목록엔 ★편입이 찍히는데
-        # 정작 매매 대상은 그대로인 어긋난 상태가 됩니다
-        if picked != list(cfg.get("universe") or []):
-            store.save_config(user_id, {"universe": picked})
+            account = brk.account()
+            # 1단계 — 캐시 순위. 손으로 돌렸거나 아직 아무 추천도 없을 때만.
+            #  (자동 갱신의 매 주기마다 돌면 캐시 순위가 정식 순위를 계속
+            #   잠깐씩 밀어내는 깜빡임이 생깁니다)
+            if manual or not store.get_recommendations(user_id):
+                _run_refresh(user_id, cfg, account, adopt, offline_only=True)
+                cfg = store.get_config(user_id)   # 1단계가 편입을 바꿨을 수 있음
+            # 2단계 — 정식 순환 평가 (이번 몫의 팩터를 새로 계산)
+            _run_refresh(user_id, cfg, account, adopt)
     except Exception as exc:
         store.log_event(user_id, "error", f"AI 추적 갱신 실패: {exc}", level="error")
     finally:
         with _refresh_guard:
             _refreshing_users.discard(user_id)
+
+
+def _run_refresh(user_id: int, cfg: dict, account: dict, adopt: bool,
+                 offline_only: bool = False) -> list[str] | None:
+    """추천 1회 계산 → 저장 (adopt 면 매매 대상 편입까지). 후보가 없으면 None."""
+    ranked = recommend_universe(user_id, cfg, account, offline_only=offline_only)
+    if not ranked:
+        return None
+    # 정식 계산은 몇 분씩 걸립니다 — 그 사이 사용자가 설정을 바꿨을 수
+    # 있으므로 저장 직전에 **다시 읽은** 설정으로 판정합니다. 계산 시작
+    # 시점의 스냅숏으로 저장하면 (a) 계산 중에 손으로 추가한 종목을 20분
+    # 뒤에 되돌리고, (b) 계산 중에 추적을 꺼도 편입이 강행됩니다.
+    cfg = store.get_config(user_id)
+    adopt = adopt and bool(cfg.get("auto_universe"))
+    if adopt:
+        picked = apply_recommendations(user_id, cfg, ranked)
+        # 반환만 하고 저장을 안 하면 추천 목록엔 ★편입이 찍히는데
+        # 정작 매매 대상은 그대로인 어긋난 상태가 됩니다
+        if picked != list(cfg.get("universe") or []):
+            store.save_config(user_id, {"universe": picked})
+        return picked
+    # 추적이 꺼진 채 손으로 돌린 경우 — 편입 없이 순위와 편입 후보만 저장
+    threshold = float(cfg.get("auto_universe_min_score", 0.55))
+    size = int(cfg.get("auto_universe_size", 5))
+    picked = [r.key for r in ranked if r.tradable and r.score >= threshold][:size]
+    store.save_recommendations(user_id, ranked, picked)
+    return picked
+
+
+def start_recommend_refresh(user_id: int) -> bool:
+    """[지금 추천 받기] — 추천 1회를 백그라운드로 시작합니다.
+
+    예전에는 API 요청 안에서 동기로 계산했습니다. 한국 시장을 처음 훑을 때는
+    10분을 넘겨 브라우저가 타임아웃되고, 기다리다 또 누르면 같은 계산이
+    겹쳐 쌓여 서로를 더 느리게 만들었습니다. 이제 스레드로 시작만 하고,
+    화면은 GET /autotrade/recommend 를 폴링해 저장된 순위를 그립니다.
+
+    반환: 시작했으면 True, 이미 계산 중이라 건너뛰었으면 False.
+    """
+    with _refresh_guard:
+        if user_id in _refreshing_users:
+            return False
+        _refreshing_users.add(user_id)
+    # sweep 타이머도 당겨 둡니다 — 방금 손으로 돌렸는데 곧바로 자동 갱신이
+    # 겹치면 같은 계산을 두 번 하게 됩니다
+    _last_universe_refresh[user_id] = time.time()
+    try:
+        threading.Thread(target=_tracking_refresh, args=(user_id, True),
+                         daemon=True, name=f"athena-recommend-{user_id}").start()
+    except Exception:
+        # 스레드를 못 만들면 가드를 되돌려야 합니다 — 안 돌리면 이 사용자의
+        # 갱신이 프로세스 재시작까지 "이미 계산 중"으로 영구히 막힙니다
+        with _refresh_guard:
+            _refreshing_users.discard(user_id)
+        raise
+    return True
+
+
+def is_refreshing(user_id: int) -> bool:
+    """추천 계산이 지금 도는 중인가 — 화면 폴링용."""
+    return user_id in _refreshing_users
 
 
 def auto_tracking_enabled(cfg: dict) -> bool:
@@ -1027,11 +1404,11 @@ def _maybe_refresh_universe(user_id: int, cfg: dict, account: dict, result: dict
     #  개별 종목의 틱 추적은 이 주기와 무관하게 WebSocket 이 담당합니다)
     period = max(float(scalp.get("universe_refresh_sec", 15)),
                  scalping.HARD_LIMITS["min_universe_refresh_sec"])
-    last = _last_universe_refresh.get(user_id, 0)
+    last = _last_scalp_refresh.get(user_id, 0)
     if time.time() - last < period:
         return cfg
 
-    _last_universe_refresh[user_id] = time.time()
+    _last_scalp_refresh[user_id] = time.time()
     try:
         picked = refresh_scalp_universe(user_id, cfg, account)
     except Exception as exc:
@@ -1074,8 +1451,14 @@ def rotate_window(items: list, key_of, budget: int,
 
 
 def recommend_universe(user_id: int, cfg: dict, account: dict,
-                       top_n: int = None) -> list:
+                       top_n: int = None, offline_only: bool = False) -> list:
     """다중 팩터 추천기로 후보를 뽑고 순위를 매깁니다 (편입은 하지 않음).
+
+    `offline_only` 는 **캐시 전용 패스** — 새 팩터를 하나도 계산하지 않고,
+    지금까지 계산해 둔 종목만 순위에 올립니다 (스크리너 표 조회는 남는데,
+    그것도 5분 캐시가 있어 반복 호출은 빠릅니다). 첫 추적에서 정식 계산이
+    끝날 때까지 화면이 비는 몇 분을 몇 초로 메우는 용도라, 회전으로 세지
+    않고(bump 없음) 순환 로그도 남기지 않습니다.
 
     1) 시장 **전체**를 모집단으로 잡고 (국내는 KRX 상장법인목록,
        미국은 나스닥 스크리너 표 — 둘 다 한 번의 조회로 명단이 옵니다)
@@ -1088,7 +1471,10 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     from engine import recommender
 
     markets = universe_mod.normalize_segments(cfg.get("auto_universe_markets"))
-    pool = str(cfg.get("auto_universe_pool") or "")
+    # 탐색 범위는 **여러 개**를 고를 수 있습니다 (코스피200 + 나스닥100 …).
+    # 예전 설정은 문자열 하나였고, normalize_pools 가 둘 다 목록으로 풀어 줍니다.
+    pools = universe_mod.normalize_pools(cfg.get("auto_universe_pool"))
+    pool = pools[0] if len(pools) == 1 else ""      # 아래 단일 경로가 쓰는 값
     size = int(top_n or cfg.get("auto_universe_size", 5))
 
     # 팩터 계산은 종목마다 일봉을 받아야 해서 비쌉니다. 그래서 **순환 평가**:
@@ -1108,17 +1494,43 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     scan_limit = int(cfg.get("auto_universe_scan_limit")
                      or store.DEFAULT_CONFIG["auto_universe_scan_limit"])
     scan_limit = min(max(scan_limit, 10), 300)   # 한 번에 300 초과는 일봉 제공처가 차단
-    scan = screener.scan(
-        markets=markets,
-        kr_price=(1_000, 2_000_000),          # 일반 추천은 가격대를 넓게
-        us_price=(3.0, 2_000.0),
-        limit=30,                             # 한국 몫 — KIS 순위 API 의 최대치
-        us_limit=100_000,                     # 미국은 전 종목 (창은 아래서 자릅니다)
-        universe=pool,
-        # 미국만 회전율 순 — 거래대금 순은 매번 같은 대형주가 상위를 채워서,
-        # 계산 창이 늘 그 안에서만 돌았습니다. 회전율(시총 대비 손바뀜)은
-        # 오늘 실제로 움직이는 종목을 앞세웁니다. 한국은 KIS 평균거래량 순 유지.
-        us_rank_basis="turnover")
+    if offline_only:
+        scan_limit = 0                    # 계산 창 없음 — 캐시만 순위에 올립니다
+    def _scan(pool_key: str):
+        return screener.scan(
+            markets=markets,
+            kr_price=(1_000, 2_000_000),          # 일반 추천은 가격대를 넓게
+            us_price=(3.0, 2_000.0),
+            limit=30,                             # 한국 몫 — KIS 순위 API 의 최대치
+            us_limit=100_000,                     # 미국은 전 종목 (창은 아래서 자릅니다)
+            universe=pool_key,
+            # 미국만 회전율 순 — 거래대금 순은 매번 같은 대형주가 상위를 채워서,
+            # 계산 창이 늘 그 안에서만 돌았습니다. 회전율(시총 대비 손바뀜)은
+            # 오늘 실제로 움직이는 종목을 앞세웁니다. 한국은 KIS 평균거래량 순 유지.
+            us_rank_basis="turnover")
+
+    # 범위를 여러 개 골랐으면 **범위마다 한 번씩** 훑어 합집합을 만듭니다.
+    # screener.scan 은 범위 하나를 전제로 지역(한국/미국)까지 걸러내므로,
+    # 목록을 통째로 넘기는 대신 여기서 합치는 편이 그 로직을 건드리지 않습니다.
+    # 범위별 결과는 5분 캐시가 있어 회전마다 새로 조회하지도 않습니다.
+    if len(pools) <= 1:
+        scan = _scan(pool)
+    else:
+        scan = screener.ScanResult()
+        scan.segments = markets
+        scan.universe = " + ".join(pools)
+        seen_keys: set = set()
+        for key in pools:
+            part = _scan(key)
+            for candidate in part.candidates:
+                if candidate.key in seen_keys:
+                    continue          # 두 범위에 겹쳐 든 종목은 한 번만
+                seen_keys.add(candidate.key)
+                scan.candidates.append(candidate)
+            for err in part.errors:
+                if err not in scan.errors:
+                    scan.errors.append(err)
+        scan.sources = sorted({c.source for c in scan.candidates})
 
     us = [c for c in scan.candidates if c.market == "US"]
     kr = [c for c in scan.candidates if c.market != "US"]
@@ -1133,17 +1545,29 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     kr_pool: list[str] = []
     if kr_segments and cfg.get("auto_universe_full_market", True):
         seen = {c.key for c in kr}
-        pool_codes = (universe_mod.index_member_codes(pool, kr_segments) if pool
-                      else [row["key"] for row in universe_mod.kr_listed(kr_segments)])
+        if pools:
+            # 고른 범위들의 **합집합**. 미국 범위(나스닥100 등)는 여기서 빈
+            # 목록을 돌려주므로 자연히 빠집니다.
+            pool_codes: list[str] = []
+            for key in pools:
+                for code in universe_mod.index_member_codes(key, kr_segments):
+                    if code not in pool_codes:
+                        pool_codes.append(code)
+        else:
+            pool_codes = [row["key"] for row in universe_mod.kr_listed(kr_segments)]
         kr_pool = [k for k in pool_codes if k not in seen]
 
     if not scan.candidates and not kr_pool:
-        store.log_event(
-            user_id, "screen",
-            "추천할 후보를 받지 못했습니다 — " + (" / ".join(scan.errors) or "원인 불명"),
-            level="warn", detail={"errors": scan.errors})
+        # 캐시 전용 패스는 로그를 남기지 않습니다 — 바로 뒤따르는 정식 패스가
+        # 같은 스캔(짧은 캐시)을 다시 만나 같은 경고를 기록하므로, 여기서도
+        # 남기면 갱신 1회당 같은 warn 이 두 번씩 쌓입니다.
+        if not offline_only:
+            store.log_event(
+                user_id, "screen",
+                "추천할 후보를 받지 못했습니다 — " + (" / ".join(scan.errors) or "원인 불명"),
+                level="warn", detail={"errors": scan.errors})
         return []
-    if not scan.candidates:
+    if not scan.candidates and not offline_only:
         # 명단만으로도 순위는 매길 수 있지만(캐시 + 순환), 오늘 시세가 붙은
         # 상위 종목이 통째로 빠진 상태입니다. 조용히 넘어가면 안 됩니다.
         store.log_event(
@@ -1160,21 +1584,31 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
 
     # 범위를 지정했으면 "시장 전체를 다 봤다"고 말하면 안 됩니다 — 실제로 다 본
     # 것은 그 범위뿐이고, 사용자는 시장 전체를 훑었다고 오해합니다.
-    scope = "범위" if pool else "시장"
+    scope = "범위" if pools else "시장"
+
+    # 이번이 몇 번째 회전인가. 화면이 "지금까지 몇 바퀴 돌았나"를 답할 수 있어야
+    # [회전당 계산 수]를 얼마로 둘지 판단할 수 있습니다.
+    rounds = 0 if offline_only else store.bump_scan_round(user_id)
+    coverage: dict = {}
 
     def _log_rotation(label: str, total: int, fresh: int, have: int, skipped: int):
-        if total <= 0:
+        if offline_only or total <= 0:
             return
         remain = max(total - have - fresh - skipped, 0)
+        left = (remain + scan_limit - 1) // scan_limit
+        coverage[label] = {"total": total, "covered": have + fresh,
+                           "fresh": fresh, "skipped": skipped,
+                           "remaining": remain, "rounds_left": left}
         store.log_event(
             user_id, "screen",
-            f"순환 평가 — {label} {total:,}종목 중 팩터 보유 {have:,}종목, "
+            f"순환 평가 {rounds}회전 — {label} {total:,}종목 중 팩터 보유 {have:,}종목, "
             f"이번 갱신에서 {fresh}종목 새로 계산"
-            + (f" (전체까지 약 {(remain + scan_limit - 1) // scan_limit}회전 남음)"
-               if remain else f" — {scope} 전체 커버 완료")
+            + (f" (전체까지 약 {left}회전 남음)" if remain
+               else f" — {scope} 전체 커버 완료")
             + (f" · 계산 불가 {skipped:,}종목은 건너뜀" if skipped else ""),
             detail={"market": label, "total": total, "cached": have,
-                    "fresh": fresh, "skipped": skipped, "remaining": remain})
+                    "fresh": fresh, "skipped": skipped, "remaining": remain,
+                    "round": rounds})
 
     # 미국 — 스크리너 표(회전율 순) 그대로 순환
     us_window, us_extras, us_skipped = _rotate(us, lambda c: c.key, scan_limit)
@@ -1188,9 +1622,30 @@ def recommend_universe(user_id: int, cfg: dict, account: dict,
     _log_rotation("한국", len(kr) + len(kr_pool),
                   len(kr) + len(kr_window), len(kr_extras), kr_skipped)
 
-    return recommender.rank(kr + kr_window + kr_extras + us_window + us_extras,
-                            cfg, account, top_n=size * 3,
-                            stale_keys={c.key for c in us_extras} | set(kr_extras))
+    # 이번 회전의 커버 상황을 화면이 읽을 수 있게 남깁니다 (tracking_status).
+    # 로그에만 남기면 "지금 어디까지 훑었나"를 사람이 로그를 뒤져 찾아야 합니다.
+    if not offline_only:
+        _last_rotation[user_id] = {"round": rounds, "at": datetime.now().isoformat(),
+                                   "scope": scope, "pools": list(pools),
+                                   "scan_limit": scan_limit, "markets": coverage}
+
+    stale = {c.key for c in us_extras} | set(kr_extras)
+    if offline_only:
+        # 순위 후보(kr)도 캐시로만 봅니다 — 여기서 신선 계산을 시작하면
+        # 이 패스가 "몇 초"가 아니라 몇 분짜리가 됩니다
+        stale |= {c.key for c in kr}
+    ranked = recommender.rank(kr + kr_window + kr_extras + us_window + us_extras,
+                              cfg, account, top_n=size * 3, stale_keys=stale)
+    if not ranked and not offline_only:
+        # 후보는 있었는데 순위가 비었다 = 팩터 계산이 전부 실패했다는 뜻입니다.
+        # 조용히 끝나면 화면은 "새 결과가 없습니다"만 보여주고 사용자는 이유를
+        # 찾을 곳이 없습니다 (캐시 전용 패스는 캐시가 없으면 원래 비므로 제외).
+        store.log_event(
+            user_id, "screen",
+            "후보는 있었지만 순위를 내지 못했습니다 — 팩터 계산이 모두 실패했거나 "
+            "(제공처 차단·일봉 부족) 캐시가 아직 없습니다. 다음 갱신에서 다시 시도합니다.",
+            level="warn")
+    return ranked
 
 
 def refresh_recommended_universe(user_id: int, cfg: dict, account: dict) -> list[str]:
@@ -1198,10 +1653,25 @@ def refresh_recommended_universe(user_id: int, cfg: dict, account: dict) -> list
     ranked = recommend_universe(user_id, cfg, account)
     if not ranked:
         return list(cfg.get("universe") or [])
+    return apply_recommendations(user_id, cfg, ranked)
 
+
+def apply_recommendations(user_id: int, cfg: dict, ranked: list) -> list[str]:
+    """추천 순위 → 편입 목록 확정 · 저장 · 이벤트 기록 (계산과 분리).
+
+    분리한 이유: 2단계 갱신이 같은 편입 규칙을 캐시 순위(1단계)와 정식
+    순위(2단계) 양쪽에 써야 하는데, 계산까지 붙어 있으면 캐시 순위 쪽이
+    계산을 한 번 더 하게 됩니다.
+    """
     threshold = float(cfg.get("auto_universe_min_score", 0.55))
     size = int(cfg.get("auto_universe_size", 5))
     picked = [r.key for r in ranked if r.tradable and r.score >= threshold][:size]
+    # 저장(picked 표시)은 **manual 병합 전의 순수 AI 선정**만 합니다.
+    # 병합 목록을 저장하면 손으로 넣은 종목이 순위에 든 순간 picked=1 로
+    # 찍히고, 다음 갱신의 previous_auto 추정이 그걸 "AI 가 뽑았던 것"으로
+    # 읽어 수동 종목을 매매 대상에서 지웁니다 — 특히 2단계 갱신에서는
+    # 1단계가 찍은 표시를 2단계가 곧바로 읽어 한 번의 갱신 안에서 지웠습니다.
+    auto_picked = list(picked)
 
     # 손으로 넣은 종목은 지키고 싶을 수 있습니다 (기본값: 유지)
     if cfg.get("auto_universe_keep_manual", True):
@@ -1216,7 +1686,7 @@ def refresh_recommended_universe(user_id: int, cfg: dict, account: dict) -> list
             manual = [s for s in (cfg.get("universe") or []) if s not in previous_auto]
         picked = list(dict.fromkeys(manual + picked))
 
-    store.save_recommendations(user_id, ranked, picked)
+    store.save_recommendations(user_id, ranked, auto_picked)
 
     if not picked:
         store.log_event(
@@ -1612,6 +2082,19 @@ def _handle_exit(user_id: int, cfg: dict, brk, engine_risk, position,
     decision = strategy.check_exit(inst, position, sig, exit_cfg, state,
                                    protective_only=fast,
                                    defer_take_profit=split_on)
+
+    # AI 에이전트 청산 표 (engine/agent_trader.py). 손절·익절·트레일링 규칙을
+    # **대체하지 않고** 사유를 하나 더합니다 — 위에서 이미 나가기로 정했다면
+    # 그 사유를 덮어쓰지 않습니다(무엇 때문에 팔았는지가 기록의 전부입니다).
+    #
+    # 빠른 회전(fast)에서는 보지 않습니다. 그 경로는 가격 배리어만 재는
+    # 자리이고, 여기에 판단 조회를 끼우면 손절이 그만큼 늦어집니다.
+    if not fast and not decision.should_exit:
+        vote = agent_trader.exit_vote(user_id, cfg, inst.key)
+        if vote:
+            decision.should_exit = True
+            decision.reason = vote
+
     if not decision.should_exit:
         if split_on and not fast:
             _handle_split(user_id, cfg, brk, engine_risk, inst, position, state,
@@ -2171,6 +2654,30 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
     if inst.key in held and not cfg.get("allow_pyramiding"):
         return
 
+    # -- 시장 분리 (engine/allocation.py) ---------------------------------
+    # 한국·미국은 각자의 예산과 상한을 갖습니다. **신호를 계산하기 전에** 봅니다
+    # — 배분을 다 쓴 시장의 지표를 회전마다 계산해봐야 어차피 못 삽니다.
+    #
+    # 초단타에는 예산·상한 게이트를 적용하지 않습니다. 초단타는 engine/scalping.py
+    # 가 자기 예산(scalp_budget)으로 수량을 정하는 별도 지갑이라, 여기서 또 자르면
+    # 두 예산이 서로를 깎습니다. 다만 **시장 스위치**는 초단타에도 적용합니다 —
+    # 미국을 꺼 두었는데 초단타가 미국 페니를 사면 끈 사람이 이해할 수 없습니다.
+    scope = allocation.scope_of(inst)
+    if scalp:
+        blocked = ("" if allocation.market_on(cfg, scope)
+                   else f"{allocation.label(scope)} 자동매매가 꺼져 있습니다.")
+    else:
+        blocked = allocation.gate(cfg, scope, engine_risk.account,
+                                  engine_risk.positions, key=inst.key)
+    if blocked:
+        result["rejects"].append({"symbol": inst.key, "action": "entry",
+                                  "reasons": [blocked]})
+        # 이벤트 로그에는 남기지 않습니다 — 상한에 닿아 있는 동안 회전마다 같은
+        # 줄이 쌓입니다. 회전 결과의 rejects 와 화면의 시장 카드로 보입니다.
+        if scalp:
+            mark_scalp_phase(user_id, inst.key, WATCH, name=inst.name, note=blocked)
+        return
+
     # 장이 닫혀 있으면 **여기서 끝냅니다** — 시세도 지표도 계산하지 않습니다.
     # 예전에는 신호를 다 만든 뒤 주문 직전에야 리스크 게이트가 거부했습니다.
     # 그래서 미국장 시간(새벽)마다 한국 종목의 지표·ML 을 회전마다 계산해서
@@ -2226,6 +2733,22 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
 
     quote = feed.quote(inst)
 
+    # 추격 재매수 차단 — 방금 판 가격보다 크게 오른 자리에서는 되사지 않습니다.
+    # 잠금(위)과 달리 **현재가를 봐야** 판정할 수 있어서 시세를 받은 뒤에 봅니다.
+    #
+    # 초단타는 제외합니다. 초단타의 기대 보유 시간은 분 단위고 재진입 쿨다운도
+    # 초 단위라, 하루짜리 매도가 기준선을 씌우면 첫 청산 한 번으로 그 종목의
+    # 초단타가 사실상 끝납니다. 초단타의 되사기는 engine/scalping.py 의
+    # reentry_cooldown_sec 가 자기 시간 척도로 막습니다.
+    if not scalp and locks is not None and quote:
+        why = locks.chase_reason(inst.key, quote.get("price"))
+        if why:
+            result["rejects"].append({"symbol": inst.key, "action": "entry",
+                                      "reasons": [why]})
+            # 이벤트 로그에는 남기지 않습니다 — 문턱이 유지되는 동안 회전마다
+            # 같은 줄이 쌓입니다. 회전 결과의 rejects 로만 보입니다.
+            return
+
     # 초단타 목록에서 온 종목만 틱 기반 경로를 탑니다
     entry_cfg, sig, scalp_plan = cfg, None, None
     if scalp:
@@ -2241,18 +2764,39 @@ def _handle_entry(user_id: int, cfg: dict, brk, engine_risk, query: str,
 
     if sig is None:
         sig = strategy.evaluate(inst, cfg, quote=quote)
+
+    # AI 에이전트 오버레이 (engine/agent_trader.py) — **점수만** 고칩니다.
+    # 아래에 남아 있는 방어는 하나도 건너뛰지 않습니다: 수량 계획(plan_entry),
+    # 리스크 게이트(check_entry), 중복 주문(order_exists), 킬 스위치, 시장 배분.
+    # 에이전트용 주문 경로를 따로 내지 않는 이유가 이것입니다 — 새 경로는
+    # 이 열 겹을 통째로 우회합니다.
+    #
+    # 초단타는 제외합니다. 에이전트 판단은 시간 단위로 갱신되는데 초단타의
+    # 기대 보유 시간은 분 단위라, 판단이 도착하는 순간 이미 낡았습니다.
+    if not scalp and sig.ok:
+        sig = agent_trader.apply_overlay(user_id, cfg, inst, sig)
+
     if not sig.ok:
         result["errors"].append(f"{inst.name}: {sig.error}")
         _log_signal_error(user_id, inst.key, inst.name, sig.error)
         return
 
     result["signals"].append({**sig.to_dict(), "held": inst.key in held})
+    _record_candidate(user_id, cfg, inst, sig, inst.key in held, scalp=scalp)
 
     if sig.direction == strategy.FLAT:
         return
 
-    cfg = entry_cfg
-    account = engine_risk.account
+    # 이 시장의 설정과 이 시장의 지갑으로 수량을 정합니다. 총자산 자리에 시장
+    # 예산이 들어가므로 plan_entry 의 세 한도(1회 위험 예산 · 종목당 비중 ·
+    # 주문가능금액)가 한꺼번에 그 시장 몫으로 줄어듭니다.
+    #
+    # 초단타는 제외합니다 — 수량을 자기 예산으로 이미 정했고(scalp_plan),
+    # 여기서 또 시장 예산으로 자르면 두 예산이 서로를 깎습니다.
+    cfg = entry_cfg if scalp else allocation.market_cfg(entry_cfg, scope)
+    account = (engine_risk.account if scalp else
+               allocation.scoped_account(cfg, scope, engine_risk.account,
+                                         engine_risk.positions))
     if scalp_plan is not None:
         # 초단타는 수량을 예산으로 정합니다 (비중·리스크 예산 기반이 아님).
         # plan_entry 를 태우면 position_pct 로 다시 잘려서 소액에서 0주가 됩니다.
@@ -2903,6 +3447,7 @@ def _record(user_id: int, cfg: dict, inst: Instrument, order, reason: str,
         "filled_quantity": order.filled_quantity,
         "avg_fill_price": order.avg_fill_price,
         "slippage_bps": order.slippage_bps,
+        "venue": order.venue,
     })
 
 
@@ -3097,8 +3642,14 @@ class EngineLoop:
                     continue          # 이전 갱신이 아직 도는 중
                 _refreshing_users.add(user_id)
             _last_universe_refresh[user_id] = time.time()
-            threading.Thread(target=_tracking_refresh, args=(user_id,),
-                             daemon=True, name=f"athena-track-{user_id}").start()
+            try:
+                threading.Thread(target=_tracking_refresh, args=(user_id,),
+                                 daemon=True, name=f"athena-track-{user_id}").start()
+            except Exception as exc:
+                with _refresh_guard:
+                    _refreshing_users.discard(user_id)
+                store.log_event(user_id, "error",
+                                f"AI 추적 스레드 시작 실패: {exc}", level="error")
 
     def status(self) -> dict:
         return {
@@ -3676,13 +4227,22 @@ def _run_backtest(inst: Instrument, bars, cfg: dict, initial_cash: float) -> dic
                             "entry_fee": fee, "entry_tax": tax,
                             "entry_cost": fee + tax,
                             "borrow_cost": 0.0, "last_accrued": bar_date,
+                            # 승자 보유로 이 봉의 목표가 익절을 건너뛸지.
+                            # 아래 ③ 이 지난 봉 종가 신호로 정해 둡니다 —
+                            # 라이브와 같은 인과(종가로 판단, 다음 봉에 적용).
+                            "skip_target": False,
                         }
 
         # -- ② 봉 안에서의 손절·익절 (같은 봉에 진입했어도 판정합니다) -----
         if position:
+            # 승자 보유(hold_winners)가 켜져 있고 지난 봉 종가에 추세가 살아
+            # 있었으면 **목표가만** 빼고 판정합니다. 이 줄이 없으면 봉 안 익절이
+            # check_exit 의 보류 게이트보다 먼저 팔아버려서, hold_winners 가
+            # 백테스트에서만 효과 0으로 나옵니다.
             protective = fills.protective_fill(
                 inst, row, position["side"], position["stop"],
-                position["target"], slippage, prev_close, i, day)
+                None if position.get("skip_target") else position["target"],
+                slippage, prev_close, i, day)
             if protective:
                 label = {fills.STOP: "손절 도달",
                          fills.TARGET: "목표가 도달",
@@ -3710,6 +4270,12 @@ def _run_backtest(inst: Instrument, bars, cfg: dict, initial_cash: float) -> dic
             state = {"entry_price": position["entry"], "stop_price": position["stop"],
                      "target_price": position["target"], "peak_price": position["peak"],
                      "opened_at": position["opened_at"]}
+            # 다음 봉의 ② 가 목표가를 볼지 말지 — check_exit 과 같은 함수로
+            # 정합니다 (engine/strategy.hold_winner).
+            position["skip_target"] = strategy.hold_winner(
+                price, sig, cfg, state,
+                1 if position["side"] == strategy.LONG else -1)
+
             # 손절·익절은 ②가 이미 봉 안에서 처리했습니다. 여기서 보는 것은
             # 신호 반전·보유기간 초과처럼 **종가로만 알 수 있는** 사유입니다.
             decision = strategy.check_exit(inst, fake, sig, cfg, state,

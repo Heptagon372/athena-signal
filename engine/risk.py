@@ -46,11 +46,50 @@ class RiskVerdict:
                 "rejects": self.rejects, "halt": self.halt}
 
 
+@dataclass
+class ReservedPosition:
+    """이번 회전에서 **방금 승인한** 주문. 잔고에는 아직 없지만 한도는 이미 씁니다.
+
+    브로커 잔고(engine/broker.Position)와 같은 이름의 필드를 갖습니다 — 보유
+    수·노출·시장별 예산을 세는 쪽이 진짜 포지션과 구분 없이 셀 수 있어야
+    합니다. `reserved` 로만 구분됩니다(진단용).
+    """
+    key: str
+    name: str = ""
+    market: str = ""
+    asset_class: str = STOCK
+    side: str = "long"
+    quantity: float = 0.0
+    avg_price: float = 0.0
+    multiplier: float = 1.0
+    current_price: float | None = None
+    market_value: float = 0.0
+    unrealized_pnl: float = 0.0
+    margin: float = 0.0
+    opened_at: str = ""
+    reserved: bool = True
+
+
 class RiskEngine:
     """한 번의 자동매매 회전 동안 쓰이는 리스크 판단 컨텍스트.
 
-    계좌·포지션 스냅샷을 생성 시점에 고정합니다. 회전 중간에 값이 바뀌면
-    "같은 회전에서 앞 종목은 통과, 뒤 종목은 거부" 같은 비결정적 동작이 나옵니다.
+    계좌·포지션 스냅샷을 생성 시점에 고정합니다. 회전 중간에 브로커 잔고를
+    다시 읽으면 "같은 회전에서 앞 종목은 통과, 뒤 종목은 거부" 같은
+    비결정적 동작이 나옵니다.
+
+    **다만 이 엔진이 스스로 승인한 주문은 즉시 반영합니다.** 스냅샷만 고정하고
+    자기가 낸 승인을 세지 않으면 한도가 종목 수만큼 곱해집니다. 실계좌에서
+    실제로 이렇게 됐습니다.
+
+        미국 상한 4종목 · 이미 3종목 보유 상태에서, 한 회전에 후보 4개가
+        9초 사이에 전부 통과해 7종목이 됐습니다. 넷 다 "아직 3종목이니까
+        한 자리 남았다"는 **같은 스냅샷**을 봤기 때문입니다.
+        배분 예산 297,896원에 456,193원어치가 들어간 것도 같은 이유입니다.
+
+    그래서 `check_entry` 는 승인하는 순간 그 주문을 포지션 목록에 넣고
+    주문가능금액에서 뺍니다(`_reserve`). 승인 뒤 주문이 거부되면 그 회전 동안은
+    한도를 조금 보수적으로 보게 되는데, 그 방향이 안전합니다 — 다음 회전에
+    브로커 잔고로 다시 시작합니다.
     """
 
     def __init__(self, cfg: dict, account: dict, positions: list, day: dict = None):
@@ -58,6 +97,27 @@ class RiskEngine:
         self.account = account or {}
         self.positions = positions or []
         self.day = day or {}
+
+    # -- 승인한 주문을 이번 회전 스냅샷에 반영 -----------------------------
+    def _reserve(self, inst: Instrument, side: str, quantity: float,
+                 price_krw: float):
+        """방금 승인한 주문만큼 보유·현금을 미리 깎습니다.
+
+        account 를 **새 dict 로 갈아끼웁니다** — 원본은 회전 결과(result)와
+        화면이 같이 들고 있어서, 그 자리에서 고치면 화면의 주문가능금액이
+        주문을 낼 때마다 줄어드는 것처럼 보입니다.
+        """
+        notional = inst.notional(price_krw, quantity)
+        margin = inst.margin_required(price_krw, quantity, side)
+        self.positions = list(self.positions) + [ReservedPosition(
+            key=inst.key, name=inst.name, market=inst.market,
+            asset_class=inst.asset_class,
+            side=("short" if side == "sell" else "long"),
+            quantity=quantity, avg_price=price_krw, multiplier=inst.multiplier,
+            current_price=price_krw, market_value=notional, margin=margin)]
+        cash = float(self.account.get("available_cash") or 0)
+        self.account = {**self.account,
+                        "available_cash": max(cash - margin, 0.0)}
 
     # -- 계좌 차단 --------------------------------------------------------
     def halt_reasons(self) -> list[str]:
@@ -147,6 +207,18 @@ class RiskEngine:
             verdict.rejects.append(f"시세가 {age:.0f}초 지났습니다 (허용 {max_age:.0f}초)")
             return verdict
 
+        # 3-1) 주간거래 구간에서는 **주간 시세로 확인된 가격**이라야 합니다.
+        # 위 신선도 검사는 '캐시에 담긴 지 몇 초'를 재기 때문에 이걸 못 잡습니다 —
+        # 주간거래 시간에 Yahoo 가 돌려주는 몇 시간 전 정규장 종가도 방금
+        # 받아왔으면 age_sec 이 0 입니다. 그 가격으로 ATS 에 지정가를 걸면
+        # 시장과 동떨어진 주문이 됩니다.
+        if (_session == "DAY" and inst.market == "US"
+                and (quote or {}).get("price_session") != "DAY"):
+            verdict.rejects.append(
+                "주간거래 시세를 받지 못했습니다 "
+                "(정규장 종가로는 주문하지 않습니다 — KIS 키·주간거래 신청 확인).")
+            return verdict
+
         # 4) 만기 임박 파생 — 진입하자마자 청산해야 하는 포지션은 만들지 않습니다
         if inst.asset_class in (FUTURES, OPTION):
             days = feed.days_to_expiry(inst)
@@ -156,7 +228,7 @@ class RiskEngine:
                 return verdict
 
         # 5) 보유 종목 수
-        max_positions = int(cfg.get("max_positions", 5))
+        max_positions = int(cfg.get("max_positions", 1))
         holding_keys = {p.key for p in self.positions}
         if inst.key not in holding_keys and len(holding_keys) >= max_positions:
             verdict.rejects.append(f"보유 종목 수 상한 {max_positions}개에 도달했습니다.")
@@ -229,6 +301,8 @@ class RiskEngine:
 
         verdict.quantity = quantity
         verdict.approved = True
+        # 이 회전에서 뒤에 오는 종목이 이 주문을 보게 합니다 (위 머리말 참고)
+        self._reserve(inst, side, quantity, price_krw)
         return verdict
 
     def _cap(self, verdict: RiskVerdict, quantity: float, unit_cost: float,
@@ -246,14 +320,27 @@ class RiskEngine:
     def _regular_only(self, inst: Instrument) -> bool:
         """이 종목에 '정규장만' 제한을 적용할 것인가.
 
-        미국 종목은 us_extended_hours 로 프리·애프터마켓을 따로 열 수 있습니다.
-        한국 시간외와 스위치를 분리한 이유: 한국 시간외 단일가(10분 단위 ±10%)와
-        미국 확장 시간(연속 체결)은 성격이 달라 한 스위치로 묶으면 안 됩니다.
+        미국 종목은 두 개의 스위치로 정규장 밖을 따로 엽니다.
+            us_extended_hours  프리·애프터마켓 (나스닥·NYSE 정규 거래소의 연장)
+            us_day_session     주간거래(데이마켓, 한국 낮) — FINRA 승인 ATS
+        한국 시간외와도, 서로끼리도 스위치를 분리한 이유: 한국 시간외 단일가
+        (10분 단위 ±10%), 미국 확장시간(연속 체결), 주간거래(ATS·얇은 호가)는
+        체결 성격이 전부 달라 한 스위치로 묶으면 안 됩니다.
+
+        **지금 열려 있는 세션에만** 제한을 풉니다. 예전에는 확장시간 스위치
+        하나가 켜지면 미국 종목의 '정규장만'을 통째로 껐습니다 — 애프터마켓만
+        하려던 설정이 주간거래까지 열어버립니다.
         """
         regular_only = bool(self.cfg.get("regular_session_only", True))
-        if regular_only and inst.market == "US" and self.cfg.get("us_extended_hours"):
+        if not regular_only or inst.market != "US":
+            return regular_only
+
+        session = feed.market_status(inst).get("session", "")
+        if session == "DAY" and self.cfg.get("us_day_session"):
             return False
-        return regular_only
+        if session in ("PRE", "AFTER") and self.cfg.get("us_extended_hours"):
+            return False
+        return True
 
     # -- 청산 검증 --------------------------------------------------------
     def check_exit(self, inst: Instrument, quote: dict, urgent: bool = False) -> RiskVerdict:
@@ -279,7 +366,7 @@ def describe_limits(cfg: dict) -> list[dict]:
     """현재 설정된 한도를 화면에 그대로 보여주기 위한 요약."""
     return [
         {"key": "max_positions", "label": "최대 보유 종목",
-         "value": f"{cfg.get('max_positions', 5)}개"},
+         "value": f"{cfg.get('max_positions', 1)}개"},
         {"key": "position_pct", "label": "종목당 최대 비중",
          "value": f"{cfg.get('position_pct', 20)}%"},
         {"key": "risk_per_trade_pct", "label": "1회 위험 예산",
@@ -298,6 +385,8 @@ def describe_limits(cfg: dict) -> list[dict]:
          "value": "예" if cfg.get("regular_session_only", True) else "아니오"},
         {"key": "us_extended_hours", "label": "미국 프리·애프터마켓",
          "value": "허용" if cfg.get("us_extended_hours") else "차단"},
+        {"key": "us_day_session", "label": "미국 주간거래 (데이마켓)",
+         "value": "허용" if cfg.get("us_day_session") else "차단"},
         {"key": "min_one_unit", "label": "최소 1주 허용 (소액 계좌)",
          "value": "예" if cfg.get("min_one_unit") else "아니오"},
         {"key": "us_order_funding", "label": "미국 주문 재원",

@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>아테나 시그널 AI 에이전트</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="/static/at_common.css">
+<style>
+/* 판단 카드 — 종목 하나가 한 줄입니다. 판단·확신도·시각이 한눈에 읽히고,
+   근거는 펼쳐야 나옵니다. LLM 리포트를 다 펼쳐두면 화면이 글자벽이 됩니다. */
+.verdict{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;
+  border-radius:999px;font-weight:800;font-size:16px}
+.verdict.buy{background:color-mix(in srgb,var(--up) 14%,transparent);color:var(--up)}
+.verdict.sell{background:color-mix(in srgb,var(--down) 14%,transparent);color:var(--down)}
+.verdict.hold{background:var(--raised);color:var(--muted)}
+
+/* 확신도 막대 — 숫자만 있으면 0.62 가 높은지 낮은지 읽히지 않습니다 */
+.conf{display:inline-block;width:74px;height:8px;border-radius:999px;
+  background:var(--raised);overflow:hidden;vertical-align:middle}
+.conf i{display:block;height:100%;background:var(--gold)}
+
+/* 접기 펼치기 — 단계별 리포트 */
+details.stage{border:1px solid var(--line);border-radius:var(--radius-sm);
+  margin-top:8px;background:var(--raised)}
+details.stage>summary{cursor:pointer;padding:10px 14px;font-weight:700;
+  font-size:16.5px;display:flex;align-items:center;gap:10px;list-style:none}
+details.stage>summary::-webkit-details-marker{display:none}
+details.stage>summary::before{content:"+";color:var(--muted);font-weight:700}
+details.stage[open]>summary::before{content:"−"}
+details.stage .body{padding:2px 16px 14px;font-size:16px;line-height:1.75}
+details.stage ul{margin:6px 0 0;padding-left:20px}
+details.stage li{margin:3px 0}
+.roleline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+  font-size:15px;color:var(--muted)}
+.groupname{font-size:19px;font-weight:800;margin:16px 0 2px}
+.evbox{font-size:14.5px;color:var(--muted);white-space:pre-wrap;
+  max-height:340px;overflow:auto;background:var(--panel);padding:10px 12px;
+  border-radius:var(--radius-sm);border:1px solid var(--line)}
+.rowlink{cursor:pointer}
+.rowlink:hover{background:var(--raised)}
+
+/* main 은 그리드입니다. 그리드 자식의 min-width 기본값이 auto 라서, 안에 든
+   표가 좁은 화면보다 넓으면 트랙이 같이 늘어나 **페이지 전체**에 가로
+   스크롤이 생깁니다 (표 상자만 스크롤되는 것이 아닙니다). 0 으로 낮춰
+   넓은 표가 자기 상자 안에서만 스크롤하게 합니다.
+   이 화면의 판단 표는 열이 여덟 개라 휴대폰에서 반드시 걸립니다. */
+main>section,main>.grid,main>.warnbox{min-width:0}
+.grid.two>section{min-width:0}
+.scroll-x{max-width:100%}
+.progress{height:6px;border-radius:999px;background:var(--raised);overflow:hidden}
+.progress i{display:block;height:100%;background:var(--olive);transition:width .3s}
+</style>
+</head>
+<body>
+<main>
+
+  <div class="warnbox" id="disclaimer">
+    <b>연구 참고용이며 투자자문이 아닙니다.</b>
+    이 화면의 판단은 LLM 이 생성한 의견입니다. 글이 매끄럽다는 것과 맞다는 것은
+    다릅니다. 성적표(아래 전진 검증)가 쌓이기 전까지는 근거가 없는 의견으로
+    보셔야 합니다. 투자 판단과 그 결과는 본인 책임입니다.
+  </div>
+
+  <section>
+    <h2>준비 상태 <span class="sub" id="readySub"></span></h2>
+    <div class="note" id="readyNote"></div>
+    <div class="stat" style="margin-top:10px">
+      <div class="box"><div class="k">사용 모델</div><div class="v" id="stModel">-</div></div>
+      <div class="box"><div class="k">분석 1회당 평균</div><div class="v" id="stAvg">-</div></div>
+      <div class="box"><div class="k">최근 30일 비용</div><div class="v" id="stCost">-</div></div>
+      <div class="box"><div class="k">최근 30일 분석</div><div class="v" id="stCount">-</div></div>
+    </div>
+    <div class="note" style="margin-top:8px">
+      비용은 토큰 사용량에 공식 요금표를 곱한 <b>추정치</b>입니다. 실제 청구액은
+      앤트로픽 콘솔의 사용량을 보셔야 합니다. 같은 증거 팩을 에이전트 11명이
+      나눠 보므로 두 번째 호출부터는 캐시가 걸려 입력 비용이 크게 줄어듭니다.
+    </div>
+  </section>
+
+  <section>
+    <h2>지금 분석하기 <span class="sub">호출 한 번에 요금이 나갑니다</span></h2>
+    <div class="row">
+      <input id="symInput" placeholder="종목명, 코드, 티커 (삼성전자 / 005930 / AAPL)"
+             style="flex:1;min-width:240px">
+      <button id="btnAnalyze" class="primary">분석 시작</button>
+      <button id="btnResolve" class="sm" title="만기가 지난 판단을 지금 채점합니다">지금 채점</button>
+    </div>
+    <div class="tagrow" id="uniTags"></div>
+    <div id="jobBox" style="margin-top:12px"></div>
+  </section>
+
+  <section>
+    <h2>최근 판단 <span class="sub" id="latestSub"></span></h2>
+    <div class="scroll-x"><table id="latestTable">
+      <thead><tr>
+        <th>종목</th><th>판단</th><th>확신도</th><th>유효 기간</th>
+        <th>판단 시각</th><th class="num">비용</th><th>모델</th><th>채점</th>
+      </tr></thead>
+      <tbody id="latestBody"></tbody>
+    </table></div>
+    <div class="note" id="latestEmpty" style="margin-top:8px"></div>
+  </section>
+
+  <section id="reportSection" class="hide">
+    <h2>판단 근거 <span class="sub" id="reportSub"></span></h2>
+    <div id="reportBox"></div>
+  </section>
+
+  <div class="grid two">
+    <section>
+      <h2>집행 설정 <span class="sub">판단을 매매에 얼마나 반영할지</span></h2>
+      <div class="field">
+        <label>집행 강도</label>
+        <select id="cfg_exec_mode"></select>
+      </div>
+      <div class="note" id="execNote"></div>
+      <div class="split" style="margin-top:10px">
+        <div class="field"><label>점수 반영 무게</label>
+          <input id="cfg_overlay_weight" type="number" step="0.05"
+                 title="확신도 1.0 의 매수 판단이 신호 점수를 이만큼 올립니다. 점수 범위는 -1 에서 +1, 기본 진입 문턱은 0.35 근처입니다"></div>
+        <div class="field"><label>최소 확신도</label>
+          <input id="cfg_min_confidence" type="number" step="0.05"
+                 title="이 아래 확신도의 판단은 없는 것으로 봅니다"></div>
+        <div class="field"><label>판단 유효 시간</label>
+          <input id="cfg_max_age_hours" type="number" step="1"
+                 title="이보다 오래된 판단은 매매에 쓰지 않습니다"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="cfg_veto_on_sell">
+        매도 판단이면 신규 진입을 막습니다</label>
+      <label class="chk"><input type="checkbox" id="cfg_exit_on_sell">
+        매도 판단이면 보유 종목도 정리합니다</label>
+      <label class="chk"><input type="checkbox" id="cfg_require_gate">
+        검증 게이트를 통과해야 매매에 반영합니다</label>
+
+      <h2 style="margin-top:18px">자동 분석 <span class="sub">에이전트가 스스로 훑습니다</span></h2>
+      <label class="chk"><input type="checkbox" id="cfg_auto_scan">
+        자동매매 회전마다 매매 대상을 순환 분석합니다</label>
+      <div class="split">
+        <div class="field"><label>분석 주기(분)</label>
+          <input id="cfg_scan_interval_min" type="number" step="10"></div>
+        <div class="field"><label>회전당 종목 수</label>
+          <input id="cfg_scan_limit" type="number" step="1"></div>
+        <div class="field"><label>하루 요금 상한(달러)</label>
+          <input id="cfg_daily_cost_cap_usd" type="number" step="0.5"></div>
+      </div>
+
+      <h2 style="margin-top:18px">분석 방식</h2>
+      <div class="split">
+        <div class="field"><label>모델</label><select id="cfg_model"></select></div>
+        <div class="field"><label>토론 라운드</label>
+          <input id="cfg_debate_rounds" type="number" step="1"
+                 title="강세 약세 연구원이 몇 번 주고받을지. 라운드마다 호출 2회가 늘어납니다"></div>
+        <div class="field"><label>노력 수준</label><select id="cfg_effort"></select></div>
+        <div class="field"><label>최종 판단 노력</label><select id="cfg_final_effort"></select></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="cfg_include_news"> 뉴스를 증거에 포함</label>
+      <label class="chk"><input type="checkbox" id="cfg_include_community"> 커뮤니티 여론을 증거에 포함</label>
+      <div class="row" style="margin-top:10px">
+        <button id="btnSaveCfg" class="primary">저장</button>
+        <span class="note" id="cfgSaved"></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>검증 게이트 <span class="sub" id="gateSub"></span></h2>
+      <div id="gateBox"></div>
+      <div class="note" style="margin-top:8px">
+        이 게이트는 <b>전진 검증</b>만 봅니다. 판단을 낼 때 그 시점 가격과 채점
+        만기를 박아두고, 만기가 지난 뒤 그때의 실제 가격으로만 채점합니다.
+        과거로 되돌려 LLM 을 다시 돌리는 백테스트는 하지 않습니다, 뉴스 크롤러가
+        지금 시점의 글을 주기 때문에 미래를 보고 찍는 것이 됩니다.
+      </div>
+
+      <h2 style="margin-top:18px">전진 검증 성적 <span class="sub" id="cardSub"></span></h2>
+      <div class="stat">
+        <div class="box"><div class="k">채점 건수</div><div class="v" id="scN">-</div></div>
+        <div class="box"><div class="k">적중률</div><div class="v" id="scHit">-</div></div>
+        <div class="box"><div class="k">평균 수익률</div><div class="v" id="scAvg">-</div></div>
+        <div class="box"><div class="k">t 통계</div><div class="v" id="scT">-</div></div>
+      </div>
+      <div class="scroll-x" style="margin-top:10px"><table>
+        <thead><tr><th>판단</th><th class="num">건수</th><th class="num">적중률</th>
+          <th class="num">평균 수익률</th></tr></thead>
+        <tbody id="scBody"></tbody>
+      </table></div>
+      <div class="note" id="scNote" style="margin-top:8px"></div>
+
+      <h2 style="margin-top:18px">룰 층 과거 검증 <span class="sub">에이전트를 끈 상태</span></h2>
+      <div class="row">
+        <input id="btSym" placeholder="종목 (삼성전자 / AAPL)" style="flex:1;min-width:180px">
+        <input id="btDays" type="number" value="250" style="width:110px" title="검증 기간(거래일)">
+        <button id="btnBacktest">돌리기</button>
+      </div>
+      <div class="note" style="margin-top:6px">
+        기존 백테스트 하네스를 그대로 씁니다, 복권 검정과 DSR, CPCV 가 함께
+        돌아갑니다. 룰 층 성적이 바닥이라면 그 위에 무엇을 얹어도 소용없습니다.
+      </div>
+      <div id="btBox" style="margin-top:10px"></div>
+    </section>
+  </div>
+
+</main>
+
+<script>
+window.PAGE = {
+  nav: "agents",
+  title: "AI 에이전트",
+  desc: "역할이 다른 LLM 에이전트들이 토론해 매수 매도 보유를 정합니다. 연구 참고용입니다.",
+
+  status: null,
+  timer: null,
+
+  init() {
+    AT.$("btnAnalyze").onclick = () => this.analyze();
+    AT.$("btnResolve").onclick = () => this.resolveNow();
+    AT.$("btnSaveCfg").onclick = () => this.saveConfig();
+    AT.$("btnBacktest").onclick = () => this.backtest();
+    AT.$("symInput").onkeydown = (e) => { if (e.key === "Enter") this.analyze(); };
+    AT.$("cfg_exec_mode").onchange = () => this.renderExecNote();
+    this.load();
+    this.loadScorecard();
+  },
+
+  onSnapshot() {},
+
+  // ---- 상태 ----
+  async load() {
+    try {
+      const d = await AT.call("/agents/status");
+      this.status = d;
+      this.renderReady(d);
+      this.renderConfig(d);
+      this.renderUniverse(d);
+      this.renderJobs(d);
+      this.renderLatest(d);
+      this.renderGate(d);
+      this.schedule(d);
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  // 진행 중인 작업이 있으면 자주, 없으면 느리게 봅니다.
+  // LLM 분석은 수 분이 걸리므로, 끝날 때까지 화면이 멈춰 보이면 안 됩니다.
+  schedule(d) {
+    clearTimeout(this.timer);
+    const busy = (d.jobs || []).some((j) => j.state === "running");
+    this.timer = setTimeout(() => this.load(), busy ? 4000 : 30000);
+  },
+
+  renderReady(d) {
+    const r = d.readiness || {};
+    const badge = r.ready
+      ? '<span class="pill on"><span class="dot"></span><span>준비됨</span></span>'
+      : '<span class="pill halt"><span class="dot"></span><span>사용 불가</span></span>';
+    AT.$("readySub").innerHTML = badge;
+    AT.$("readyNote").innerHTML = r.ready
+      ? "앤트로픽 API 키가 설정돼 있습니다. 분석을 시작할 수 있습니다."
+      : `<b>${AT.esc(r.reason || "")}</b><br>키는 <code>api_keys.json</code> 의
+         <code>ANTHROPIC_API_KEY</code> 에 넣거나, 계정 설정의 내 API 키에
+         저장하면 그 계정에서만 쓰입니다.`;
+
+    const cost = d.cost || {};
+    const spec = (d.models || {})[(d.config || {}).model] || {};
+    AT.$("stModel").textContent = spec.label || (d.config || {}).model || "-";
+    AT.$("stAvg").textContent = cost.count
+      ? "$" + cost.avg_usd.toFixed(3) : "-";
+    AT.$("stCost").textContent = "$" + (cost.cost_usd || 0).toFixed(2);
+    AT.$("stCount").textContent = (cost.count || 0) + "건";
+  },
+
+  renderUniverse(d) {
+    const box = AT.$("uniTags");
+    const uni = d.universe || [];
+    if (!uni.length) { box.innerHTML = ""; return; }
+    box.innerHTML = '<span class="note" style="margin:0">매매 대상에서 고르기</span>'
+      + uni.map((s) => `<span class="tag pick" data-sym="${AT.esc(s)}">${AT.esc(s)}</span>`).join("");
+    box.querySelectorAll(".pick").forEach((el) => {
+      el.style.cursor = "pointer";
+      el.onclick = () => { AT.$("symInput").value = el.dataset.sym; };
+    });
+  },
+
+  renderJobs(d) {
+    const jobs = (d.jobs || []).filter(
+      (j) => j.state === "running" || (j.finished_at || "") >= this._since());
+    if (!jobs.length) { AT.$("jobBox").innerHTML = ""; return; }
+    AT.$("jobBox").innerHTML = jobs.map((j) => {
+      const pct = j.total ? Math.round(j.step / j.total * 100) : 0;
+      const state = j.state === "running" ? `${AT.esc(j.label)} ${j.step}/${j.total}`
+        : j.state === "done" ? "완료"
+        : `실패 ${AT.esc(j.error || "")}`;
+      return `<div style="margin-bottom:10px">
+        <div class="roleline"><b style="font-size:16.5px;color:var(--text)">${AT.esc(j.query)}</b>
+          <span>${state}</span></div>
+        <div class="progress" style="margin-top:5px"><i style="width:${pct}%"></i></div>
+      </div>`;
+    }).join("");
+  },
+
+  _since() {
+    const d = new Date(Date.now() - 5 * 60 * 1000);
+    return d.toISOString().slice(0, 19);
+  },
+
+  renderLatest(d) {
+    const rows = d.latest || [];
+    AT.$("latestSub").textContent = rows.length ? `${rows.length}종목` : "";
+    AT.$("latestEmpty").textContent = rows.length ? ""
+      : "아직 판단이 없습니다. 위에서 종목을 넣고 분석을 시작해 보세요.";
+    AT.$("latestBody").innerHTML = rows.map((r) => `
+      <tr class="rowlink" data-id="${r.id}">
+        <td><b>${AT.esc(r.name)}</b><br><span class="muted" style="font-size:14px">${AT.esc(r.symbol)}</span></td>
+        <td>${this.verdictHTML(r.decision)}</td>
+        <td>${this.confHTML(r.confidence)}</td>
+        <td>${AT.esc(r.horizon || "-")}</td>
+        <td class="muted">${AT.esc((r.created_at || "").replace("T", " ").slice(0, 16))}</td>
+        <td class="num">$${(r.cost_usd || 0).toFixed(3)}</td>
+        <td class="muted" style="font-size:14px">${AT.esc(r.model || "")}</td>
+        <td>${this.scoreHTML(r)}</td>
+      </tr>`).join("");
+    AT.$("latestBody").querySelectorAll(".rowlink").forEach((el) => {
+      el.onclick = () => this.openReport(el.dataset.id);
+    });
+  },
+
+  verdictHTML(decision) {
+    const label = {buy: "매수", sell: "매도", hold: "보유"}[decision] || decision;
+    return `<span class="verdict ${AT.esc(decision)}">${AT.esc(label)}</span>`;
+  },
+
+  confHTML(c) {
+    if (c == null) return '<span class="muted">-</span>';
+    const pct = Math.round(Math.max(0, Math.min(1, c)) * 100);
+    return `<span class="conf"><i style="width:${pct}%"></i></span>
+            <span class="num" style="margin-left:6px">${pct}%</span>`;
+  },
+
+  scoreHTML(r) {
+    if (r.correct === null || r.correct === undefined) {
+      return '<span class="muted">채점 대기</span>';
+    }
+    const cls = r.correct ? "up" : "down";
+    const mark = r.correct ? "맞음" : "틀림";
+    const chg = r.change_pct == null ? "" : ` ${AT.pct(r.change_pct)}`;
+    return `<span class="${cls}">${mark}${AT.esc(chg)}</span>`;
+  },
+
+  // ---- 리포트 ----
+  async openReport(id) {
+    try {
+      const d = await AT.call(`/agents/analysis/${id}`);
+      const a = d.analysis;
+      const groups = d.groups || {};
+      AT.$("reportSection").classList.remove("hide");
+      AT.$("reportSub").innerHTML =
+        `${AT.esc(a.name)} ${this.verdictHTML(a.decision)} `
+        + `<span class="muted">${AT.esc((a.created_at || "").replace("T", " ").slice(0, 16))}, `
+        + `호출 ${a.calls}회, $${(a.cost_usd || 0).toFixed(3)}`
+        + (a.cost_krw ? `, 약 ${AT.won(a.cost_krw)}` : "") + "</span>";
+
+      const stages = (a.report || {}).stages || [];
+      const order = ["analyst", "debate", "research", "risk"];
+      let html = `<div class="note" style="font-size:16.5px;color:var(--text);
+                    line-height:1.8;margin-bottom:6px">${AT.esc(a.summary)}</div>`;
+      html += `<div class="roleline">유효 기간 ${AT.esc(a.horizon || "-")}
+               <span>확신도 ${this.confHTML(a.confidence)}</span>
+               <span>모델 ${AT.esc(a.model)}</span>
+               <span>소요 ${Math.round((a.elapsed_ms || 0) / 1000)}초</span></div>`;
+
+      order.forEach((g) => {
+        const mine = stages.filter((s) => s.group === g);
+        if (!mine.length) return;
+        html += `<div class="groupname">${AT.esc(groups[g] || g)}</div>`;
+        mine.forEach((s) => { html += this.stageHTML(s); });
+      });
+
+      const ev = (a.report || {}).evidence || {};
+      html += `<div class="groupname">에이전트가 본 자료</div>`;
+      html += `<details class="stage"><summary>증거 팩 전문</summary>
+        <div class="body"><div class="evbox">${AT.esc(this.evidenceText(ev))}</div></div></details>`;
+
+      AT.$("reportBox").innerHTML = html;
+      AT.$("reportSection").scrollIntoView({behavior: "smooth", block: "start"});
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  stageHTML(s) {
+    const stance = {bullish: "강세", bearish: "약세", neutral: "중립"}[s.stance];
+    const bits = [];
+    if (stance) bits.push(stance);
+    if (s.confidence != null) bits.push(`확신도 ${Math.round(s.confidence * 100)}%`);
+    if (s.winner) bits.push({bull: "강세 우세", bear: "약세 우세", tie: "우열 없음"}[s.winner] || "");
+    bits.push(`$${(s.cost_usd || 0).toFixed(4)}`);
+
+    const list = (arr, title) => (arr && arr.length)
+      ? `<div style="margin-top:6px"><b>${title}</b><ul>`
+        + arr.map((p) => `<li>${AT.esc(p)}</li>`).join("") + "</ul></div>" : "";
+
+    return `<details class="stage">
+      <summary>${AT.esc(s.role || s.key)}
+        <span class="roleline" style="margin-left:auto">${AT.esc(bits.filter(Boolean).join("   "))}</span>
+      </summary>
+      <div class="body">
+        <div>${AT.esc(s.summary || "")}</div>
+        ${list(s.points, "근거")}
+        ${list(s.counter, "상대 주장의 약한 고리")}
+        ${list(s.plan, "계획")}
+        ${list(s.reasons, "판단 이유")}
+        ${list(s.risks, "위험")}
+        ${list(s.watch, "이 판단이 틀렸음을 알려줄 지점")}
+        ${s.invalidation ? `<div style="margin-top:6px"><b>판단 철회 조건</b><br>${AT.esc(s.invalidation)}</div>` : ""}
+      </div></details>`;
+  },
+
+  evidenceText(ev) {
+    const out = [];
+    out.push(`종목 ${ev.name || ""} (${ev.symbol || ""}), 시장 ${ev.market || ""}`);
+    out.push(`수집 시각 ${ev.collected_at || ""}`);
+    if (ev.quote) out.push(`현재가 ${ev.quote.price} ${ev.quote.currency || ""}, 출처 ${ev.quote.source || ""}`);
+    if (ev.technical) {
+      out.push("");
+      out.push(`기술점수 ${ev.technical.score}, 일봉 ${ev.technical.bars_used}개`);
+      (ev.technical.indicators || []).forEach((i) => {
+        out.push(`  ${i.label}: ${i.value} (${i.verdict}) ${i.reason || ""}`);
+      });
+    }
+    if (ev.news) {
+      out.push("");
+      out.push(`뉴스 감성 ${ev.news.score}`);
+      (ev.news.items || []).forEach((n) => out.push(`  ${n.title} (${n.source})`));
+    }
+    if (ev.community) {
+      out.push("");
+      out.push(`커뮤니티 강세비율 ${ev.community.bullish_ratio}, 표본 ${ev.community.post_count}건`);
+    }
+    if ((ev.missing || []).length) {
+      out.push("");
+      out.push("수집하지 못한 자료: " + ev.missing.join(", "));
+    }
+    return out.join("\n");
+  },
+
+  // ---- 설정 ----
+  renderConfig(d) {
+    const cfg = d.config || {};
+    const modes = d.exec_modes || [];
+    const sel = AT.$("cfg_exec_mode");
+    sel.innerHTML = modes.map((m) =>
+      `<option value="${AT.esc(m.key)}">${AT.esc(m.label)}</option>`).join("");
+    sel.value = cfg.exec_mode;
+
+    const models = AT.$("cfg_model");
+    models.innerHTML = Object.entries(d.models || {}).map(([k, v]) =>
+      `<option value="${AT.esc(k)}">${AT.esc(v.label || k)}</option>`).join("");
+    models.value = cfg.model;
+
+    ["cfg_effort", "cfg_final_effort"].forEach((id) => {
+      AT.$(id).innerHTML = ["low", "medium", "high", "xhigh", "max"].map((e) =>
+        `<option value="${e}">${e}</option>`).join("");
+    });
+    AT.$("cfg_effort").value = cfg.effort;
+    AT.$("cfg_final_effort").value = cfg.final_effort;
+
+    const nums = ["overlay_weight", "min_confidence", "max_age_hours",
+                  "scan_interval_min", "scan_limit", "daily_cost_cap_usd",
+                  "debate_rounds"];
+    nums.forEach((k) => { if (AT.$("cfg_" + k)) AT.$("cfg_" + k).value = cfg[k]; });
+
+    const bools = ["veto_on_sell", "exit_on_sell", "require_gate", "auto_scan",
+                   "include_news", "include_community"];
+    bools.forEach((k) => { if (AT.$("cfg_" + k)) AT.$("cfg_" + k).checked = !!cfg[k]; });
+
+    this.renderExecNote();
+  },
+
+  renderExecNote() {
+    const mode = AT.$("cfg_exec_mode").value;
+    const text = {
+      observe: "판단을 기록만 합니다. 매매에 아무 영향이 없습니다.",
+      overlay: "자동매매가 계산한 신호 점수 위에 에이전트 판단을 더합니다. "
+             + "룰이 주도하고 에이전트가 보정합니다. 수량 계획, 리스크 게이트, "
+             + "중복 주문 방어, 킬 스위치는 그대로 지나갑니다.",
+      lead: "에이전트가 방향을 정합니다. 룰 점수는 거부권만 갖습니다. "
+          + "판단이 틀리면 그대로 손실이 됩니다, 성적표를 먼저 확인하세요.",
+    }[mode] || "";
+    AT.$("execNote").innerHTML = AT.esc(text);
+  },
+
+  async saveConfig() {
+    const patch = {};
+    ["exec_mode", "model", "effort", "final_effort"].forEach((k) => {
+      patch[k] = AT.$("cfg_" + k).value;
+    });
+    ["overlay_weight", "min_confidence", "max_age_hours", "scan_interval_min",
+     "scan_limit", "daily_cost_cap_usd", "debate_rounds"].forEach((k) => {
+      patch[k] = Number(AT.$("cfg_" + k).value);
+    });
+    ["veto_on_sell", "exit_on_sell", "require_gate", "auto_scan",
+     "include_news", "include_community"].forEach((k) => {
+      patch[k] = AT.$("cfg_" + k).checked;
+    });
+    try {
+      await AT.call("/agents/config", {method: "POST", body: {config: patch}});
+      AT.$("cfgSaved").textContent = "저장했습니다.";
+      setTimeout(() => { AT.$("cfgSaved").textContent = ""; }, 3000);
+      this.load();
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  // ---- 실행 ----
+  async analyze() {
+    const symbol = AT.$("symInput").value.trim();
+    if (!symbol) { AT.toast("종목을 입력해 주세요.", true); return; }
+    try {
+      await AT.call("/agents/analyze", {method: "POST", body: {symbol}});
+      AT.toast(`${symbol} 분석을 시작했습니다. 수십 초에서 수 분 걸립니다.`);
+      this.load();
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  async resolveNow() {
+    try {
+      const d = await AT.call("/agents/resolve", {method: "POST"});
+      const r = d.result || {};
+      AT.toast(`채점 ${r.scored || 0}건, 대기 ${r.pending || 0}건, 무효 ${r.voided || 0}건`);
+      this.load();
+      this.loadScorecard();
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  // ---- 성적표 ----
+  renderGate(d) {
+    const g = d.gate || {};
+    AT.$("gateSub").innerHTML = g.passed
+      ? '<span class="pill on"><span class="dot"></span><span>통과</span></span>'
+      : '<span class="pill off"><span class="dot"></span><span>잠김</span></span>';
+    AT.$("gateBox").innerHTML =
+      `<div class="note" style="font-size:16.5px;color:var(--text)">
+         <b>${AT.esc(g.stage || "")}</b><br>${AT.esc(g.reason || "")}</div>`;
+  },
+
+  async loadScorecard() {
+    try {
+      const d = await AT.call("/agents/scorecard");
+      const c = d.scorecard || {};
+      AT.$("cardSub").textContent = c.scored ? `${c.scored}건 채점` : "";
+      AT.$("scN").textContent = (c.directional || 0) + "건";
+      AT.$("scHit").textContent = c.hit_rate == null ? "-" : c.hit_rate + "%";
+      AT.$("scAvg").textContent = c.avg_return_pct == null ? "-" : AT.pct(c.avg_return_pct);
+      AT.$("scT").textContent = c.t_stat == null ? "-" : c.t_stat;
+      const by = c.by_decision || {};
+      AT.$("scBody").innerHTML = Object.keys(by).length
+        ? Object.entries(by).map(([k, v]) => `<tr>
+            <td>${this.verdictHTML(k)}</td>
+            <td class="num">${v.n}</td>
+            <td class="num">${v.hit_rate == null ? "-" : v.hit_rate + "%"}</td>
+            <td class="num">${v.avg_return_pct == null ? "-" : AT.pct(v.avg_return_pct)}</td>
+          </tr>`).join("")
+        : '<tr><td colspan="4" class="muted">아직 채점된 판단이 없습니다.</td></tr>';
+      const cr = d.criteria || {};
+      AT.$("scNote").innerHTML = AT.esc(
+        (c.note || "") + ` 게이트 기준은 방향성 판단 ${cr.min_samples}건 이상, `
+        + `평균 수익률 0 초과, t 통계 ${cr.min_t_stat} 이상입니다. `
+        + `보유 판단은 등락이 ${cr.hold_band_pct}% 안에 머물렀으면 맞은 것으로 봅니다.`);
+    } catch (e) { /* 로그인 전이면 조용히 넘어갑니다 */ }
+  },
+
+  async backtest() {
+    const symbol = AT.$("btSym").value.trim();
+    if (!symbol) { AT.toast("종목을 입력해 주세요.", true); return; }
+    AT.$("btBox").innerHTML = '<div class="note">돌리는 중입니다. 수십 초 걸립니다.</div>';
+    try {
+      const d = await AT.call("/agents/backtest", {method: "POST",
+        body: {symbol, days: Number(AT.$("btDays").value) || 250}});
+      const r = d.result || {};
+      const m = r.metrics || r;
+      const rows = Object.entries(m).filter(([, v]) =>
+        typeof v === "number" || typeof v === "string").slice(0, 14);
+      AT.$("btBox").innerHTML = `<div class="scroll-x"><table><tbody>`
+        + rows.map(([k, v]) => `<tr><td class="muted">${AT.esc(k)}</td>
+            <td class="num">${AT.esc(typeof v === "number" ? AT.num(v, 3) : v)}</td></tr>`).join("")
+        + `</tbody></table></div>`
+        + (r.gates ? `<div class="note" style="margin-top:8px">${AT.esc(JSON.stringify(r.gates))}</div>` : "");
+    } catch (e) {
+      AT.$("btBox").innerHTML = `<div class="warnbox">${AT.esc(e.message)}</div>`;
+    }
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>

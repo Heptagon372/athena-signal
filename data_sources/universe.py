@@ -215,6 +215,41 @@ def get(key: str) -> Universe | None:
     return _BY_KEY.get(str(key or "").strip().upper())
 
 
+def normalize_pools(value) -> list[str]:
+    """설정에 저장된 탐색 범위를 **목록**으로 펼칩니다 (중복 제거, 순서 유지).
+
+    받는 모양이 셋입니다 — 예전 설정이 문자열 하나였기 때문입니다.
+        ""                       범위 지정 없음 (시장 전체)
+        "KOSPI200"               예전 단일 선택
+        "KOSPI200,KOSDAQ150"     콤마로 이어붙인 값 (URL·수동 편집)
+        ["KOSPI200", "SP500"]    지금 화면이 저장하는 모양
+
+    `normalize_segments` 와 같은 규약입니다: 어떤 경로로 들어온 값이든 여기
+    한 곳을 지나면 같은 모양이 됩니다. 카탈로그에 없는 키도 **버리지 않고**
+    그대로 둡니다 — 조용히 지우면 오타를 낸 사람은 왜 결과가 시장 전체인지
+    알 수 없습니다. 알 수 없는 키는 screener.scan 이 경고로 남깁니다.
+    """
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    elif value is None:
+        raw = []
+    else:
+        raw = [value]
+    out: list[str] = []
+    for item in raw:
+        key = str(item or "").strip().upper()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def describe_many(keys) -> list[dict]:
+    """고른 범위들의 설명 — 화면이 "지금 어디를 보고 있는지"를 적을 때 씁니다."""
+    return [u.to_dict() for u in (get(k) for k in normalize_pools(keys)) if u]
+
+
 def list_universes(segments: list[str] = None) -> list[dict]:
     """화면 드롭다운용 목록. 고른 세부시장과 겹치는 범위만 돌려줍니다.
 

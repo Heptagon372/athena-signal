@@ -20,6 +20,7 @@ freqtrade 의 plugins/protections 를 아테나의 주문 원장 위로 옮긴 �
     StoplossGuard    정해진 시간 안에 손절이 N회 → 잠금
     MaxDrawdown      정해진 시간 안의 실현손익 낙폭이 한도 초과 → 전체 잠금
     LowProfitPairs   그 종목의 최근 성적이 기준 미달 → 그 종목만 잠금
+    ChaseGuard       판 가격보다 크게 오른 자리에서의 재매수 금지 (아테나 자체)
 
 **청산은 어떤 잠금으로도 막지 않습니다.** 못 들어가는 것은 기회 손실이지만
 못 나오는 것은 손실입니다. 이 모듈이 만드는 잠금은 전부 '신규 진입' 대상입니다.
@@ -59,6 +60,13 @@ DEFAULTS = {
     "protect_lowprofit_lookback_min": 1440,
     "protect_lowprofit_min_trades": 3,
     "protect_lowprofit_stop_min": 120,
+
+    # 5) 추격 재매수 차단 — 아래 chase_reason() 참고.
+    #    위 1~4 와 달리 **protect_enabled 와 무관하게** 동작합니다. 이건
+    #    "매매를 멈추는" 스위치가 아니라 진입 가격 하나를 보는 규칙이라,
+    #    보호장치를 통째로 켜야만 걸리는 것은 과합니다. 0 이면 사용 안 함.
+    "protect_chase_pct": 3.0,               # 마지막 매도가 대비 이만큼 위면 금지(%)
+    "protect_chase_lookback_min": 1440,     # 매도가를 기억하는 시간(분)
 }
 
 # 청산 사유 문자열에서 '손절로 끝난 매매'를 알아보는 표지.
@@ -104,6 +112,11 @@ class LockSet:
     locks: list = field(default_factory=list)
     checked_at: str = ""
     error: str = ""
+    # 종목 -> (마지막 청산 시각, 그때의 체결가). 추격 재매수 차단의 기준선입니다.
+    # 잠금과 달리 시간만으로는 판정할 수 없어서(가격을 봐야 합니다) 여기에
+    # 재료만 담아 두고, 실제 판정은 현재가를 아는 진입 경로에서 합니다.
+    exits: dict = field(default_factory=dict)
+    chase_pct: float = 0.0
 
     def global_reasons(self, now: datetime = None) -> list[str]:
         return [lock.reason for lock in self.locks
@@ -115,9 +128,55 @@ class LockSet:
                 return lock
         return None
 
+    def chase_reason(self, symbol: str, price: float) -> str | None:
+        """"판 가격보다 너무 올라서 지금은 못 산다"면 그 사유, 아니면 None.
+
+        왜 필요한가
+            시간 쿨다운은 **얼마나 지났는지**만 봅니다. 그래서 30분(또는 4시간)만
+            지나면, 그 사이에 종목이 얼마를 올랐든 같은 신호로 다시 들어갑니다.
+            그런데 매도 뒤 급등한 종목은 추세추종 지표가 전부 켜지는 자리라
+            신호는 오히려 더 좋아 보입니다 — 규칙이 **가장 비싼 자리를 가장
+            자신 있게** 고르는 구조입니다.
+
+            여기서 막는 것은 신호가 틀려서가 아니라 **기준가가 있어서**입니다.
+            같은 종목을 방금 판 가격보다 비싸게 되사려면, 판 판단이 틀렸다는
+            뜻입니다. 그 재평가는 하루 지나 기준이 사라진 뒤에 하는 것이 맞고,
+            5분 뒤 호가창을 보고 할 일이 아닙니다.
+
+        되돌아오면 다시 살 수 있습니다 — 회전마다 **현재가로** 다시 재므로,
+        가격이 문턱 아래로 내려오면 그 순간 풀립니다. 잠금이 아니라 문턱입니다.
+        """
+        if self.chase_pct <= 0:
+            return None
+        record = self.exits.get(str(symbol))
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return None
+        if not record or price <= 0:
+            return None
+        when, sold = record
+        if not sold or sold <= 0:
+            return None
+        rise = (price - sold) / sold * 100
+        if rise < self.chase_pct:
+            return None
+        # 경과 시간은 이 스냅샷을 만든 시각 기준입니다 (실시간 now 가 아니라).
+        # 백테스트·재현 로그에서 "지금"이 다른데도 같은 문장이 나와야 합니다.
+        try:
+            ref = datetime.fromisoformat(self.checked_at)
+        except (TypeError, ValueError):
+            ref = datetime.now()
+        ago = (ref - when).total_seconds() / 60
+        return (f"추격 재매수 차단 — {ago / 60:.1f}시간 전 {sold:,.2f} 에 팔고 "
+                f"{rise:+.1f}% 오른 {price:,.2f} (문턱 +{self.chase_pct:g}%)")
+
     def to_dict(self) -> dict:
         return {"enabled": self.enabled, "checked_at": self.checked_at,
                 "locks": [lock.to_dict() for lock in self.locks],
+                "chase_pct": self.chase_pct,
+                "chase_marks": {sym: {"at": when.isoformat(), "price": price}
+                                for sym, (when, price) in self.exits.items()},
                 "error": self.error}
 
 
@@ -147,13 +206,20 @@ def evaluate(user_id: int, mode: str, cfg: dict, equity: float = 0.0,
     now = now or datetime.now()
     params = config_from(cfg)
     result = LockSet(enabled=enabled(cfg), checked_at=now.isoformat())
-    if not result.enabled:
+
+    # 추격 차단은 보호장치 스위치와 별개로 삽니다 (DEFAULTS 5번 주석 참고).
+    chase_pct = float(params.get("protect_chase_pct") or 0)
+    chase_look = int(params.get("protect_chase_lookback_min") or 0)
+    chase_on = chase_pct > 0 and chase_look > 0
+    if not result.enabled and not chase_on:
         return result
 
     lookbacks = [int(params["protect_cooldown_min"]),
                  int(params["protect_stoploss_lookback_min"]),
                  int(params["protect_drawdown_lookback_min"]),
-                 int(params["protect_lowprofit_lookback_min"])]
+                 int(params["protect_lowprofit_lookback_min"])]         if result.enabled else []
+    if chase_on:
+        lookbacks.append(chase_look)
     horizon = max([v for v in lookbacks if v > 0] or [1440])
 
     if trades is None:
@@ -171,6 +237,12 @@ def evaluate(user_id: int, mode: str, cfg: dict, equity: float = 0.0,
     trades = [t for t in (trades or []) if _closed_at(t) is not None]
     trades.sort(key=_closed_at)
 
+    if chase_on:
+        result.chase_pct = chase_pct
+        result.exits = _last_exits(trades, now, chase_look)
+    if not result.enabled:
+        return result
+
     for lock in (_cooldown(trades, params, now)
                  + _stoploss_guard(trades, params, now)
                  + _max_drawdown(trades, params, now, equity)
@@ -178,6 +250,34 @@ def evaluate(user_id: int, mode: str, cfg: dict, equity: float = 0.0,
         if lock.active(now):
             result.locks.append(lock)
     return result
+
+
+def _last_exits(trades: list, now: datetime, lookback_min: int) -> dict:
+    """종목별 **마지막** 청산의 (시각, 체결가).
+
+    마지막 것만 봅니다. 기준선은 "가장 최근에 내가 판 가격"이고, 그보다 이전
+    가격은 이미 내가 한 번 갱신한 판단이라 문턱이 될 수 없습니다.
+
+    가격은 `avg_fill_price`(실제 체결가) 우선, 없으면 주문가입니다 — 저장소의
+    다른 집계(storage/autotrade.closed_trades 계열)와 같은 순서입니다. 둘 다
+    없는 매매는 기준선이 될 수 없으니 건너뜁니다.
+    """
+    cutoff = now - timedelta(minutes=lookback_min)
+    out: dict = {}
+    for trade in trades:
+        when = _closed_at(trade)
+        symbol = str(trade.get("symbol") or "")
+        if not symbol or when < cutoff:
+            continue
+        try:
+            price = float(trade.get("avg_fill_price") or trade.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        if symbol not in out or when > out[symbol][0]:
+            out[symbol] = (when, price)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +523,11 @@ def describe(cfg: dict = None) -> list[dict]:
          "value": f"{p['protect_lowprofit_lookback_min']}분 성적 "
                   f"{p['protect_lowprofit_pct']:+g}% 미만 → "
                   f"{p['protect_lowprofit_stop_min']}분 중단"},
+        {"key": "protect_chase_pct", "label": "추격 재매수 차단",
+         "value": (f"마지막 매도가 +{p['protect_chase_pct']:g}% 위에서는 재매수 금지 "
+                   f"({p['protect_chase_lookback_min']}분간, 보호장치 스위치와 무관)"
+                   if p["protect_chase_pct"] and p["protect_chase_lookback_min"]
+                   else "꺼짐")},
     ]
 
 

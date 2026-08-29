@@ -52,12 +52,20 @@ class Signal:
     daily_score: float = 0.0
     intraday_score: float | None = None
     news_score: float | None = None
+    # 분봉을 빼고(비중 0) 같은 파이프라인을 태웠다면 나왔을 점수.
+    # 사후에 재계산하지 않고 **여기서 같이 굴리는** 이유는, 어떤 오버레이가
+    # 켜져 있었고 어떤 감쇠가 곱해졌는지를 이 함수 밖에서는 알 수 없기 때문입니다.
+    # 판단에는 쓰지 않습니다 — "분봉이 실제로 결정을 바꿨나"를 로그로 답하기 위한 값입니다.
+    score_wo_intraday: float | None = None
+    entry_threshold: float = 0.0       # 그 회전에 실제로 적용된 진입 문턱
     regime: str = ""
     bars_used: int = 0
     quote_age: float = 0.0
     nnfx: dict | None = None           # NNFX 오버레이 (nnfx_mode 가 off 가 아닐 때만)
     ensemble: dict | None = None       # 앙상블 진단 (algo_mode 가 off 가 아닐 때만)
     ml: dict | None = None             # ML 오버레이 (ml_mode 가 off 가 아닐 때만)
+    overheat: dict | None = None       # 과열 진입 게이트 판정 (방향이 정해졌을 때만)
+    pullback: dict | None = None       # 눌림목 재진입 판정 (급등 뒤 첫 눌림인가)
     ma50: float | None = None          # 50일 이동평균 — 승자 보유 판정(check_exit)용
     # 과매수·과매도 판정에 쓰는 원값 (engine/split.py 의 분할 매수·매도).
     # 점수(score)만으로는 "과매도라서 담는다"를 판단할 수 없습니다 — 점수는
@@ -90,9 +98,14 @@ class Signal:
                                if self.intraday_score is not None else None),
             "news_score": (round(self.news_score, 4)
                            if self.news_score is not None else None),
+            "score_wo_intraday": (round(self.score_wo_intraday, 4)
+                                  if self.score_wo_intraday is not None else None),
+            "entry_threshold": round(self.entry_threshold, 4),
             "regime": self.regime, "bars_used": self.bars_used,
             "quote_age": self.quote_age, "nnfx": self.nnfx,
             "ensemble": self.ensemble, "ml": self.ml,
+            "overheat": self.overheat,
+            "pullback": self.pullback,
             "ma50": round(self.ma50, 4) if self.ma50 else None,
             "rsi": round(self.rsi, 2) if self.rsi is not None else None,
             "bb_pct": round(self.bb_pct, 3) if self.bb_pct is not None else None,
@@ -201,17 +214,25 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         sig.ensemble = ens.to_dict()
         sig.vol_factor = ens.vol_factor
 
+    # alt = 분봉 비중을 0 으로 뒀다면 나왔을 점수. 아래 모든 단계에서 blended 와
+    # **같은 변환을 그대로** 받습니다 (뉴스·NNFX·ML·학습 감쇠는 점수의 함수라
+    # 두 번 적용해도 모델을 다시 계산하지 않습니다).
     if ens.ok and ens_mode in (ensemble.SOFT, ensemble.GATE):
         blended = ens.score          # 시평선 불일치 감산·난기류 감쇠가 반영된 점수
+        # 분봉이 없으면 시평선 합치 결과가 일봉 점수 그대로이므로, 그 뒤에 곱해진
+        # 감쇠(ens.damping)만 같이 적용하면 반사실 점수가 정확히 나옵니다.
+        alt = max(-1.0, min(1.0, sig.daily_score * ens.damping))
         sig.stage("ensemble", "앙상블 결합", blended,
                   "시평선 불일치 감산 · 난기류 감쇠 반영"
                   + (f" · {ens.notes[0]}" if ens.notes else ""))
     elif sig.intraday_score is None:
         blended = sig.daily_score
+        alt = blended
         sig.stage("blend", "결합 점수", blended, "분봉이 없어 일봉 점수를 그대로")
     else:
         blended = ((1 - intraday_weight) * sig.daily_score
                    + intraday_weight * sig.intraday_score)
+        alt = sig.daily_score
         sig.stage("blend", "일봉·분봉 결합", blended,
                   f"일봉 {1 - intraday_weight:.0%} + 분봉 {intraday_weight:.0%}")
 
@@ -221,6 +242,7 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             sig.news_score = news
             weight = float(cfg.get("news_weight", 0.25))
             blended = (1 - weight) * blended + weight * news
+            alt = (1 - weight) * alt + weight * news
             sig.stage("news", "뉴스 감성 반영", blended,
                       f"뉴스 점수 {news:+.2f} 을 {weight:.0%} 비중으로 결합")
 
@@ -228,6 +250,7 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
     # 계산되므로 뒤집을 필요가 없지만, 뉴스 점수는 기초자산 기준이라 뒤집습니다.
     if inst.is_inverse and sig.news_score is not None:
         blended -= 2 * float(cfg.get("news_weight", 0.25)) * sig.news_score
+        alt -= 2 * float(cfg.get("news_weight", 0.25)) * sig.news_score
 
     # NNFX 규칙 오버레이 — 켜져 있을 때만. 점수에 **더하지 않고 섞습니다**
     # (슬롯이 보는 추세·모멘텀은 위 지표 점수에 이미 들어 있어, 더하면 이중 계상).
@@ -238,6 +261,7 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         sig.nnfx = nnfx_state.to_dict()
         if nnfx_mode == nnfx.SOFT:
             blended, note = nnfx.apply_to_score(blended, nnfx_state, cfg)
+            alt, _ = nnfx.apply_to_score(alt, nnfx_state, cfg)
             if note:
                 nnfx_notes.append(note)
             sig.stage("nnfx", "NNFX 규칙 결합", blended,
@@ -252,12 +276,14 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
             sig.ml = ml_state.to_dict()
         if ml_mode == mlsignal.SOFT:
             blended, note = mlsignal.apply_to_score(blended, ml_state, cfg)
+            alt, _ = mlsignal.apply_to_score(alt, ml_state, cfg)
             if note:
                 nnfx_notes.append(note)
             sig.stage("ml", "ML 오버레이", blended,
                       note or "검증을 통과한 모델 점수만 가중 결합")
 
     sig.score = max(-1.0, min(1.0, blended))
+    sig.score_wo_intraday = max(-1.0, min(1.0, alt))
     sig.atr, sig.atr_pct = _atr(bars_daily, sig.price)
     if len(bars_daily) >= 50:
         try:
@@ -273,12 +299,23 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         adjusted, lesson_note = lessons.apply_to_score(sig.score, sig, cfg)
         if lesson_note:
             sig.score = adjusted
+            sig.score_wo_intraday, _ = lessons.apply_to_score(
+                sig.score_wo_intraday, sig, cfg)
             sig.stage("lessons", "손실 학습", sig.score, lesson_note)
 
     entry = float(cfg.get("entry_score", 0.35))
     allow_short = bool(cfg.get("allow_short")) and inst.shortable
 
-    if sig.score >= entry:
+    # 급등 뒤 첫 정상 눌림이면 **롱 문턱만** 낮춥니다. 숏에 같은 논리를 쓰려면
+    # 하락 추세의 되돌림을 봐야 하는데, 그건 반대 방향의 별개 판정입니다.
+    pull = pullback_ready(bars_daily, sig.price, sig.atr, cfg)
+    sig.pullback = pull
+    entry_long = entry
+    if pull["ready"]:
+        entry_long = entry * pull["params"]["pullback_entry_ratio"]
+        sig.stage("pullback", "눌림목 재진입", entry_long, pull["note"])
+
+    if sig.score >= entry_long:
         sig.direction = LONG
     elif sig.score <= -entry and allow_short:
         sig.direction = SHORT
@@ -301,17 +338,258 @@ def evaluate(inst: Instrument, cfg: dict, bars_daily: pd.DataFrame = None,
         sig.direction = FLAT
         nnfx_notes.insert(0, ens.blocked_by[0] if ens.blocked_by else "앙상블 게이트 차단")
 
+    # 과열 진입 게이트 — 점수가 임계값을 넘었어도 '이미 많이 간 자리'면 막습니다.
+    # 지표 점수 자체가 급등 고점에서 강한 매수로 나오는 구조적 편향을 여기서
+    # 차단합니다 (위 overheat_check 주석에 이유를 적어두었습니다).
+    if sig.direction != FLAT:
+        heat = overheat_check(sig.direction, sig.price, sig.atr, sig.rsi, sig.bb_pct,
+                              bars_daily, cfg)
+        sig.overheat = heat
+        if heat["blocked"]:
+            sig.direction = FLAT
+            nnfx_notes.insert(0, heat["note"])
+        if heat["note"]:
+            sig.stage("overheat", "과열 진입 게이트", heat["hits"], heat["note"])
+
+    # 눌림목 완화는 롱에만 적용되므로, 확신도·표시 문턱도 방향에 맞춰 고릅니다.
+    # (숏에 완화된 롱 문턱을 쓰면 확신도가 부풀려집니다)
+    eased = pull["ready"] and sig.direction != SHORT
+    applied = entry_long if eased else entry
+    sig.entry_threshold = float(applied)
     sig.stage("final", "최종 점수", sig.score,
-              f"진입 임계값 ±{entry:g} · 판정 "
+              f"진입 임계값 +{applied:g}"
+              + (f" (눌림목 완화, 원래 {entry:g})" if eased else "")
+              + (f" · 숏 -{entry:g}" if allow_short else "")
+              + " · 판정 "
               + {LONG: "매수", SHORT: "매도(숏)"}.get(sig.direction, "관망"))
 
-    sig.confidence = min(1.0, abs(sig.score) / entry) if entry > 0 else 0.0
+    sig.confidence = min(1.0, abs(sig.score) / applied) if applied > 0 else 0.0
     # _reasons 가 목록을 새로 만들므로, NNFX·앙상블 사유는 **그 뒤에** 붙여야 남습니다.
     # (앞에 붙이면 조용히 덮어써져 "왜 막혔는지 모르는" 상태가 됩니다)
     ens_notes = ens.notes[:2] if ens.ok else []
     sig.reasons = nnfx_notes + ens_notes + _reasons(daily, sig)
     sig.ok = True
     return sig
+
+
+# ---------------------------------------------------------------------------
+# 과열 진입 게이트 (Overheat Entry Gate)
+# ---------------------------------------------------------------------------
+#
+# 왜 필요한가
+#     지표 점수(engine/indicators.analyze)는 급등 고점에서 오히려 **강한 매수**로
+#     나옵니다. 구조적인 이유가 셋입니다.
+#       ① 추세추종 지표 9개가 사실상 같은 질문("최근에 올랐나")을 하고, 급등하면
+#          9개가 동시에 +1.0 으로 포화합니다 — 상관 높은 한 표를 아홉 표로 셉니다.
+#       ② 국면 판정이 순환적입니다. 수직 급등이면 ADX·Hurst·분산비율이 전부
+#          '추세 국면'을 가리키고, 그러면 되돌림군 가중치가 ×0.55 로 깎입니다.
+#          과열 경고가 가장 필요한 순간에 그 경고의 목소리가 가장 작아집니다.
+#       ③ ROC·이평이격은 ±10%/±5% 에서 만점입니다. 20% 급등이든 60% 급등이든
+#          점수는 똑같은 +1.0 — 더 위험해질수록 페널티가 붙지 않습니다.
+#
+#     실측: 합성 급등 고점(RSI 99 · %B 0.95 · %K 94)에서 최종 기술점수 +0.65,
+#     기본 진입 임계값 0.35 를 넘어 **매수**가 나왔습니다.
+#
+# 그래서 점수를 고치지 않고 진입만 막습니다
+#     점수 산식을 손대면 예측 화면·기존 백테스트 결과가 통째로 바뀝니다. 이
+#     게이트는 NNFX·앙상블 게이트와 같은 자리(방향 판정 뒤)에서 **신규 진입만**
+#     막습니다. 청산은 건드리지 않습니다 — 못 들어가는 것은 기회 손실이지만,
+#     못 나오는 것은 손실입니다.
+#
+# 세 가지를 각각 세고 min_hits 개 이상 걸릴 때만 막습니다
+#     지표 하나로 막으면 정상 추세까지 통째로 죽습니다. 서로 다른 각도
+#     (모멘텀 과열 · 밴드 상단 · 이평 이격)에서 동시에 걸릴 때만 추격으로 봅니다.
+
+OVERHEAT_DEFAULTS = {
+    "overheat_gate": True,        # 과열 구간 신규 진입 차단
+    "overheat_rsi": 75.0,         # RSI(14) 이 값 이상이면 과열 1표 (숏은 100-이 값)
+    "overheat_bb": 0.95,          # 볼린저 %B 이 값 이상이면 과열 1표 (숏은 1-이 값)
+    "overheat_ext_atr": 3.0,      # MA20 에서 이 배수(ATR)만큼 벌어지면 과열 1표
+    "overheat_min_hits": 2,       # 몇 표부터 막을지 (1~3)
+    "overheat_ma": 20,            # 이격을 재는 기준 이동평균
+}
+
+
+def overheat_params(cfg: dict) -> dict:
+    """설정에서 게이트 파라미터를 꺼내 안전 범위로 조입니다."""
+    p = {**OVERHEAT_DEFAULTS}
+    for k in OVERHEAT_DEFAULTS:
+        if cfg.get(k) is not None:
+            p[k] = cfg[k]
+    p["overheat_gate"] = bool(p["overheat_gate"])
+    p["overheat_rsi"] = max(50.0, min(float(p["overheat_rsi"]), 99.0))
+    p["overheat_bb"] = max(0.5, min(float(p["overheat_bb"]), 1.5))
+    p["overheat_ext_atr"] = max(0.5, float(p["overheat_ext_atr"]))
+    p["overheat_min_hits"] = max(1, min(int(p["overheat_min_hits"]), 3))
+    p["overheat_ma"] = max(5, min(int(p["overheat_ma"]), 120))
+    return p
+
+
+def overheat_check(direction: str, price: float, atr: float, rsi, bb_pct,
+                   bars_daily: pd.DataFrame, cfg: dict) -> dict:
+    """지금 진입하면 추격매수(또는 추격매도)인가.
+
+    반환 {blocked, hits, note, detail}. 판정 재료가 하나도 없으면 막지 않습니다
+    (모르는 것을 위험하다고 취급하면 게이트가 아니라 정지 버튼이 됩니다).
+    """
+    p = overheat_params(cfg)
+    out = {"blocked": False, "hits": 0, "note": "", "detail": {}, "params": p}
+    if not p["overheat_gate"] or direction not in (LONG, SHORT) or price <= 0:
+        return out
+
+    long_side = direction == LONG
+    hits, notes = [], []
+
+    # ① 모멘텀 과열 — RSI
+    rsi_limit = p["overheat_rsi"] if long_side else 100.0 - p["overheat_rsi"]
+    if rsi is not None:
+        rsi = float(rsi)
+        out["detail"]["rsi"] = round(rsi, 2)
+        out["detail"]["rsi_limit"] = round(rsi_limit, 2)
+        if (rsi >= rsi_limit) if long_side else (rsi <= rsi_limit):
+            hits.append("rsi")
+            notes.append(f"RSI {rsi:.1f} {'≥' if long_side else '≤'} {rsi_limit:g}")
+
+    # ② 밴드 이탈 — 볼린저 %B
+    bb_limit = p["overheat_bb"] if long_side else 1.0 - p["overheat_bb"]
+    if bb_pct is not None:
+        bb_pct = float(bb_pct)
+        out["detail"]["bb_pct"] = round(bb_pct, 3)
+        out["detail"]["bb_limit"] = round(bb_limit, 3)
+        if (bb_pct >= bb_limit) if long_side else (bb_pct <= bb_limit):
+            hits.append("bollinger")
+            notes.append(f"%B {bb_pct:.2f} {'≥' if long_side else '≤'} {bb_limit:g}")
+
+    # ③ 이격도 — 이동평균에서 몇 ATR 떨어져 있는가.
+    #    ATR 로 재는 이유: 고정 %는 삼성전자와 코스닥 소형주에 같은 잣대를 댑니다.
+    ma_n = p["overheat_ma"]
+    if atr and atr > 0 and bars_daily is not None and len(bars_daily) >= ma_n:
+        try:
+            ma = float(bars_daily["close"].iloc[-ma_n:].mean())
+        except (KeyError, TypeError, ValueError):
+            ma = 0.0
+        if ma > 0:
+            ext = (price - ma) / atr          # +면 이평 위, -면 아래
+            signed = ext if long_side else -ext
+            out["detail"]["ext_atr"] = round(ext, 2)
+            out["detail"]["ext_limit"] = p["overheat_ext_atr"]
+            out["detail"]["ma"] = round(ma, 4)
+            if signed >= p["overheat_ext_atr"]:
+                hits.append("extension")
+                notes.append(f"{ma_n}일선에서 {abs(ext):.1f} ATR "
+                             f"{'위' if long_side else '아래'} (한도 {p['overheat_ext_atr']:g})")
+
+    out["hits"] = len(hits)
+    out["detail"]["hit_keys"] = hits
+    if len(hits) >= p["overheat_min_hits"]:
+        out["blocked"] = True
+        out["note"] = (("과열 진입 차단" if long_side else "과냉 진입 차단")
+                       + f" — {' · '.join(notes)}"
+                       + f" ({len(hits)}/{p['overheat_min_hits']}표). "
+                       + ("이미 많이 오른 자리라 추격매수로 봅니다."
+                          if long_side else "이미 많이 내린 자리라 추격매도로 봅니다."))
+    elif notes:
+        out["note"] = (f"과열 신호 {len(hits)}표 ({' · '.join(notes)}) — "
+                       f"차단 기준 {p['overheat_min_hits']}표 미만이라 통과")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 눌림목 재진입 (Pullback Re-entry)
+# ---------------------------------------------------------------------------
+#
+# 게이트만 있으면 절반짜리입니다. 고점 추격은 막지만, 그 종목을 **영영 못 삽니다**.
+# 강했던 종목이 눌릴 때쯤이면 추세 지표가 식어 점수가 임계값 아래로 내려가 있고,
+# 정작 위험이 낮아진 자리에서 진입 신호가 사라집니다. 남는 건 기회 손실뿐입니다.
+#
+# 그래서 "최근에 강했고 · 지금은 눌렸고 · 추세는 살아 있는" 자리에서만 진입
+# 문턱을 낮춥니다. 급등 직후 첫 정상 눌림이 손절폭 대비 보상이 가장 좋다는 것은
+# 추세매매의 오래된 관찰입니다 (돌파에 사서 물리면 손절이 멀어 한 번 지면 여러 번
+# 이긴 것이 지워집니다).
+#
+# **봉에서만 계산합니다 — 외부 상태를 쓰지 않습니다.**
+#     "언제 무장했는지"를 메모리에 들고 있으면 백테스트와 실매매가 갈라집니다.
+#     (재시작하면 사라지고, 과거를 다시 돌리면 재현되지 않습니다.) 최근 강세도
+#     지금의 눌림도 전부 과거 봉에서 다시 계산할 수 있으므로, 순수 함수로 둡니다.
+#     engine/strategy.evaluate 가 백테스트와 실매매에서 같은 함수인 이유와 같습니다.
+
+PULLBACK_DEFAULTS = {
+    # 기본 꺼짐 — 논리는 맞고 합성 시나리오에서 의도대로 동작하지만, 검증
+    # 하네스가 수익 개선을 기각했습니다 (config.REGIME_MULTIPLIER 주석 참고).
+    # 문턱을 낮추는 장치라 근거 없이 켜두면 진입만 늘어납니다.
+    "pullback_entry": False,      # 눌림목 재진입 허용
+    "pullback_lookback": 10,      # 최근 몇 봉 안의 강세를 볼지
+    "pullback_surge_atr": 2.5,    # 그 구간에 이만큼(ATR) 떠 있었어야 '강했다'
+    "pullback_max_atr": 1.5,      # 지금은 이 안으로 들어와 있어야 '눌렸다'
+    "pullback_entry_ratio": 0.70, # 진입 임계값을 이 비율로 낮춤 (0.35 -> 0.245)
+    "pullback_ma": 20,            # 기준 이동평균
+}
+
+
+def pullback_params(cfg: dict) -> dict:
+    p = {**PULLBACK_DEFAULTS}
+    for k in PULLBACK_DEFAULTS:
+        if cfg.get(k) is not None:
+            p[k] = cfg[k]
+    p["pullback_entry"] = bool(p["pullback_entry"])
+    p["pullback_lookback"] = max(2, min(int(p["pullback_lookback"]), 60))
+    p["pullback_surge_atr"] = max(0.5, float(p["pullback_surge_atr"]))
+    p["pullback_max_atr"] = max(0.0, float(p["pullback_max_atr"]))
+    # 문턱을 0.3 미만으로 낮추는 것은 사실상 임계값을 없애는 것입니다
+    p["pullback_entry_ratio"] = max(0.30, min(float(p["pullback_entry_ratio"]), 1.0))
+    p["pullback_ma"] = max(5, min(int(p["pullback_ma"]), 120))
+    return p
+
+
+def pullback_ready(bars_daily: pd.DataFrame, price: float, atr: float,
+                   cfg: dict) -> dict:
+    """지금이 '급등 뒤 첫 정상 눌림' 자리인가.
+
+    세 가지가 **모두** 맞아야 합니다.
+      ① 최근 lookback 봉 안에서 이동평균 위로 surge_atr 이상 떠 있던 적이 있다
+      ② 지금은 max_atr 안으로 되돌아왔다
+      ③ 추세가 살아 있다 — 종가가 이동평균 위이고, 이동평균이 오르고 있다
+
+    ③ 이 없으면 '눌림'과 '추세 붕괴'를 구분하지 못합니다. 떨어지는 칼을 눌림목
+    이라고 부르는 것이 이 전략이 죽는 가장 흔한 방식입니다.
+    """
+    p = pullback_params(cfg)
+    out = {"ready": False, "note": "", "detail": {}, "params": p}
+    n = p["pullback_ma"]
+    if not p["pullback_entry"] or bars_daily is None or price <= 0 or atr <= 0:
+        return out
+    if len(bars_daily) < n + p["pullback_lookback"]:
+        return out
+
+    try:
+        close = bars_daily["close"]
+        ma = close.rolling(n).mean()
+        ext = (close - ma) / atr                       # 이동평균에서 몇 ATR 위인가
+        window = ext.iloc[-p["pullback_lookback"]:].dropna()
+        if window.empty:
+            return out
+        peak = float(window.max())
+        now_ext = (price - float(ma.iloc[-1])) / atr
+        ma_now, ma_prev = float(ma.iloc[-1]), float(ma.iloc[-6])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return out
+
+    surged = peak >= p["pullback_surge_atr"]
+    pulled = now_ext <= p["pullback_max_atr"]
+    alive = price > ma_now and ma_now > ma_prev
+
+    out["detail"] = {"peak_atr": round(peak, 2), "now_atr": round(now_ext, 2),
+                     "ma": round(ma_now, 4), "ma_rising": ma_now > ma_prev,
+                     "above_ma": price > ma_now,
+                     "surged": surged, "pulled": pulled, "alive": alive}
+
+    if surged and pulled and alive:
+        out["ready"] = True
+        out["note"] = (f"눌림목 재진입 — 최근 {p['pullback_lookback']}봉 안에 "
+                       f"{n}일선 위 {peak:.1f} ATR 까지 떴다가 지금 {now_ext:+.1f} ATR 로 "
+                       f"되돌아왔고, {n}일선은 아직 오르고 있습니다. "
+                       f"진입 문턱을 {p['pullback_entry_ratio']:.0%} 로 낮춥니다.")
+    return out
 
 
 def _atr(df: pd.DataFrame, price: float, period: int = 14) -> tuple[float, float]:
@@ -560,6 +838,38 @@ class ExitDecision:
     urgency: str = "normal"        # normal | urgent (urgent 는 장 상태와 무관하게 시도)
 
 
+def hold_winner(price: float, sig, cfg: dict, state: dict,
+                direction: int = 1, pinned: bool = False) -> bool:
+    """승자 보유(hold_winners) 게이트 — 지금 목표가 익절을 보류할 상황인가.
+
+    오닐 ("승자는 추세가 깨질 때까지 보유"). 종목이 50일선을 +3% 이상 상회하고
+    진입 후 고점의 97% 이내에 있으면 추세가 아직 살아 있다고 보고 목표가·목표
+    수익률 익절을 미룹니다. 손절·트레일링·시간 청산은 여기와 무관합니다.
+
+    **이 함수가 True 를 돌려주는 동안에는 고점 되돌림을 잡는 장치가 없습니다.**
+    돌려주는 값은 check_exit 의 skip_take 로만 들어가므로, 나중에 False 로
+    바뀌어도 되살아나는 것은 진입 때 정해진 고정 목표가와 take_profit_pct
+    뿐입니다. 그 사이 고점이 목표가를 넘지 못했다면 되돌림 구간에서 아무
+    청산도 걸리지 않고 손실 한도·신호 반전·max_hold_days 까지 갑니다.
+    고점 대비로 나가게 하려면 trailing_stop_pct 가 함께 켜져 있어야 합니다
+    (그 검사는 이 게이트보다 **위**에 있어 보류와 무관하게 작동합니다).
+
+    **check_exit 과 백테스트가 반드시 같은 함수를 봐야 합니다.**
+    백테스트 루프(engine/autotrade._run_backtest)의 익절은 봉 안 체결
+    (engine/fills.protective_fill)이라 check_exit 을 거치지 않습니다. 판정을
+    여기로 모으지 않으면 hold_winners 가 백테스트에서만 조용히 꺼져서, 이
+    설정을 켠 효과가 과거 데이터에서 항상 0으로 나옵니다.
+    """
+    if not cfg.get("hold_winners") or pinned or direction <= 0:
+        return False
+    if not (sig is not None and getattr(sig, "ok", False) and getattr(sig, "ma50", 0)):
+        return False
+    if not price or price < sig.ma50 * 1.03:
+        return False
+    peak = state.get("peak_price")
+    return bool(peak and price >= float(peak) * 0.97)
+
+
 def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
                state: dict, now: datetime = None,
                protective_only: bool = False,
@@ -657,12 +967,7 @@ def check_exit(inst: Instrument, position, sig: Signal, cfg: dict,
     # 진입 후 고점의 97% 이내에 있으면 — 추세가 아직 살아 있으면 — 목표가
     # 익절을 보류합니다. 손절·트레일링·시간 청산은 이 게이트와 무관하게
     # 그대로 작동합니다 (지키는 장치는 절대 끄지 않습니다).
-    winner_hold = False
-    if (cfg.get("hold_winners") and not pinned and direction > 0 and sig.ok
-            and sig.ma50 and price >= sig.ma50 * 1.03):
-        peak = state.get("peak_price")
-        if peak and price >= float(peak) * 0.97:
-            winner_hold = True
+    winner_hold = hold_winner(price, sig, cfg, state, direction, pinned)
 
     skip_take = winner_hold or protective_only or defer_take_profit
 

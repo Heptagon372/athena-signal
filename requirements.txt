@@ -17,3 +17,7 @@ pymongo[srv]
 # 다만 웹 API 키에 HTTP 리퍼러 제한을 걸어두면 그 위임 경로가 403 으로 막히므로,
 # 설치해 두는 편이 실패할 구석이 하나 적습니다 (ACCOUNTS.md 0-3).
 cryptography
+
+# AI 에이전트 분석 (web/at_agents.html). 없으면 그 화면만 "패키지 없음" 으로
+# 표시되고 나머지 기능은 그대로 동작합니다 (engine/agents.readiness).
+anthropic

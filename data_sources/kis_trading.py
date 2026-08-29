@@ -9,6 +9,7 @@
     국내 주식/ETF   현금 매수·매도, 정정·취소, 잔고, 매수가능금액
     국내 선물/옵션  신규·청산 주문, 잔고, 시세, 일봉
     해외 주식/ETF   미국 지정가 매수·매도, 잔고
+    미국 주간거래   데이마켓 지정가 매수·매도·취소, 주간 시세 (정규장과 별도 API)
 
 3단 안전장치
     1) 키가 없으면 이 모듈 전체가 비활성 (is_configured() == False)
@@ -87,6 +88,12 @@ TR_CANDIDATES = {
     "overseas_executions_mock": ["VTTS3035R"],
     "overseas_cancel_real": ["TTTT1004U"],
     "overseas_cancel_mock": ["VTTT1004U"],
+    # 미국 주간거래 (데이마켓) — 정규장과 API 가 통째로 다릅니다.
+    # 모의투자 짝(V로 시작하는 tr_id)이 없습니다 → 모의 모드에서는 거부합니다.
+    "overseas_day_buy_real":    ["TTTS6036U"],
+    "overseas_day_sell_real":   ["TTTS6037U"],
+    "overseas_day_cancel_real": ["TTTS6038U"],
+    "overseas_day_quote":       ["HHDFS76200200"],
     # 시세 (주문 아님)
     "deriv_quote": ["FHMIF10000000"],
     "deriv_chart": ["FHKIF03020100"],
@@ -163,6 +170,9 @@ OVERSEAS_PRESENT_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance
 OVERSEAS_BUYABLE_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
 OVERSEAS_EXECUTIONS_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 OVERSEAS_CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+OVERSEAS_DAY_ORDER_PATH = "/uapi/overseas-stock/v1/trading/daytime-order"
+OVERSEAS_DAY_CANCEL_PATH = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
+OVERSEAS_DAY_QUOTE_PATH = "/uapi/overseas-price/v1/quotations/price-detail"
 
 
 def _tr_list(op: str) -> list[str]:
@@ -694,12 +704,31 @@ def _overseas_present_fetch() -> dict:
         if rate > 0:
             break
 
+    # 이 TR 의 tot_asst_amt 는 **해외주식까지만** 셉니다. 실계좌 두 개로 확인한
+    # 분해식 (2026-08-29):
+    #     tot_asst_amt = tot_frcr_cblc_smtl(총현금) + evlu_amt_smtl(해외평가)
+    #                    − ustl_buy_amt_smtl + ustl_sll_amt_smtl
+    #     1000****-01  1,007,247 + 42,948 − 23,814,950 + 23,296,454 = 531,699 ✓
+    #     1002****-01    430,721 + 235,677 −     59,076 +     72,258 = 679,580 ✓
+    # 국내 보유분이 이 식에 없습니다. 국내 종목을 들고 있으면 그만큼 총자산이
+    # 비므로, 호출부(engine/broker.py)가 국내 평가금액을 더해야 합니다.
+    #
+    # tot_frcr_cblc_smtl 은 이름과 달리 **원화 예수금까지 합친 총현금**입니다
+    # (해외 보유가 없는 계좌에서 원화 예수금과 정확히 같은 값이 나옵니다).
+    # 이 값이 없는 응답을 대비해 원화예수금 + 외화예수금으로도 만들어 둡니다.
+    krw_deposit = _num(summary.get("tot_dncl_amt"))
+    foreign_cash = _num(summary.get("frcr_evlu_tota")
+                        or summary.get("frcr_use_psbl_amt"))
+    cash_total = _num(summary.get("tot_frcr_cblc_smtl")) or (krw_deposit + foreign_cash)
+
     return {
         "ok": True,
         # 결제까지 반영한 순자산. 증권사 앱의 총자산(=자산현황 TR)과 몇백 원
         # 차이가 날 수 있습니다 — 한쪽은 결제기준, 한쪽은 체결기준입니다.
         "total_asset": _num(summary.get("tot_asst_amt")),
-        "deposit": _num(summary.get("tot_dncl_amt")),
+        "deposit": krw_deposit,
+        "foreign_cash": foreign_cash,      # 외화 예수금 (원화 환산)
+        "cash_total": cash_total,          # 원화 + 외화 예수금
         "withdrawable": _num(summary.get("wdrw_psbl_tot_amt")),
         "purchase_amount": _num(summary.get("pchs_amt_smtl")
                                 or summary.get("pchs_amt_smtl_amt")),
@@ -739,8 +768,13 @@ def account_snapshot() -> dict:
     """계좌 요약 한 장 — 화면·엔진이 쓰는 숫자를 전부 증권사 값으로.
 
     돌려주는 값 (원)
-        total_asset       총자산 — 증권사 앱과 같은 숫자
-        deposit           총예수금 (미결제 매수대금 포함)
+        total_asset       결제기준 총자산 (자산현황 TR — 증권사 앱 '총자산' 화면)
+        settled_asset     체결기준 총자산 — **해외분까지만.** 국내 보유분은
+                          호출부가 더해야 합니다 (engine/broker.py 참고)
+        deposit           원화 예수금 (미결제 매수대금 포함 — 아직 나가지 않은 돈)
+        foreign_cash      외화 예수금 (원화 환산)
+        cash_total        총현금 = 원화 + 외화 예수금
+        settled_deposit   체결기준 예수금 = 총현금 − 미결제매수 + 미결제매도
         available_cash    주문가능현금 — 지금 진짜 쓸 수 있는 돈
         withdrawable      출금가능금액
         purchase_amount   매입금액 (체결기준)
@@ -775,19 +809,39 @@ def account_snapshot() -> dict:
     deposit = (assets.get("deposit") if assets.get("ok")
                else present.get("deposit") if present.get("ok") else None)
 
+    # 체결기준 예수금 — 미결제분이 전부 결제되고 나면 남을 현금.
+    #
+    # 예수금에는 아직 빠져나가지 않은 매수대금이 들어 있고, 이미 판 대금은 아직
+    # 들어와 있지 않습니다. 그래서 예수금을 그대로 '총예수금'으로 띄우면
+    # 총자산보다 큰 예수금이 화면에 뜹니다 (실측 2026-08-29:
+    # 예수금 1,007,247 · 체결기준 총자산 531,699). 미결제 매수를 빼고 미결제
+    # 매도를 더하면 체결기준 총자산과 아귀가 맞습니다.
+    #
+    # **원화 예수금이 아니라 총현금(원화+외화)에서 출발합니다.** 외화 예수금을
+    # 빼먹으면 달러를 들고 있는 계좌에서 그만큼 예수금이 비고, 화면의
+    # '총자산 = 총예수금 + 평가금액' 이 어긋납니다 (실측 1002****-01:
+    # 원화 158,968 · 외화 271,753 — 외화를 빼면 27만원이 사라집니다).
+    unsettled_buy = present.get("unsettled_buy", 0.0) if present.get("ok") else 0.0
+    unsettled_sell = present.get("unsettled_sell", 0.0) if present.get("ok") else 0.0
+    cash_total = present.get("cash_total", 0.0) if present.get("ok") else 0.0
+    settled_deposit = (cash_total or deposit or 0.0) - unsettled_buy + unsettled_sell
+
     return {
         "ok": total is not None and cash.get("ok") and present.get("ok"),
         "total_asset": total or 0.0,
-        # 결제기준 순자산 — 총자산과 몇백 원 차이 나는 것이 정상입니다
+        # 체결기준 순자산 — 결제 전 매매까지 반영한, 지금 실제로 가진 돈
         "settled_asset": present.get("total_asset", 0.0) if present.get("ok") else 0.0,
-        "deposit": deposit or 0.0,
+        "deposit": deposit or 0.0,                  # 원화 예수금 (미결제 포함)
+        "foreign_cash": present.get("foreign_cash", 0.0) if present.get("ok") else 0.0,
+        "cash_total": cash_total,                   # 원화 + 외화 예수금
+        "settled_deposit": settled_deposit,
         "available_cash": cash.get("available_cash", 0.0) if cash.get("ok") else 0.0,
         "withdrawable": present.get("withdrawable", 0.0) if present.get("ok") else 0.0,
         "purchase_amount": present.get("purchase_amount", 0.0) if present.get("ok") else 0.0,
         "eval_amount": present.get("eval_amount", 0.0) if present.get("ok") else 0.0,
         "unrealized_pnl": present.get("pnl", 0.0) if present.get("ok") else 0.0,
-        "unsettled_buy": present.get("unsettled_buy", 0.0) if present.get("ok") else 0.0,
-        "unsettled_sell": present.get("unsettled_sell", 0.0) if present.get("ok") else 0.0,
+        "unsettled_buy": unsettled_buy,
+        "unsettled_sell": unsettled_sell,
         "fx_rate": present.get("fx_rate", 0.0) if present.get("ok") else 0.0,
         # 결제완료분만 센 평가금액 (앱 '총자산' 화면의 평가금액과 같은 값)
         "settled_eval_amount": assets.get("eval_amount", 0.0) if assets.get("ok") else 0.0,
@@ -804,7 +858,8 @@ def _first(row: dict, *keys, default=None):
     return default
 
 
-def stock_executions(order_id: str = "", days_back: int = 0) -> dict:
+def stock_executions(order_id: str = "", days_back: int = 0,
+                     symbol: str = "") -> dict:
     """주식 일별 주문체결 조회 — **주문이 실제로 얼마나 체결됐는지** 확인합니다.
 
     접수 응답(ODNO)만 보고 "샀다"고 처리하면 미체결·부분체결이 그대로 누락되어
@@ -825,7 +880,10 @@ def stock_executions(order_id: str = "", days_back: int = 0) -> dict:
         "INQR_STRT_DT": day, "INQR_END_DT": datetime.now().strftime("%Y%m%d"),
         "SLL_BUY_DVSN_CD": "00",          # 전체
         "INQR_DVSN": "00",                # 역순
-        "PDNO": "",
+        # 종목으로 좁힙니다 — 한 페이지 분량을 넘기면 방금 낸 주문이 목록
+        # 밖으로 밀려 "찾지 못했습니다"가 됩니다 (해외 경로에서 실제로 겪은
+        # 사고입니다 — overseas_executions 주석 참고).
+        "PDNO": symbol or "",
         "CCLD_DVSN": "00",                # 전체(체결+미체결)
         "ORD_GNO_BRNO": "",
         "ODNO": order_id or "",
@@ -1194,12 +1252,200 @@ def cancel_overseas_order(ticker: str, order_id: str, quantity: float,
             "message": res.get("message", ""), "raw": res.get("raw")}
 
 
-def overseas_executions(days_back: int = 3, order_id: str = "") -> dict:
+# ---------------------------------------------------------------------------
+# 미국 주간거래 (데이마켓)
+# ---------------------------------------------------------------------------
+#
+# 한국 낮에 미국 주식을 사고파는 구간입니다. ET 20:00~03:30
+# = KST 09:00~16:30(서머타임) / 10:00~17:30(표준시), 월~금.
+#
+# **정규장과 같은 함수를 쓰면 안 됩니다.** 접수 경로가 완전히 다릅니다:
+#   · 주문 경로   /trading/daytime-order        (정규장은 /trading/order)
+#   · 정정취소    /trading/daytime-order-rvsecncl
+#   · 시세        /quotations/price-detail + 주간 전용 거래소코드
+#
+# 성격상 알아야 할 것
+#   · 정규 거래소가 아니라 FINRA 승인 ATS 에서 SOR 로 체결됩니다. 호가가 얇고
+#     화면 가격과 다르게 체결되거나 아예 안 걸릴 수 있습니다.
+#   · **지정가만 됩니다** (시장가·예약주문 불가).
+#   · 미체결 잔량은 주간거래 종료 시 **증권사가 자동 취소**합니다. 그래서 우리가
+#     따로 걷지 않아도 정규장으로 넘어가 엉뚱한 가격에 체결되지는 않습니다.
+#     (그래도 종료 전에 우리 손으로 거두는 편이 상태 정합에 좋습니다)
+#   · 계좌에 "미국주식 주간거래" 서비스 신청이 되어 있어야 접수됩니다.
+
+# 주문용 거래소 코드와 **시세용 거래소 코드가 다릅니다.**
+#   주문 NASD / NYSE / AMEX   (정규장과 동일)
+#   시세 BAQ  / BAY  / BAA    (주간거래 전용 — 정규장의 NAS/NYS/AMS 와 또 다름)
+# 이 둘을 섞으면 "해당종목정보가 없습니다"로 조용히 실패합니다.
+_DAY_QUOTE_EXCD = {"NASD": "BAQ", "NYSE": "BAY", "AMEX": "BAA"}
+
+
+def overseas_day_quote_excd(exchange: str, default: str = "BAQ") -> str:
+    """주문용 거래소코드(NASD/NYSE/AMEX) -> 주간거래 시세용 코드(BAQ/BAY/BAA)."""
+    return _DAY_QUOTE_EXCD.get(str(exchange or "").upper(), default)
+
+
+def _day_trading_blocked() -> str:
+    """주간거래를 낼 수 없는 상태면 그 사유를, 낼 수 있으면 빈 문자열."""
+    if not live_enabled():
+        return "실전 주문이 잠겨 있습니다 (KIS_LIVE_TRADING=1 필요)."
+    if kis_client.is_mock():
+        # 모의투자 서버에는 주간거래 tr_id 자체가 없습니다. 정규장 코드로
+        # 대신 보내면 **모의 계좌에서 정규장 주문이 나갑니다** — 조용히 다른
+        # 일을 하느니 여기서 막습니다.
+        return "미국 주간거래는 모의투자를 지원하지 않습니다 (실전 계좌 전용)."
+    if not account():
+        return "KIS_ACCOUNT 가 설정되지 않았습니다."
+    return ""
+
+
+def place_overseas_day_order(ticker: str, side: str, quantity: float,
+                             price: float, exchange: str = "NASD") -> dict:
+    """미국 주간거래 주문 — 지정가만 가능합니다.
+
+    exchange 는 **주문용 코드**(NASD/NYSE/AMEX)를 그대로 받습니다.
+    """
+    blocked = _day_trading_blocked()
+    if blocked:
+        return {"ok": False, "error": blocked}
+    if not price or price <= 0:
+        return {"ok": False, "error": "주간거래는 지정가가 필요합니다 (시장가 불가)."}
+    quantity = int(quantity)
+    if quantity <= 0:
+        return {"ok": False, "error": "주문 수량이 0입니다."}
+
+    cano, prdt = account()
+    body = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "OVRS_EXCG_CD": exchange,
+        "PDNO": ticker,
+        "ORD_QTY": str(quantity),
+        "OVRS_ORD_UNPR": f"{float(price):.2f}",
+        "CTAC_TLNO": "",
+        "MGCO_APTM_ODNO": "",
+        "ORD_SVR_DVSN_CD": "0",
+        "ORD_DVSN": "00",                     # 주간거래는 지정가(00)만
+    }
+    op = "overseas_day_buy_real" if side == "buy" else "overseas_day_sell_real"
+    res = _post(op, OVERSEAS_DAY_ORDER_PATH, body)
+    if not res.get("ok"):
+        return res
+    out = res.get("output") or {}
+    return {"ok": True, "broker_order_id": out.get("ODNO", ""),
+            "order_time": out.get("ORD_TMD", ""),
+            "message": res.get("message", ""), "raw": res.get("raw")}
+
+
+def cancel_overseas_day_order(ticker: str, order_id: str, quantity: float,
+                              exchange: str = "NASD") -> dict:
+    """주간거래 미체결 취소.
+
+    정규장 취소(cancel_overseas_order)로 보내면 주간거래 주문번호를 찾지 못해
+    실패합니다 — 접수 창구가 다르기 때문입니다.
+    """
+    blocked = _day_trading_blocked()
+    if blocked:
+        return {"ok": False, "error": blocked}
+
+    cano, prdt = account()
+    body = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": prdt,
+        "OVRS_EXCG_CD": exchange,
+        "PDNO": ticker,
+        "ORGN_ODNO": str(order_id),
+        "RVSE_CNCL_DVSN_CD": "02",            # 02 = 취소 (01 은 정정)
+        "ORD_QTY": str(int(quantity)),
+        "OVRS_ORD_UNPR": "0",
+        "CTAC_TLNO": "",
+        "MGCO_APTM_ODNO": "",
+        "ORD_SVR_DVSN_CD": "0",
+    }
+    res = _post("overseas_day_cancel_real", OVERSEAS_DAY_CANCEL_PATH, body)
+    if not res.get("ok"):
+        return res
+    out = res.get("output") or {}
+    return {"ok": True, "broker_order_id": out.get("ODNO", ""),
+            "message": res.get("message", ""), "raw": res.get("raw")}
+
+
+# 주간거래 현재가 응답의 필드명은 KIS 문서 공개분으로 확정하지 못했습니다.
+# 후보를 순서대로 보고, 하나도 못 맞히면 **받은 키 목록을 오류에 실어** 한 번의
+# 실행으로 이름을 확정할 수 있게 합니다 (조용히 0원을 돌려주지 않습니다).
+_DAY_PRICE_KEYS = ("last", "ovrs_prpr", "prpr", "stck_prpr")
+_DAY_BASE_KEYS = ("base", "ovrs_prdy_clpr", "prdy_clpr", "sdpr")
+_DAY_VOL_KEYS = ("tvol", "acml_vol", "vol")
+_DAY_RATE_KEYS = ("rate", "prdy_ctrt", "diff_rate")
+
+
+def _first_num(out: dict, keys: tuple, default: float = 0.0) -> float:
+    for k in keys:
+        if out.get(k) not in (None, "", "0.0000"):
+            value = _num(out.get(k), 0.0)
+            if value:
+                return value
+    return default
+
+
+def overseas_day_quote(ticker: str, exchange: str = "NASD") -> dict | None:
+    """미국 주간거래 현재가.
+
+    Yahoo 로는 이 구간을 못 받습니다 — Yahoo 의 확장시간(includePrePost)은
+    ET 04:00~20:00 까지고, 주간거래는 ET 20:00 이후 ATS 물량이라 아예 안 나옵니다.
+    그래서 이 구간만은 KIS 시세를 씁니다.
+    """
+    excd = overseas_day_quote_excd(exchange)
+    res = _get("overseas_day_quote", OVERSEAS_DAY_QUOTE_PATH, {
+        "AUTH": "",
+        "EXCD": excd,
+        "SYMB": str(ticker or "").upper(),
+    }, timeout=10)
+    if not res.get("ok"):
+        return None
+
+    out = res.get("output") or {}
+    price = _first_num(out, _DAY_PRICE_KEYS)
+    if price <= 0:
+        # 거래가 아예 없어 0 인 것과 필드명을 못 맞힌 것을 구분해야 합니다.
+        return {"price": None, "excd": excd,
+                "error": "주간거래 현재가 필드를 찾지 못했습니다 "
+                         f"(응답 키: {sorted(out.keys())[:20]})"}
+
+    prev = _first_num(out, _DAY_BASE_KEYS) or None
+    rate = _first_num(out, _DAY_RATE_KEYS, default=None)
+    if rate is None and prev:
+        rate = (price - prev) / prev * 100
+    return {
+        "price": price,
+        "prev_close": prev,
+        "change_rate": round(rate, 2) if rate is not None else None,
+        "volume": _first_num(out, _DAY_VOL_KEYS),
+        "excd": excd,
+        "source": "한국투자증권 KIS (주간거래)",
+    }
+
+
+def overseas_executions(days_back: int = 3, order_id: str = "",
+                        symbol: str = "") -> dict:
     """해외주식 주문·체결 내역.
 
     이게 없으면 미국 주문은 접수 뒤 결말을 확인할 방법이 없습니다. 국내 체결
     내역에는 해외 주문이 안 들어 있어서, 계속 "주문 상태를 확인하지 못했습니다"
     가 반복되고 그 종목은 미결제로 묶여 새 주문도 못 냅니다.
+
+    **symbol 을 꼭 넘기세요.** 이 API 는 한 번에 20건만 돌려주고 연속조회
+    (CTX_AREA_NK200) 는 이 계좌에서 rt_cd=7 로 거부됩니다. 하루에 수십 건을
+    내는 자동매매에서는 조회 창 안의 주문이 20건을 훌쩍 넘으므로, 종목으로
+    좁히지 않으면 방금 낸 주문이 목록 밖으로 밀려나 "주문 내역에서 찾지
+    못했습니다" 가 됩니다 — 실제로는 **전량 체결된** 주문인데도요.
+
+    실측 2026-08-20: 8/19 주문 9건이 전부 체결됐는데 20건 창 밖으로 밀려
+    16~23시간째 pending 으로 남아 있었습니다. 체결 원장에 기록되지 않았고,
+    _ORDER_LOST_SEC(24시간)이 지나면 결말 미상으로 버려질 상태였습니다.
+
+    SORT_SQN 도 "DS"(정순 — 가장 오래된 주문부터)에서 "AS"(역순)로 바꿉니다.
+    20건 창은 최신 주문부터 채워야 방금 낸 주문이 항상 들어옵니다.
     """
     acc = account()
     if not acc:
@@ -1208,12 +1454,12 @@ def overseas_executions(days_back: int = 3, order_id: str = "") -> dict:
     start = (datetime.now() - timedelta(days=max(days_back, 0))).strftime("%Y%m%d")
     res = _get(_op("overseas_executions"), OVERSEAS_EXECUTIONS_PATH, {
         "CANO": cano, "ACNT_PRDT_CD": prdt,
-        "PDNO": "", "ORD_STRT_DT": start,
+        "PDNO": symbol or "", "ORD_STRT_DT": start,
         "ORD_END_DT": datetime.now().strftime("%Y%m%d"),
         "SLL_BUY_DVSN": "00",             # 전체
         "CCLD_NCCS_DVSN": "00",           # 체결+미체결
         "OVRS_EXCG_CD": "%",              # 전체 거래소
-        "SORT_SQN": "DS", "ORD_DT": "", "ORD_GNO_BRNO": "",
+        "SORT_SQN": "AS", "ORD_DT": "", "ORD_GNO_BRNO": "",
         "ODNO": order_id or "",
         "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
     })

@@ -107,7 +107,7 @@ def _fetch_quote(inst: Instrument) -> dict | None:
     if not isinstance(status, dict):
         status = market_clock.status_for(inst.market)
 
-    return {
+    out = {
         "price": float(price),
         "price_krw": fx.to_krw(float(price), inst.currency),
         "prev_close": live.get("prev_close"),
@@ -117,6 +117,51 @@ def _fetch_quote(inst: Instrument) -> dict | None:
         "source": live.get("source", ""),
         "market_open": bool(status.get("is_open")),
         "session": status.get("label", ""),
+        # 이 가격이 **어느 세션의 가격인가**. 주간거래 구간에서 정규장 종가로
+        # 주문하는 사고를 리스크 게이트가 잡아낼 수 있게 하는 표식입니다.
+        "price_session": "",
+    }
+    if inst.market == "US" and status.get("session") == "DAY":
+        out = _overlay_day_price(inst, out)
+    return out
+
+
+def _overlay_day_price(inst: Instrument, base: dict) -> dict:
+    """주간거래 구간이면 가격을 KIS 주간 시세로 갈아끼웁니다.
+
+    Yahoo 의 확장시간 데이터는 ET 04:00~20:00 까지입니다. 주간거래(ET 20:00~03:30)
+    는 그 바깥이라, 이 구간에 Yahoo 를 믿으면 **몇 시간 전 정규장 종가**를
+    현재가로 씁니다. 신선도 게이트는 '캐시에 담긴 지 몇 초'를 재기 때문에 이걸
+    걸러내지 못합니다 — 방금 받아온 낡은 값은 age_sec 이 0 입니다.
+
+    거래소 코드(NASD/NYSE/AMEX)는 Yahoo 응답에서 옵니다. 그래서 Yahoo 를
+    건너뛰지 않고 받아온 뒤 가격만 덮어씁니다 (전일종가·거래소도 함께 씁니다).
+
+    실패하면 base 를 그대로 돌려주되 price_session 은 비워 둡니다. 부르는 쪽이
+    "주간 시세를 못 받았다"를 알아야 낡은 가격으로 주문하지 않습니다.
+    """
+    if not kis_trading.is_configured():
+        return base
+    exchange = kis_trading.overseas_exchange_code(base.get("exchange"))
+    try:
+        day = kis_trading.overseas_day_quote(inst.key, exchange)
+    except Exception:
+        return base
+    if not day or not day.get("price"):
+        return base
+
+    price = float(day["price"])
+    return {
+        **base,
+        "price": price,
+        "price_krw": fx.to_krw(price, inst.currency),
+        # 전일종가는 주간 시세 것이 있으면 그것을, 없으면 Yahoo 것을 씁니다.
+        "prev_close": day.get("prev_close") or base.get("prev_close"),
+        "change_rate": day.get("change_rate", base.get("change_rate")),
+        "volume": day.get("volume") or base.get("volume"),
+        "source": day.get("source", "한국투자증권 KIS (주간거래)"),
+        "price_session": "DAY",
+        "day_excd": day.get("excd", ""),
     }
 
 
@@ -225,6 +270,8 @@ def is_tradable_now(inst: Instrument, regular_only: bool = True) -> tuple[bool, 
 # 예외: 미국 애프터마켓은 us_extended_hours 를 **켠 경우에만** 신규 진입을
 # 허용합니다 — 설정 라벨("미국 프리·애프터마켓 허용")이 약속하는 동작이고,
 # 스프레드 비용을 감수하겠다는 명시적 선택이므로 기본값은 꺼짐입니다.
+# 예외 2: 미국 주간거래(DAY, 한국 낮)는 us_day_session 을 켠 경우에만. ATS 라
+# 호가가 더 얇아 스위치를 따로 뒀습니다 (_day_entry_allowed 주석 참고).
 # 반대로 **청산은 이 제한을 받지 않습니다** — 못 들어가는 것은 기회 손실이지만
 # 못 나오는 것은 손실입니다 (check_exit 는 그대로 is_tradable_now 를 씁니다).
 ENTRY_SESSIONS = ("REGULAR", "PRE", "PRE_AUCTION")
@@ -235,6 +282,18 @@ def _after_entry_allowed(inst: Instrument, cfg: dict, session: str) -> bool:
     """미국 애프터마켓 신규 진입 — 확장 시간 스위치를 켠 경우에만."""
     return (session == "AFTER" and inst.market == "US"
             and bool((cfg or {}).get("us_extended_hours")))
+
+
+def _day_entry_allowed(inst: Instrument, cfg: dict, session: str) -> bool:
+    """미국 주간거래(데이마켓) 신규 진입 — us_day_session 을 켠 경우에만.
+
+    확장시간(프리·애프터)과 **스위치를 분리한 이유**: 프리·애프터는 나스닥·NYSE
+    정규 거래소의 연장이고, 주간거래는 FINRA 승인 ATS 라 체결 경로 자체가
+    다릅니다. 호가가 훨씬 얇고 미국 현지 참여가 거의 없어 변동성이 큽니다.
+    한 스위치로 묶으면 "애프터마켓만 하려던 사람"이 ATS 까지 열게 됩니다.
+    """
+    return (session == "DAY" and inst.market == "US"
+            and bool((cfg or {}).get("us_day_session")))
 
 
 def entry_allowed_now(inst: Instrument, cfg: dict) -> tuple[bool, str, str]:
@@ -249,7 +308,9 @@ def entry_allowed_now(inst: Instrument, cfg: dict) -> tuple[bool, str, str]:
     session = status.get("session", "")
     label = status.get("label", "")
 
-    if session not in ENTRY_SESSIONS and not _after_entry_allowed(inst, cfg, session):
+    if (session not in ENTRY_SESSIONS
+            and not _after_entry_allowed(inst, cfg, session)
+            and not _day_entry_allowed(inst, cfg, session)):
         return False, f"신규 진입 시간이 아닙니다 ({label})", session
 
     if session in _PRE_SESSIONS and not _pre_market_allowed(inst, cfg):

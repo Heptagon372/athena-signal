@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>아테나 시그널 시장별 자동매매</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" crossorigin
+      href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="/static/at_common.css">
+<style>
+/* 시장 화면은 "이 시장이 지금 어떤가"를 한 눈에 봐야 하므로, 수익률 카드와
+   시장 카드를 넓은 화면에서 나란히 세웁니다. */
+@media(min-width:1080px){.grid.market{grid-template-columns:1.3fr 1fr}}
+.uni-tag{display:inline-flex;align-items:center;gap:6px;background:var(--raised);
+  border-radius:999px;padding:4px 13px;font-size:15px;margin:0 6px 6px 0}
+.uni-tag.held{background:var(--ink);color:var(--ink-text)}
+</style>
+</head>
+<body>
+<main>
+  <div class="grid market">
+    <section>
+      <h2 id="curveTitle">순수익률</h2>
+      <div id="curveHost"></div>
+    </section>
+
+    <section>
+      <h2>이 시장의 지갑 <span class="sub">배분한 만큼만 씁니다</span></h2>
+      <div id="marketCard" class="mcards"></div>
+
+      <div style="margin-top:14px">
+        <label class="chk"><input type="checkbox" id="cfg_enabled"> 이 시장에서 신규 매수
+          <span class="muted" style="font-size:15px">   끄면 새로 사지 않습니다. 손절, 익절은 계속 돕니다</span>
+        </label>
+      </div>
+
+      <div class="alloc" style="margin-top:10px">
+        <div class="head"><b>배분</b> <b id="allocPct"></b>
+          <span class="krw" id="allocKrw"></span></div>
+        <input type="range" id="cfg_alloc" min="0" max="100" step="5">
+        <div class="left" id="allocLeft"></div>
+      </div>
+
+      <div class="split">
+        <div class="field"><label>최대 보유 종목</label>
+          <input id="cfg_max_positions" type="number" min="0" step="1"></div>
+        <div class="field"><label>1회 위험 예산 (%)</label>
+          <input id="cfg_risk" type="number" min="0" step="0.5"></div>
+        <div class="field"><label>종목당 최대 비중 (%)</label>
+          <input id="cfg_position_pct" type="number" min="0" step="5"></div>
+      </div>
+      <div class="note" id="cfgNote"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>보유 포지션 <span class="sub" id="posSub"></span></h2>
+    <div class="scroll-x"><table id="posTable">
+      <thead><tr>
+        <th>종목</th><th class="num">수량</th><th class="num">진입가</th>
+        <th class="num">현재가</th><th class="num">평가손익</th><th class="num">손절</th>
+        <th class="num">목표</th><th></th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+    <div id="posEmpty" class="center">이 시장에는 보유 중인 포지션이 없습니다.</div>
+
+    <div id="openOrders" class="hide" style="margin-top:16px">
+      <h2 style="margin-bottom:8px">체결 대기 중인 주문</h2>
+      <div class="scroll-x"><table id="openTable">
+        <thead><tr><th>접수</th><th>종목</th><th>동작</th><th class="num">주문</th>
+          <th class="num">체결</th><th class="num">주문가</th><th>상태</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <div class="grid two">
+    <section>
+      <h2>이 시장의 매매 대상 <span class="sub">메인, AI 추천 화면에서 넣고 뺍니다</span></h2>
+      <div id="uniBox"></div>
+    </section>
+
+    <section>
+      <h2>이 시장의 실행 로그 <span class="sub">이 시장 종목에 대한 판단만 추립니다</span></h2>
+      <div class="log" id="logBox"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+// 한국 화면과 미국 화면은 **같은 파일**입니다. 주소 끝(/kr · /us)으로만
+// 갈립니다 — 구조가 같은 화면을 파일 두 개로 나누면 한쪽만 고쳐진 채로
+// "미국에는 있는 버튼이 한국에는 없는" 상태가 반드시 생깁니다.
+const SCOPE = location.pathname.endsWith("/us") ? "US" : "KR";
+const SCOPE_NAME = SCOPE === "US" ? "미국" : "한국";
+const OTHER = SCOPE === "US" ? "KR" : "US";
+const OTHER_NAME = SCOPE === "US" ? "한국" : "미국";
+const P = SCOPE === "US" ? "us" : "kr";       // 설정 키 앞머리 (kr_alloc_pct …)
+const OP = OTHER === "US" ? "us" : "kr";
+
+window.PAGE = {
+  nav: P,
+  lite: false,                       // 포지션·계좌를 그리므로 전체 스냅샷이 필요합니다
+  title: `${SCOPE_NAME} 주식 자동매매`,
+  desc: `${SCOPE_NAME} 시장에 배분한 돈 안에서만 사고팝니다. 손절과 익절은 배분과 무관하게 계속 돕니다.`,
+
+  init() {
+    const A = AT;
+    A.$("curveTitle").textContent = `${SCOPE_NAME} 순수익률`;
+    this.curve = A.curveCard("curveHost", {scopes: [SCOPE], days: 1,
+                                           title: `오늘 ${SCOPE_NAME} 순수익률`});
+
+    A.$("cfg_enabled").onchange = (e) =>
+      this.save({[`${P}_enabled`]: e.target.checked});
+    A.$("cfg_alloc").oninput = () => this.allocNote(Number(A.$("cfg_alloc").value));
+    A.$("cfg_alloc").onchange = () =>
+      this.save({[`${P}_alloc_pct`]: Number(A.$("cfg_alloc").value)});
+    A.$("cfg_max_positions").onchange = () =>
+      this.save({[`${P}_max_positions`]: Number(A.$("cfg_max_positions").value) || 0});
+    A.$("cfg_risk").onchange = () =>
+      this.save({[`${P}_risk_per_trade_pct`]: Number(A.$("cfg_risk").value) || 0});
+    A.$("cfg_position_pct").onchange = () =>
+      this.save({[`${P}_position_pct`]: Number(A.$("cfg_position_pct").value) || 0});
+
+    this.pollEvents();
+    setInterval(() => this.pollEvents(), 7000);
+    setInterval(() => this.curve?.reload(), 30000);
+  },
+
+  async save(patch) {
+    this._dirty = true;
+    try {
+      await AT.call("/autotrade/config", {method: "POST", body: {config: patch}});
+      AT.toast("저장했습니다. 다음 회전부터 적용됩니다.");
+      this._dirty = false;
+      AT.refresh();
+    } catch (e) { AT.toast("저장 실패: " + e.message, true); this._dirty = false; }
+  },
+
+  ACTION: {buy: "매수", sell: "매도", close: "청산", open_long: "롱진입", open_short: "숏진입"},
+  STATUS: {filled: "체결", partial: "부분체결", pending: "대기", rejected: "거부",
+           cancelled: "취소됨", cancel_requested: "취소요청", lost: "결말미상"},
+
+  // 배분을 옮기면 실제로 얼마인지 곧바로 보여줍니다. 비율만 보여주면 사람은
+  // 그게 얼마인지 매번 암산해야 하고, 암산은 소액 계좌에서 특히 자주 틀립니다.
+  allocNote(value) {
+    const A = AT, total = A.SNAP?.account?.total_value || 0;
+    A.$("allocPct").textContent = `${value}%`;
+    A.$("allocKrw").textContent = total ? A.won(total * value / 100) : "";
+    const other = A.SNAP?.config?.[`${OP}_alloc_pct`] ?? 0;
+    const left = Math.max(0, 100 - value - other);
+    A.$("allocLeft").textContent =
+      `${SCOPE_NAME} ${value}%   ${OTHER_NAME} ${AT.num(other, 0)}%   `
+      + `어느 쪽도 쓰지 않는 현금 ${AT.num(left, 0)}%`
+      + (value + other > 100 ? "   합이 100%를 넘어 비례 축소됩니다" : "");
+  },
+
+  onSnapshot(snap) {
+    const A = AT, cfg = snap.config || {};
+    const mine = (snap.positions || []).filter((p) => A.scopeOf(p.key) === SCOPE);
+    const states = snap.position_states || {};
+
+    A.marketCards("marketCard", snap, {only: SCOPE, link: false});
+
+    // 설정 폼 (저장 중이면 덮지 않습니다)
+    if (!this._dirty) {
+      A.$("cfg_enabled").checked = cfg[`${P}_enabled`] !== false;
+      A.$("cfg_alloc").value = cfg[`${P}_alloc_pct`] ?? 50;
+      A.$("cfg_max_positions").value = cfg[`${P}_max_positions`] ?? 1;
+      A.$("cfg_risk").value = cfg[`${P}_risk_per_trade_pct`] ?? 0;
+      A.$("cfg_position_pct").value = cfg[`${P}_position_pct`] ?? 0;
+      this.allocNote(Number(A.$("cfg_alloc").value));
+    }
+    A.$("cfgNote").innerHTML = cfg.market_split
+      ? `공통값은 1회 위험 예산 <b>${A.num(cfg.risk_per_trade_pct, 2)}%</b>, `
+        + `종목당 최대 비중 <b>${A.num(cfg.position_pct, 0)}%</b> 입니다. `
+        + `여기에 0이 아닌 값을 넣으면 ${SCOPE_NAME} 종목에만 그 값이 쓰입니다. `
+        + `비중과 위험 예산은 <b>${SCOPE_NAME} 배분액</b> 기준으로 계산됩니다.`
+      : `<b>분리 운용이 꺼져 있습니다.</b> 지금은 한국과 미국이 한 지갑을 함께 쓰고 있어 `
+        + `이 화면의 배분 설정이 적용되지 않습니다. `
+        + `<a href="/autotrade">메인 화면</a>에서 켜세요.`;
+
+    // 포지션
+    A.$("posSub").textContent = `${mine.length}종목   `
+      + `평가손익 ${A.won(mine.reduce((s, p) => s + (p.unrealized_pnl || 0), 0))}`;
+    A.$("posEmpty").classList.toggle("hide", mine.length > 0);
+    A.$("posTable").classList.toggle("hide", mine.length === 0);
+    A.$("posTable").querySelector("tbody").innerHTML = mine.map((p) => {
+      const s = states[p.key] || {};
+      const off = p.managed === false;
+      // 금액만 보면 3만원 손실이 큰지 작은지 알 수 없습니다. 상세 슬라이드와
+      // 같은 식(진입가 대비, 숏은 부호 반전)으로 수익률을 옆에 같이 적습니다.
+      const pnlPct = p.avg_price && p.current_price
+        ? ((p.current_price - p.avg_price) / p.avg_price * 100 * (p.side === "short" ? -1 : 1)) : null;
+      const sp = p.split;
+      return `<tr class="${off ? "pos-unmanaged" : ""}">
+        <td>${A.esc(p.name)}${off ? '<span class="tag-unmanaged">관리 안 함</span>' : ""}
+            ${s.pinned ? '<span class="tag-pinned">고정</span>' : ""}
+            ${sp ? `<span class="tag-unmanaged">분할 ${sp.count}/${sp.total}차</span>` : ""}
+            <div class="muted mono" style="font-size:13.5px">${p.key}</div></td>
+        <td class="num">${A.num(p.quantity, 4)}</td>
+        <td class="num">${A.num(p.avg_price)}</td>
+        <td class="num">${A.num(p.current_price)}</td>
+        <td class="num ${A.sign(p.unrealized_pnl)}">${A.won(p.unrealized_pnl)}${pnlPct == null ? "" : ` (${A.pct(pnlPct)})`}</td>
+        <td class="num muted">${s.stop_price ? A.num(s.stop_price) : "-"}</td>
+        <td class="num muted">${s.target_price ? A.num(s.target_price) : "-"}</td>
+        <td><button class="sm danger" data-close="${p.key}">청산</button></td>
+      </tr>`;
+    }).join("");
+    document.querySelectorAll("[data-close]").forEach((b) =>
+      b.onclick = () => this.closePosition(b.dataset.close));
+
+    // 체결 대기 — 이 시장 것만
+    const open = (snap.open_orders || []).filter((o) => A.scopeOf(o.symbol) === SCOPE);
+    A.$("openOrders").classList.toggle("hide", open.length === 0);
+    A.$("openTable").querySelector("tbody").innerHTML = open.map((o) => `<tr>
+      <td class="muted mono">${o.created_at.slice(11, 19)}</td>
+      <td>${A.esc(o.name || o.symbol)}</td>
+      <td>${this.ACTION[o.action] || o.action}</td>
+      <td class="num">${A.num(o.quantity, 4)}</td>
+      <td class="num ${o.filled_quantity > 0 ? "up" : "muted"}">${A.num(o.filled_quantity, 4)}</td>
+      <td class="num">${A.num(o.price)}</td>
+      <td>${this.STATUS[o.status] || o.status}</td>
+      <td><button class="sm" data-cancel="${o.id}">취소</button></td>
+    </tr>`).join("");
+    document.querySelectorAll("[data-cancel]").forEach((b) =>
+      b.onclick = () => this.cancelOrder(b.dataset.cancel));
+
+    // 매매 대상
+    const held = new Set(mine.map((p) => p.key));
+    const uni = (snap.universe_detail || []).filter((u) => A.scopeOf(u.key) === SCOPE);
+    A.$("uniBox").innerHTML = uni.length
+      ? uni.map((u) => `<span class="uni-tag ${held.has(u.key) ? "held" : ""}"
+          title="${A.esc((u.reasons || []).join(" "))}">${A.esc(u.name || u.key)}
+          ${u.auto ? '<span class="muted" style="font-size:13px">AI</span>' : ""}</span>`).join("")
+      : `<div class="note">${SCOPE_NAME} 종목이 매매 대상에 없습니다.
+         <a href="/autotrade/ai">AI 추천</a> 화면에서 넣으세요.</div>`;
+  },
+
+  async closePosition(symbol) {
+    if (!confirm(`${symbol} 을 지금 청산할까요?`)) return;
+    try {
+      const r = await AT.call(`/autotrade/close/${encodeURIComponent(symbol)}`, {method: "POST"});
+      AT.toast(r.message || "청산 주문을 냈습니다.");
+      AT.refresh();
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  async cancelOrder(id) {
+    try {
+      const r = await AT.call(`/autotrade/orders/${id}/cancel`, {method: "POST"});
+      AT.toast(r.message || "취소를 요청했습니다.");
+      AT.refresh();
+    } catch (e) { AT.toast(e.message, true); }
+  },
+
+  // 로그는 종목코드로 거릅니다. 종목이 없는 줄(회전 요약·계좌 경고)은 두
+  // 시장 모두에 해당하므로 남겨둡니다 — 지우면 "왜 아무것도 안 하지"의
+  // 답이 이 화면에서 사라집니다.
+  async pollEvents() {
+    try {
+      const data = await AT.call("/autotrade/events?limit=120");
+      const rows = (data.events || []).filter((e) => {
+        if (e.symbol) return AT.scopeOf(e.symbol) === SCOPE;
+        // 종목이 없는 줄은 두 시장 모두의 이야기라 남깁니다. 다만 장 상태만은
+        // 어느 장인지가 문구에 있으므로, 이 시장 것만 추립니다.
+        if (e.kind === "market") return e.message.includes(SCOPE_NAME);
+        return true;
+      });
+      AT.$("logBox").innerHTML = rows.map((e) => `<div class="line">
+        <span class="t">${e.created_at.slice(11, 19)}</span>
+        <span class="k k-${e.kind}">${e.kind}</span>
+        <span>${AT.esc(e.message)}</span></div>`).join("")
+        || `<div class="center">기록이 없습니다.</div>`;
+    } catch {}
+  },
+};
+</script>
+<script src="/static/at_common.js"></script>
+</body>
+</html>

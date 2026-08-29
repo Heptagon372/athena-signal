@@ -29,7 +29,8 @@
 import numpy as np
 import pandas as pd
 
-from config import INDICATOR_WEIGHTS, MIN_BARS_FOR_TECHNICAL
+from config import (INDICATOR_FAMILY_CAP, INDICATOR_WEIGHTS,
+                    MIN_BARS_FOR_TECHNICAL, REGIME_MULTIPLIER)
 from engine import econophysics, quant
 from models import IndicatorResult, TechnicalAnalysis
 
@@ -938,19 +939,7 @@ def detect_regime(df: pd.DataFrame) -> dict:
 
     trend_score = float(np.mean(score_parts)) if score_parts else 0.0
 
-    if trend_score >= 0.25:
-        regime, label = "TREND", "추세 국면"
-        multipliers = {"trend": 1.45, "meanrev": 0.55, "confirm": 1.0, "info": 0.0}
-        strategy = "추세추종 지표(MACD·이동평균·ADX)에 비중을 싣고, 되돌림 지표는 낮췄습니다."
-    elif trend_score <= -0.25:
-        regime, label = "MEAN_REVERT", "평균회귀 국면"
-        multipliers = {"trend": 0.55, "meanrev": 1.45, "confirm": 1.0, "info": 0.0}
-        strategy = "되돌림 지표(RSI·볼린저·CCI)에 비중을 싣고, 추세추종 지표는 낮췄습니다."
-    else:
-        regime, label = "RANDOM", "방향성 불분명"
-        multipliers = {"trend": 0.8, "meanrev": 0.8, "confirm": 1.0, "info": 0.0}
-        strategy = ("추세도 되돌림도 통계적으로 뚜렷하지 않아 모든 지표의 비중을 낮추고 "
-                    "확률을 50%에 가깝게 유지합니다.")
+    regime, label, multipliers, strategy = _regime_multipliers(trend_score)
 
     return {
         "regime": regime,
@@ -967,6 +956,127 @@ def detect_regime(df: pd.DataFrame) -> dict:
         "dfa": dfa_res,
         "modified_rs": mrs,
     }
+
+
+def _regime_multipliers(trend_score: float) -> tuple:
+    """추세점수 -> (국면, 이름, 지표군 배수, 설명).
+
+    예전에는 ±0.25 에서 **계단**으로 꺾었습니다. 추세점수 0.249 와 0.251 이
+    배수 0.8 과 1.45 로 갈려, 잡음 한 톨에 신호가 뒤집혔습니다.
+
+    지금은 추세점수에 따라 배수를 **연속으로** 보간합니다. 국면 이름(라벨)은
+    사람이 읽으라고 예전 기준 그대로 붙이되, 실제 배수는 경계에서 매끄럽게
+    이어집니다.
+
+    되돌림군에는 하한(meanrev_floor)을 둡니다. 수직 급등은 그 자체로 ADX·Hurst·
+    분산비율을 전부 '추세'로 만들고, 그러면 과열을 경고하는 지표가 깎입니다.
+    **급등이 스스로 자기 경고를 지우는 구조**라, 그 아래로는 못 내려가게 막습니다.
+    """
+    p = REGIME_MULTIPLIER
+    t = _clip(float(trend_score))
+
+    if t >= 0.25:
+        regime, label = "TREND", "추세 국면"
+    elif t <= -0.25:
+        regime, label = "MEAN_REVERT", "평균회귀 국면"
+    else:
+        regime, label = "RANDOM", "방향성 불분명"
+
+    if not p.get("smooth", True):
+        table = {"TREND": (1.45, 0.55), "MEAN_REVERT": (0.55, 1.45), "RANDOM": (0.8, 0.8)}
+        tr, mr = table[regime]
+    else:
+        # t=0 에서 neutral 로 시작해 |t|=full_at 에서 극값에 닿고, 그 위로는 평평.
+        # 되돌림군은 같은 축을 반대로 탑니다.
+        neutral = float(p["neutral"])
+        full_at = max(0.05, float(p.get("full_at", 0.5)))
+        k = min(abs(t) / full_at, 1.0)          # 0 ~ 1 진행도
+        if t >= 0:
+            tr = neutral + k * (float(p["trend_max"]) - neutral)
+            mr = neutral + k * (float(p["trend_min"]) - neutral)
+        else:
+            tr = neutral + k * (float(p["trend_min"]) - neutral)
+            mr = neutral + k * (float(p["trend_max"]) - neutral)
+
+    multipliers = {"trend": round(tr, 4), "meanrev": round(mr, 4),
+                   "confirm": 1.0, "info": 0.0}
+
+    if regime == "TREND":
+        strategy = (f"추세추종 지표(MACD·이동평균·ADX)에 비중을 실었습니다 "
+                    f"(×{tr:.2f}). 되돌림 지표는 ×{mr:.2f} 입니다.")
+    elif regime == "MEAN_REVERT":
+        strategy = (f"되돌림 지표(RSI·볼린저·CCI)에 비중을 실었습니다 (×{mr:.2f}). "
+                    f"추세추종 지표는 ×{tr:.2f} 입니다.")
+    else:
+        strategy = (f"추세도 되돌림도 통계적으로 뚜렷하지 않아 모든 지표의 비중을 "
+                    f"낮추고(추세 ×{tr:.2f} · 되돌림 ×{mr:.2f}) 확률을 50%에 "
+                    f"가깝게 유지합니다.")
+
+    return regime, label, multipliers, strategy
+
+
+def _family_signal(indicators: list, family: str) -> float:
+    """지표군의 가중평균 점수 (-1 ~ +1). 그 군이 지금 무슨 말을 하는지 한 숫자로."""
+    picked = [i for i in indicators if i.family == family and i.weight > 0]
+    total = sum(i.weight for i in picked)
+    if not total:
+        return 0.0
+    return float(sum(i.score * i.weight for i in picked) / total)
+
+
+def _apply_family_cap(indicators: list) -> dict:
+    """지표군이 전체 가중에서 가져가는 비중에 상한을 씌웁니다 (공선성 보정).
+
+    추세 지표 9개는 사실상 같은 질문("최근에 올랐나")을 합니다. 급등하면 아홉 개가
+    동시에 포화해 전체 가중의 78% 를 가져갑니다 — 상관 높은 한 표를 아홉 표로
+    세는 것입니다. 지표를 지우지 않고 **군의 몫**만 조입니다. 개별 지표를 빼면
+    그 지표가 혼자 옳았던 국면까지 같이 잃기 때문입니다.
+
+    상한을 넘긴 군은 군 안에서 **비율을 유지한 채** 축소합니다 (군 안의 상대
+    서열은 그대로 두고 목소리 크기만 줄입니다). 반환값은 화면·로그용 요약입니다.
+    """
+    caps = {k: float(v) for k, v in (INDICATOR_FAMILY_CAP or {}).items()
+            if v and 0 < float(v) < 1.0}
+    report = {"applied": {}, "before": {}, "after": {}}
+    if not caps:
+        return report
+
+    def shares() -> dict:
+        total = sum(i.weight for i in indicators) or 1.0
+        out = {}
+        for i in indicators:
+            out[i.family] = out.get(i.family, 0.0) + i.weight / total
+        return out
+
+    report["before"] = {k: round(v, 4) for k, v in shares().items()}
+
+    # 군 하나를 줄이면 전체 합도 같이 줄어, 그 군의 비중이 목표보다 덜 내려갑니다.
+    # 그래서 비율로 나누지 않고 **목표 비중이 되는 무게를 직접 풉니다.**
+    #     w_new / (T_나머지 + w_new) = c   ->   w_new = c × T_나머지 / (1 - c)
+    # 두 군이 동시에 상한을 넘으면 서로의 분모를 바꾸므로 몇 번 돌려 수렴시킵니다.
+    for _ in range(12):
+        total = sum(i.weight for i in indicators)
+        if total <= 0:
+            break
+        over = [f for f, c in caps.items()
+                if sum(i.weight for i in indicators if i.family == f) / total > c + 1e-9]
+        if not over:
+            break
+        for family in over:
+            cap = caps[family]
+            w_family = sum(i.weight for i in indicators if i.family == family)
+            others = sum(i.weight for i in indicators if i.family != family)
+            target = cap * others / (1.0 - cap)
+            if w_family <= 0 or target >= w_family:
+                continue
+            ratio = target / w_family
+            for ind in indicators:
+                if ind.family == family:
+                    ind.weight = round(ind.weight * ratio, 6)
+            report["applied"][family] = cap
+
+    report["after"] = {k: round(v, 4) for k, v in shares().items()}
+    return report
 
 
 def analyze(df: pd.DataFrame) -> TechnicalAnalysis:
@@ -1006,9 +1116,33 @@ def analyze(df: pd.DataFrame) -> TechnicalAnalysis:
     multipliers = regime["multipliers"]
 
     for ind in indicators:
-        family = INDICATOR_FAMILY.get(ind.key, "confirm")
-        ind.family = family
-        ind.weight = round(ind.weight * multipliers.get(family, 1.0), 4)
+        ind.family = INDICATOR_FAMILY.get(ind.key, "confirm")
+
+    # 순환논리 차단 — 되돌림 지표가 **실제로 극단을 가리킬 때만** 감쇠를 풉니다.
+    #
+    # 왜 필요한가: 수직 급등은 그 자체로 ADX·Hurst·분산비율을 전부 '추세'로 만들고,
+    # 그러면 과열을 경고하는 되돌림 지표가 ×0.55 로 깎입니다. 급등이 스스로 자기
+    # 경고를 지우는 구조입니다.
+    #
+    # 왜 '실제로 가리킬 때만' 인가: 되돌림군 배수를 일률적으로 올리면 고점도 정상
+    # 추세도 점수가 같이 내려가 순서가 바뀌지 않습니다(척도만 이동). RSI 가 중립
+    # 구간이면 점수가 0 이라 배수가 얼마든 결과가 같으므로, 이 규칙은 과열·침체
+    # 구간에서만 실제로 작동합니다 — 그게 정확히 순환논리가 무는 자리입니다.
+    mr_hint = _family_signal(indicators, "meanrev")
+    unclamped = None
+    if abs(mr_hint) >= float(REGIME_MULTIPLIER.get("extreme_at", 1.1)):
+        floor = float(REGIME_MULTIPLIER.get("extreme_floor", 1.0))
+        if multipliers.get("meanrev", 1.0) < floor:
+            unclamped = (multipliers["meanrev"], floor)
+            multipliers = {**multipliers, "meanrev": floor}
+
+    for ind in indicators:
+        ind.weight = round(ind.weight * multipliers.get(ind.family, 1.0), 4)
+
+    # 공선성 보정 — 지표군이 전체 가중에서 가져갈 몫에 상한을 씌웁니다.
+    # 국면 배수를 곱한 **뒤에** 해야 합니다. 배수가 곱해지기 전 비중에 상한을
+    # 걸면, 배수가 그 상한을 다시 뚫습니다 (추세국면 ×1.45 가 정확히 그 짓을 합니다).
+    cap_report = _apply_family_cap(indicators)
 
     weighted_sum = sum(i.score * i.weight for i in indicators)
     total_weight = sum(i.weight for i in indicators)
@@ -1018,6 +1152,14 @@ def analyze(df: pd.DataFrame) -> TechnicalAnalysis:
     note = (f"일봉 {bars}개 기준 {len(indicators)}개 지표를 계산했습니다. "
             f"국면 판정: {regime['label']} (추세점수 {regime['trend_score']:+.2f}). "
             f"{regime['strategy']}")
+    if unclamped:
+        note += (f" 되돌림 지표가 {mr_hint:+.2f} 로 극단을 가리켜 국면 감쇠를 "
+                 f"풀었습니다 (×{unclamped[0]:.2f} → ×{unclamped[1]:.2f}). "
+                 f"급등이 스스로 과열 경고를 지우지 못하게 하는 장치입니다.")
+    if cap_report.get("applied"):
+        capped = " · ".join(f"{f} {cap_report['before'].get(f, 0):.0%}→{cap_report['after'].get(f, 0):.0%}"
+                            for f in cap_report["applied"])
+        note += (f" 같은 질문을 하는 지표가 몰려 비중 상한을 적용했습니다 ({capped}).")
     if skipped:
         note += f" 데이터 부족으로 {skipped}개 지표는 건너뛰었습니다."
 

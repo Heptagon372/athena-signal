@@ -198,12 +198,24 @@ def test_strategy():
     check("신호", "하락 추세 → 진입 안 함 (현물은 숏 불가)",
           sig_dn.ok and sig_dn.direction == strategy.FLAT, f"점수 {sig_dn.score:+.3f}")
 
+    # 이 하락 봉은 RSI 14 · 20일선에서 4 ATR 아래인 '이미 다 빠진' 자리라, 과열
+    # 진입 게이트가 추격매도로 보고 막습니다. 여기서 확인하려는 것은 **방향 판정**
+    # 이므로 게이트를 끄고 봅니다. 게이트 자체는 바로 아래 줄에서 따로 확인합니다.
     fut = instruments.parse_derivative("101H6000")
-    sig_short = strategy.evaluate(fut, dict(cfg, allow_short=True), bars_daily=down,
+    sig_short = strategy.evaluate(fut, dict(cfg, allow_short=True, overheat_gate=False),
+                                  bars_daily=down,
                                   quote=fake_quote(float(down["close"].iloc[-1])),
                                   allow_fetch=False)
     check("신호", "파생 + 숏 허용 → 숏 신호",
           sig_short.direction == strategy.SHORT, f"점수 {sig_short.score:+.3f}")
+
+    sig_gated = strategy.evaluate(fut, dict(cfg, allow_short=True), bars_daily=down,
+                                  quote=fake_quote(float(down["close"].iloc[-1])),
+                                  allow_fetch=False)
+    check("신호", "과열 게이트가 급락 바닥 추격매도를 막는다",
+          sig_gated.direction == strategy.FLAT
+          and (sig_gated.overheat or {}).get("blocked"),
+          (sig_gated.overheat or {}).get("note", "")[:50])
 
     short_bars = trend_bars(n=10)
     check("신호", "봉이 부족하면 신호를 만들지 않음",
@@ -1060,6 +1072,16 @@ def test_reconcile():
         check("잔고", "주문가능현금은 예수금이 아님 (미결제 매수대금 제외)",
               snap["available_cash"] == 3_325 and snap["deposit"] == 132_226,
               f"예수금 {snap['deposit']:,.0f} / 주문가능 {snap['available_cash']:,.0f}")
+        # 체결기준 예수금 = 예수금 − 미결제매수 + 미결제매도.
+        # 이 값이 있어야 '총자산 = 총예수금 + 평가금액'이 화면에서 맞습니다.
+        check("잔고", "체결기준 예수금은 미결제분을 정리한 뒤 남을 현금",
+              snap["settled_deposit"] == 132_226 - 129_692 + 7_235,
+              f"{snap['settled_deposit']:,.0f}원")
+        check("잔고", "체결기준 총자산 = 체결기준 예수금 + 체결기준 평가금액",
+              abs(snap["settled_asset"]
+                  - (snap["settled_deposit"] + snap["eval_amount"])) < 1,
+              f"{snap['settled_asset']:,.0f} = {snap['settled_deposit']:,.0f}"
+              f" + {snap['eval_amount']:,.0f}")
         check("잔고", "평가금액은 체결기준 — 결제 전 보유분도 셈",
               snap["eval_amount"] == 129_194 and snap["settled_eval_amount"] == 7_292,
               f"체결 {snap['eval_amount']:,.0f} / 결제 {snap['settled_eval_amount']:,.0f}")
@@ -1139,23 +1161,69 @@ def test_reconcile():
         # 쓰는 옛 동작이 되살아나면 바로 잡히게 합니다.
         BK.kis_trading.account_snapshot = lambda: {
             "ok": True, "total_asset": 139_518.0, "settled_asset": 138_963.0,
-            "deposit": 132_226.0, "available_cash": 3_325.0, "withdrawable": 3_325.0,
+            "deposit": 132_226.0, "settled_deposit": 9_769.0,
+            "available_cash": 3_325.0, "withdrawable": 3_325.0,
             "purchase_amount": 129_379.0, "eval_amount": 129_194.0,
             "unrealized_pnl": -185.0, "unsettled_buy": 129_692.0,
             "unsettled_sell": 7_235.0, "fx_rate": 1_418.8,
             "settled_eval_amount": 7_292.0, "sources": ["자산현황"], "errors": []}
         live = BK.KISBroker(user, BK.LIVE, {}).account()
-        check("잔고", "총자산은 증권사가 계산한 값을 그대로",
-              live["total_value"] == 139_518.0, f"{live['total_value']:,.0f}원")
-        check("잔고", "주문가능 현금은 예수금이 아니라 주문가능현금",
-              live["available_cash"] == 3_325.0 and live["cash"] == 132_226.0,
+        # 결제기준 총자산은 오늘 판 종목을 아직 들고 있는 것으로 세서, 매매가
+        # 잦으면 통째로 부풉니다 (실측 2026-08-29: 130만 vs 53만). 화면과
+        # 엔진은 체결기준을 씁니다 — 결제기준은 진단용으로만 남습니다.
+        check("잔고", "총자산은 체결기준 (결제기준은 진단용으로만 보관)",
+              live["total_value"] == 138_963.0
+              and live["gross_total_value"] == 139_518.0,
+              f"체결 {live['total_value']:,.0f} / 결제 {live['gross_total_value']:,.0f}")
+        check("잔고", "총예수금도 체결기준 — 미결제 매수대금을 뺀 금액",
+              live["available_cash"] == 3_325.0 and live["cash"] == 9_769.0
+              and live["gross_deposit"] == 132_226.0,
               f"예수금 {live['cash']:,.0f} / 주문가능 {live['available_cash']:,.0f}")
-        check("잔고", "예수금에 묶인 미결제 매수대금이 드러남",
-              live["reserved_cash"] == 128_901.0 and live["unsettled_buy"] == 129_692.0,
-              f"묶임 {live['reserved_cash']:,.0f} / 미결제매수 {live['unsettled_buy']:,.0f}")
+        check("잔고", "미결제 매수·매도 금액은 그대로 드러남",
+              live["unsettled_buy"] == 129_692.0 and live["unsettled_sell"] == 7_235.0,
+              f"매수 {live['unsettled_buy']:,.0f} / 매도 {live['unsettled_sell']:,.0f}")
         check("잔고", "평가금액은 체결기준 (결제 안 된 보유분도 노출로 계산)",
               live["equity_value"] == 129_194.0 and live["notional_exposure"] == 129_194.0,
               f"{live['equity_value']:,.0f}원")
+        # 화면에 나란히 뜨는 세 숫자가 서로 맞아야 합니다.
+        check("잔고", "화면 항등식: 총자산 = 총예수금 + 평가금액",
+              abs(live["total_value"] - (live["cash"] + live["equity_value"])) < 1,
+              f"{live['total_value']:,.0f} = {live['cash']:,.0f}"
+              f" + {live['equity_value']:,.0f}")
+
+        # --- 국내 + 미국 + 외화예수금을 같이 굴리는 계좌 -------------------
+        # 실계좌 실측값 (2026-08-29, 위탁계좌 1002****-01).
+        # 여기서 두 가지가 한꺼번에 터졌습니다:
+        #   ① 체결기준잔고 TR 의 총자산은 **해외분까지만** 셉니다
+        #      → 국내 6종목 235,080원이 총자산에서 통째로 사라졌습니다.
+        #   ② 총현금이 아니라 원화 예수금에서 미결제를 빼면
+        #      → 외화 예수금 271,753원이 총예수금에서 사라졌습니다.
+        # 화면에는 총자산 679,581원으로 떴고, 실제는 914,660원이었습니다.
+        BK.kis_trading.stock_balance = lambda: {
+            "ok": True, "positions": [], "cash": 158_968.0,
+            "available_cash": 158_968.0, "eval_amount": 235_080.0,
+            "purchase_amount": 0.0, "total_pnl": 0.0}
+        BK.kis_trading.overseas_balance_all = lambda: {"ok": True, "positions": []}
+        BK.kis_trading.account_snapshot = lambda: {
+            "ok": True, "total_asset": 978_571.0, "settled_asset": 679_580.0,
+            "deposit": 158_968.0, "foreign_cash": 271_753.0,
+            "cash_total": 430_721.0, "settled_deposit": 443_903.0,
+            "available_cash": 158_968.0, "withdrawable": 158_968.0,
+            "purchase_amount": 237_416.0, "eval_amount": 235_677.0,
+            "unrealized_pnl": -1_739.0, "unsettled_buy": 59_076.0,
+            "unsettled_sell": 72_258.0, "fx_rate": 1_380.3,
+            "settled_eval_amount": 547_850.0, "sources": ["자산현황"], "errors": []}
+        both = BK.KISBroker(user, BK.LIVE, {}).account()
+        check("잔고", "국내 보유분이 총자산에서 빠지지 않음",
+              both["total_value"] == 679_580.0 + 235_080.0,
+              f"{both['total_value']:,.0f}원 (해외 679,580 + 국내 235,080)")
+        check("잔고", "외화 예수금이 총예수금에서 빠지지 않음",
+              both["cash"] == 443_903.0,
+              f"{both['cash']:,.0f}원 (원화 158,968 + 외화 271,753 − 미결제 순 13,182 조정)")
+        check("잔고", "국내·미국 겸용 계좌에서도 총자산 = 총예수금 + 평가금액",
+              abs(both["total_value"] - (both["cash"] + both["equity_value"])) < 1,
+              f"{both['total_value']:,.0f} = {both['cash']:,.0f}"
+              f" + {both['equity_value']:,.0f}")
     finally:
         (BK.kis_trading.stock_balance, BK.kis_trading.deriv_balance,
          BK.kis_trading.overseas_balance_all, BK.kis_trading.account_snapshot,
@@ -2171,6 +2239,295 @@ def test_scalp_chart():
 # 13. AI 추천 — 물리학 팩터 · 스마트머니 · 장 상태 알림
 # ---------------------------------------------------------------------------
 
+def test_recommend_background():
+    """[지금 추천 받기] 비동기화 — 2단계 갱신 · 시작 가드 · 편입 규칙.
+
+    모의계좌(구글 계정)에서 한국 시장을 처음 추적하면 정식 계산에 10분이
+    넘게 걸려 "안 찾아준다"로 보였습니다. 고친 뒤의 계약을 검사합니다:
+    캐시 패스가 먼저 저장되고, 계산은 백그라운드 1개로만 돌고, 추적이
+    꺼져 있으면 편입하지 않습니다.
+    """
+    section("추천 백그라운드 갱신 (2단계 · 시작 가드)")
+    import time as _time
+    from engine import autotrade as at
+
+    user = TEST_USER
+
+    class FakeRec:
+        def __init__(self, key="REC01", score=0.9):
+            self.key = key; self.name = "추천테스트"; self.market = "KOSPI"
+            self.score = score; self.tradable = True; self.rank = 1
+            self.regime = "추세 국면"; self.price = 1000.0; self.price_krw = 1000.0
+        def to_dict(self):
+            return {"key": self.key, "name": self.name, "market": self.market,
+                    "rank": self.rank, "score": self.score, "price": self.price,
+                    "price_krw": self.price_krw, "regime": self.regime,
+                    "reasons": [], "factors": {}}
+
+    calls = []
+    real_recommend = at.recommend_universe
+
+    def fake_recommend(user_id, cfg, account, top_n=None, offline_only=False):
+        calls.append(offline_only)
+        return [FakeRec()]
+
+    at.recommend_universe = fake_recommend
+    prev_cfg = store.get_config(user)
+    try:
+        store.save_config(user, {"auto_universe": False, "universe": [],
+                                 "manual_universe": [], "mode": "paper",
+                                 "auto_universe_min_score": 0.55,
+                                 "auto_universe_size": 5})
+        store.save_recommendations(user, [], [])
+
+        # 1) manual + 추적 꺼짐 — 두 단계가 돌고, 편입은 하지 않는다
+        at._tracking_refresh(user, manual=True)
+        cfg2 = store.get_config(user)
+        recs = store.get_recommendations(user)
+        check("추천", "manual 은 추적이 꺼져 있어도 계산한다", len(recs) > 0)
+        check("추천", "1단계(캐시)→2단계(정식) 순서로 돈다", calls == [True, False],
+              f"calls={calls}")
+        check("추천", "추적이 꺼져 있으면 편입하지 않는다",
+              cfg2.get("universe") == [], f"universe={cfg2.get('universe')}")
+        check("추천", "편입 후보(picked)는 저장된다", any(r["picked"] for r in recs))
+
+        # 2) 자동 추적 켜짐 — 편입까지 한다
+        calls.clear()
+        store.save_config(user, {"auto_universe": True})
+        at._tracking_refresh(user, manual=True)
+        cfg3 = store.get_config(user)
+        check("추천", "추적이 켜져 있으면 편입한다", cfg3.get("universe") == ["REC01"],
+              f"universe={cfg3.get('universe')}")
+
+        # 2-b) 계산 도중 추적을 끄면 — 편입을 강행하지 않는다 (저장 직전 재판정)
+        store.save_config(user, {"universe": [], "auto_universe": True})
+
+        def recommend_and_turn_off(user_id, cfg, account, top_n=None,
+                                   offline_only=False):
+            # 몇 분짜리 정식 계산 도중 사용자가 추적을 끈 상황을 흉내
+            store.save_config(user_id, {"auto_universe": False})
+            return [FakeRec()]
+
+        at.recommend_universe = recommend_and_turn_off
+        at._tracking_refresh(user, manual=True)
+        cfg4 = store.get_config(user)
+        check("추천", "계산 중 추적을 끄면 편입하지 않는다",
+              cfg4.get("universe") == [], f"universe={cfg4.get('universe')}")
+        at.recommend_universe = fake_recommend
+
+        # 2-c) 구계정(manual_universe 없음)의 수동 종목은 2단계 갱신을 살아남는다
+        #      — 1단계가 저장하는 picked 는 순수 AI 선정뿐이라, 2단계의
+        #      previous_auto 추정이 수동 종목을 "AI 가 뽑았던 것"으로 오분류해
+        #      지우는 일이 없어야 합니다.
+        store.save_config(user, {"auto_universe": True,
+                                 "universe": ["MANU01"], "manual_universe": []})
+        store.save_recommendations(user, [], [])
+
+        def recommend_two(user_id, cfg, account, top_n=None, offline_only=False):
+            return [FakeRec("AUTO01", score=0.9), FakeRec("MANU01", score=0.4)]
+
+        at.recommend_universe = recommend_two
+        at._tracking_refresh(user, manual=True)
+        cfg5 = store.get_config(user)
+        recs5 = store.get_recommendations(user)
+        check("추천", "수동 종목은 2단계 갱신 후에도 매매 대상에 남는다",
+              set(cfg5.get("universe") or []) == {"MANU01", "AUTO01"},
+              f"universe={cfg5.get('universe')}")
+        check("추천", "picked 표시는 순수 AI 선정에만 붙는다",
+              {r["symbol"] for r in recs5 if r["picked"]} == {"AUTO01"},
+              f"picked={[r['symbol'] for r in recs5 if r['picked']]}")
+        at.recommend_universe = fake_recommend
+
+        # 3) 시작 가드 — 이미 도는 중이면 다시 시작하지 않는다
+        with at._refresh_guard:
+            at._refreshing_users.add(user)
+        check("추천", "계산 중이면 다시 시작하지 않는다 (False)",
+              at.start_recommend_refresh(user) is False)
+        with at._refresh_guard:
+            at._refreshing_users.discard(user)
+        check("추천", "is_refreshing 이 가드를 그대로 비춘다", not at.is_refreshing(user))
+
+        # 4) start → 스레드가 manual=True 로 1회 돌고 가드가 풀린다
+        ran = []
+        real_tracking = at._tracking_refresh
+
+        def fake_tracking(user_id, manual=False):
+            ran.append((user_id, manual))
+            with at._refresh_guard:
+                at._refreshing_users.discard(user_id)
+
+        at._tracking_refresh = fake_tracking
+        try:
+            ok = at.start_recommend_refresh(user)
+            deadline = _time.time() + 3
+            while _time.time() < deadline and (not ran or at.is_refreshing(user)):
+                _time.sleep(0.05)
+            check("추천", "백그라운드 시작 → manual=True 로 1회 실행",
+                  ok and ran == [(user, True)], f"ran={ran}")
+            check("추천", "실행이 끝나면 가드가 풀린다", not at.is_refreshing(user))
+        finally:
+            at._tracking_refresh = real_tracking
+    finally:
+        at.recommend_universe = real_recommend
+        store.save_config(user, {k: prev_cfg.get(k) for k in
+                                 ("auto_universe", "universe", "manual_universe",
+                                  "mode", "auto_universe_min_score",
+                                  "auto_universe_size")})
+        store.save_recommendations(user, [], [])
+
+
+def test_recommend_offline_pass():
+    """recommend_universe(offline_only=True) — 캐시 전용 패스의 계약.
+
+    새 팩터 계산이 하나라도 시작되면 이 패스는 "몇 초"가 아니라 몇 분짜리가
+    됩니다. 그래서 (a) 회전으로 세지 않고, (b) 모든 후보를 stale(캐시 전용)로
+    넘기고, (c) 캐시 없는 종목은 계산 창에 담지 않는지를 검사합니다.
+    """
+    section("추천 캐시 전용 패스 (offline_only)")
+    from engine import autotrade as at
+    from data_sources import screener, universe as universe_mod
+    from engine import recommender
+
+    user = TEST_USER
+
+    class Cand:
+        def __init__(self, key, market="US", source="nasdaq"):
+            self.key = key; self.market = market; self.source = source
+            self.name = key
+
+        def to_dict(self):
+            return {"key": self.key, "market": self.market, "name": self.name}
+
+    def fake_scan(**kwargs):
+        out = screener.ScanResult()
+        out.candidates = [Cand("USCACHED"), Cand("USFRESH"),
+                          Cand("KR30", market="KOSPI")]
+        return out
+
+    bumps = {"n": 0}
+    captured = {}
+
+    def fake_bump(user_id):
+        bumps["n"] += 1
+        return bumps["n"]
+
+    def fake_rank(candidates, cfg, account, top_n=5, market_regime="",
+                  stale_keys=None):
+        captured["keys"] = [getattr(c, "key", c) for c in candidates]
+        captured["stale"] = set(stale_keys or set())
+        return []
+
+    real = (screener.scan, universe_mod.kr_listed, recommender.cached_factor_keys,
+            recommender.uncomputable_keys, recommender.rank, store.bump_scan_round)
+    screener.scan = fake_scan
+    universe_mod.kr_listed = lambda segments: [{"key": "KRCACHED"},
+                                               {"key": "KRFRESH"}]
+    recommender.cached_factor_keys = lambda max_age=None: {"USCACHED", "KRCACHED"}
+    recommender.uncomputable_keys = lambda: set()
+    recommender.rank = fake_rank
+    store.bump_scan_round = fake_bump
+    cfg = {"auto_universe_markets": ["KOSPI", "NASDAQ"], "auto_universe_pool": "",
+           "auto_universe_size": 5, "auto_universe_scan_limit": 100,
+           "auto_universe_full_market": True}
+    try:
+        at._last_rotation.pop(user, None)
+
+        at.recommend_universe(user, cfg, {}, offline_only=True)
+        check("추천", "캐시 패스는 회전으로 세지 않는다", bumps["n"] == 0,
+              f"bumps={bumps['n']}")
+        check("추천", "캐시 패스는 순환 현황을 덮지 않는다",
+              user not in at._last_rotation)
+        check("추천", "모든 후보가 stale(캐시 전용)로 넘어간다",
+              captured["stale"] >= {"USCACHED", "KRCACHED", "KR30"},
+              f"stale={captured['stale']}")
+        check("추천", "캐시 없는 종목은 계산 창에 담지 않는다",
+              "USFRESH" not in captured["keys"]
+              and "KRFRESH" not in captured["keys"],
+              f"keys={captured['keys']}")
+
+        at.recommend_universe(user, cfg, {})
+        check("추천", "정식 패스는 회전으로 센다", bumps["n"] == 1,
+              f"bumps={bumps['n']}")
+        check("추천", "정식 패스는 계산 창을 채운다 (신규 종목 포함)",
+              "USFRESH" in captured["keys"] and "KRFRESH" in captured["keys"],
+              f"keys={captured['keys']}")
+        check("추천", "정식 패스의 stale 은 캐시 종목뿐",
+              "KR30" not in captured["stale"], f"stale={captured['stale']}")
+    finally:
+        (screener.scan, universe_mod.kr_listed, recommender.cached_factor_keys,
+         recommender.uncomputable_keys, recommender.rank,
+         store.bump_scan_round) = real
+        at._last_rotation.pop(user, None)
+
+
+def test_kis_token_cooldown():
+    """KIS 토큰 발급 실패의 쿨다운 — 실패 직후의 재시도는 하지 않는다.
+
+    키가 서버와 맞지 않는 환경(구글 계정 오버레이의 모의서버 + 서버 실전
+    앱키)에서는 국내 종목마다 토큰 발급을 다시 시도해 팩터 계산이 몇 배로
+    느려졌습니다. 쿨다운 안에서는 HTTP 왕복 없이 바로 포기해야 합니다.
+    """
+    section("KIS 토큰 실패 쿨다운")
+    from data_sources import http_client, kis_client as kc
+
+    calls = {"n": 0}
+
+    def fake_post(url, json_body=None, headers=None, timeout=0):
+        calls["n"] += 1
+        return 403, {"error_description": "denied"}, "denied"
+
+    real_post = http_client.post_full
+    real_app_key, real_app_secret = kc.app_key, kc.app_secret
+    real_load_saved = kc._load_saved_token
+    http_client.post_full = fake_post
+    kc.app_key = lambda: "FAKE-KEY-COOLDOWN-TEST"
+    kc.app_secret = lambda: "FAKE-SECRET"
+    kc._load_saved_token = lambda cache_key: ("", 0.0)
+    try:
+        cache_key = kc._token_cache_key()
+        fail_key = kc._token_fail_key()
+        kc._tokens.pop(cache_key, None)
+        kc._token_fail_until.pop(fail_key, None)
+
+        t1 = kc._get_token()
+        t2 = kc._get_token()
+        check("KIS", "실패한 토큰 발급은 None", t1 is None and t2 is None)
+        check("KIS", "쿨다운 안에서는 재시도하지 않는다 (HTTP 1회)",
+              calls["n"] == 1, f"calls={calls['n']}")
+
+        kc._token_fail_until[fail_key] = 0.0         # 쿨다운 만료를 흉내
+        kc._get_token()
+        check("KIS", "쿨다운이 끝나면 다시 시도한다", calls["n"] == 2,
+              f"calls={calls['n']}")
+
+        # 실패 키는 시크릿까지 구분 — 틀린 시크릿의 실패가 옳은 시크릿을 못 막게
+        kc.app_secret = lambda: "OTHER-SECRET"
+        check("KIS", "시크릿이 다르면 실패 쿨다운을 공유하지 않는다",
+              kc._token_fail_key() != fail_key)
+        kc.app_secret = lambda: "FAKE-SECRET"
+
+        # 네트워크 계층 실패(status 0)는 쿨다운을 걸지 않는다 — 몇 초 만에
+        # 복구될 수 있는데 60초를 걸면 실계좌 손절 회전까지 늦어집니다
+        kc._token_fail_until.pop(fail_key, None)
+
+        def fake_post_network(url, json_body=None, headers=None, timeout=0):
+            calls["n"] += 1
+            return 0, None, "네트워크 연결 실패"
+
+        http_client.post_full = fake_post_network
+        kc._get_token()
+        before = calls["n"]
+        kc._get_token()
+        check("KIS", "네트워크 오류는 쿨다운 없이 즉시 재시도한다",
+              calls["n"] == before + 1, f"calls={calls['n']}")
+    finally:
+        http_client.post_full = real_post
+        kc.app_key = real_app_key
+        kc.app_secret = real_app_secret
+        kc._load_saved_token = real_load_saved
+        kc._token_fail_until.clear()
+
+
 def test_recommender_factors():
     section("13. AI 추천 — 물리학 팩터 · 스마트머니 · 장 상태 알림")
 
@@ -2448,6 +2805,9 @@ def main():
     test_strategy_separation()
     test_scalp_chart()
     test_recommender_factors()
+    test_recommend_background()
+    test_recommend_offline_pass()
+    test_kis_token_cooldown()
     if not offline:
         test_api()
 
